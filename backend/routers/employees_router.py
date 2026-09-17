@@ -7,17 +7,11 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from bson import ObjectId
 from db import get_db
-from auth_utils import get_current_user, require_roles
-from models import UserPublic, EmployeeAdminUpdateRequest
-from models_part2 import (
-    DepartmentIn,
-    EmployeeInviteIn,
-    AttendanceIn,
-    LeaveIn,
-    PerformanceIn
-)
-from hub.utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
-
+from auth_utils import get_current_user, require_roles, hash_password
+from models import UserPublic
+from models_part2 import DepartmentIn, EmployeeInviteIn, AttendanceIn, LeaveIn, PerformanceIn
+from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
+from email_utils import send_invitation_email, send_password_reset_email
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -314,7 +308,9 @@ async def _find_user(db, employee_id: str):
 
 
 @router.post("/{employee_id}/reset-password")
-async def reset_employee_password(employee_id: str, payload: dict | None = None,
+async def reset_employee_password(employee_id: str,
+                                  background_tasks: BackgroundTasks,
+                                  payload: dict | None = None,
                                   current: UserPublic = Depends(require_roles("Founder", "Admin"))):
     db = get_db()
     target = await _find_user(db, employee_id)
@@ -322,16 +318,42 @@ async def reset_employee_password(employee_id: str, payload: dict | None = None,
         raise HTTPException(404, "Employee not found")
     if target.get("role") == "Founder":
         raise HTTPException(403, "Cannot reset the Founder password from here")
-    new_password = (payload or {}).get("new_password") or _gen_temp_password()
+
+    raw_pwd = (payload or {}).get("new_password")
+    if raw_pwd is not None and str(raw_pwd).strip():
+        raw_pwd = str(raw_pwd).strip()
+        if len(raw_pwd) < 6:
+            raise HTTPException(400, "Password must be at least 6 characters long")
+        new_password = raw_pwd
+    else:
+        new_password = _gen_temp_password()
+
     await db.users.update_one(
         {"_id": target["_id"]},
         {"$set": {"password_hash": hash_password(new_password), "updated_at": utc_iso()}},
     )
     await log_activity(db, current, "Reset password", "Employees", target=target["name"])
     await notify(db, str(target["_id"]), "Your password was reset",
-                 f"{current.name} reset your password. Please sign in with the new temporary password and update it if allowed.",
+                 f"{current.name} reset your password. Please sign in with the new password and update it if allowed.",
                  kind="warning", link="/settings")
-    return {"ok": True, "temp_password": new_password}
+
+    target_email = target.get("email")
+    target_name = target.get("name") or "Employee"
+    if target_email:
+        background_tasks.add_task(
+            send_password_reset_email,
+            recipient_email=target_email,
+            recipient_name=target_name,
+            new_password=new_password,
+            reset_by=current.name,
+        )
+
+    return {
+        "ok": True,
+        "temp_password": new_password,
+        "email": target_email,
+        "message": f"Password reset successfully and email dispatched to {target_email} via Brevo"
+    }
 
 
 @router.patch("/{employee_id}/status")
@@ -538,39 +560,8 @@ async def create_leave(payload: LeaveIn, current: UserPublic = Depends(get_curre
     doc["updated_at"] = utc_iso()
     res = await db.leave_requests.insert_one(doc)
     doc["_id"] = res.inserted_id
-
-    emp = await db.users.find_one(
-        {
-            "_id": oid(
-                doc["employee_id"]
-            )
-        },
-        {
-            "name": 1
-        },
-    )
-
-    await log_activity(
-        db,
-        current,
-        "Leave requested",
-        "Employees",
-        target=(
-            f"{emp['name'] if emp else '—'} · "
-            f"{doc['from_date']} → {doc['to_date']}"
-        ),
-    )
-
-    await log_activity(
-    db,
-    current,
-    "Leave requested",
-    "Employees",
-    target=(
-        f"{emp['name'] if emp else '—'} · "
-        f"{doc['from_date']} → {doc['to_date']}"
-    ),
-)
+    emp = await db.users.find_one({"_id": oid(doc["employee_id"])}, {"name": 1})
+    await log_activity(db, current, "Leave requested", "Employees", target=f"{emp['name'] if emp else '—'} · {doc['from_date']} → {doc['to_date']}")
 
     approvers = await db.users.find(
         {"role": {"$in": ["Founder", "Admin", "Manager"]}},
