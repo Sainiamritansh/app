@@ -64,62 +64,81 @@ async def invite_employee(payload: EmployeeInviteIn,
     if payload.role == "Founder":
         raise HTTPException(403, "Cannot create another Founder")
     if payload.role == "Admin" and current.role != "Founder":
-        raise HTTPException(
-            403,
-            "Only the Founder can create an Admin",
+        raise HTTPException(403, "Only the Founder can create an Admin")
+    existing_user = await db.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+    if existing_user and existing_user.get("status") == "active" and (existing_user.get("is_active") is True or existing_user.get("active") is True):
+        raise HTTPException(409, "Email is already registered as an active employee")
+
+    frontend_url = os.environ.get("FRONTEND_URL", "https://app-eta-flax-97.vercel.app")
+    token = secrets.token_urlsafe(32)
+    invite_url = f"{frontend_url}/accept-invite?token={token}"
+
+    if existing_user:
+        await db.users.update_one(
+            {"_id": existing_user["_id"]},
+            {"$set": {
+                "name": name,
+                "role": payload.role,
+                "designation": payload.designation,
+                "department": payload.department,
+                "phone": payload.phone,
+                "status": "deactivated",
+                "is_active": False,
+                "active": False,
+                "invited_by": current.name,
+                "updated_at": utc_iso()
+            }}
         )
+        user_id = str(existing_user["_id"])
+    else:
+        user_doc = {
+            "email": email,
+            "name": name,
+            "role": payload.role,
+            "designation": payload.designation,
+            "department": payload.department,
+            "phone": payload.phone,
+            "password_hash": "",
+            "status": "deactivated",
+            "is_active": False,
+            "active": False,
+            "online": False,
+            "invited_by": current.name,
+            "created_at": utc_iso(),
+            "updated_at": utc_iso(),
+        }
+        res_u = await db.users.insert_one(user_doc)
+        user_id = str(res_u.inserted_id)
 
-    email = payload.email.lower().strip()
-
-    # Prevent duplicate accounts
-    if await db.users.find_one({"email": email}):
-        raise HTTPException(
-            409,
-            "Email already exists",
-        )
-
-    default_pw = "Wavygo@2026"
-
-    doc = {
+    inv_doc = {
+        "token": token,
         "email": email,
-        "name": payload.name.strip(),
+        "name": name,
         "role": payload.role,
         "designation": payload.designation,
         "department": payload.department,
         "phone": payload.phone,
-        "password_hash": hash_password(default_pw),
-        "online": False,
+        "status": "pending",
+        "invited_by": current.name,
+        "user_id": user_id,
         "created_at": utc_iso(),
-        "updated_at": utc_iso(),
     }
+    await db.invitations.delete_many({"email": email})
+    res = await db.invitations.insert_one(inv_doc)
+    inv_doc["_id"] = res.inserted_id
 
-    res = await db.users.insert_one(doc)
-
-    doc["_id"] = res.inserted_id
-
-    await log_activity(
-    db,
-    current,
-    "Invited employee",
-    "Employees",
-    target=payload.name,
-)
-
-managers = await db.users.find(
-    {"role": {"$in": ["Founder", "Admin"]}},
-    {"_id": 1},
-).to_list(50)
-
-for m in managers:
-    await notify(
-        db,
-        str(m["_id"]),
-        "New teammate joined",
-        f"{payload.name} was invited by {current.name} as {payload.role}.",
-        kind="success",
-        link="/employees",
+    background_tasks.add_task(
+        send_invitation_email,
+        recipient_email=email,
+        recipient_name=name,
+        role=payload.role,
+        token=token,
+        invited_by=current.name,
+        designation=payload.designation,
+        department=payload.department
     )
 
+    await log_activity(db, current, "Sent employee invitation", "Employees", target=name)
     return {
         **serialize(inv_doc),
         "token": token,
@@ -568,19 +587,12 @@ async def create_leave(payload: LeaveIn, current: UserPublic = Depends(get_curre
         {"_id": 1},
     ).to_list(50)
 
-for a in approvers:
-    await notify(
-        db,
-        str(a["_id"]),
-        "Leave request",
-        (
-            f"{emp['name'] if emp else 'Employee'} "
-            f"requested {doc['kind']} leave from "
-            f"{doc['from_date']} to {doc['to_date']}."
-        ),
-        kind="warning",
-        link="/employees",
-    )
+    for a in approvers:
+        await notify(
+            db, str(a["_id"]), "Leave request",
+            f"{emp['name'] if emp else 'Employee'} requested {doc['kind']} leave from {doc['from_date']} to {doc['to_date']}.",
+            kind="warning", link="/employees",
+        )
     return serialize(doc)
 
 
