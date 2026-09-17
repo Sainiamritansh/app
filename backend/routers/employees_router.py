@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from bson import ObjectId
 
 from db import get_db
-from auth_utils import get_current_user, require_roles
+from auth_utils import get_current_user, require_roles, hash_password
 from models import UserPublic, EmployeeAdminUpdateRequest
 from models_part2 import (
     DepartmentIn,
@@ -14,7 +14,7 @@ from models_part2 import (
     LeaveIn,
     PerformanceIn
 )
-from hub.utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
+from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
 
 
 router = APIRouter(prefix="/employees", tags=["employees"])
@@ -141,27 +141,27 @@ async def invite_employee(
     doc["_id"] = res.inserted_id
 
     await log_activity(
-    db,
-    current,
-    "Invited employee",
-    "Employees",
-    target=payload.name,
-)
-
-managers = await db.users.find(
-    {"role": {"$in": ["Founder", "Admin"]}},
-    {"_id": 1},
-).to_list(50)
-
-for m in managers:
-    await notify(
         db,
-        str(m["_id"]),
-        "New teammate joined",
-        f"{payload.name} was invited by {current.name} as {payload.role}.",
-        kind="success",
-        link="/employees",
+        current,
+        "Invited employee",
+        "Employees",
+        target=payload.name,
     )
+
+    managers = await db.users.find(
+        {"role": {"$in": ["Founder", "Admin"]}},
+        {"_id": 1},
+    ).to_list(50)
+
+    for m in managers:
+        await notify(
+            db,
+            str(m["_id"]),
+            "New teammate joined",
+            f"{payload.name} was invited by {current.name} as {payload.role}.",
+            kind="success",
+            link="/employees",
+        )
 
     return {
         **serialize(doc),
@@ -781,35 +781,25 @@ async def create_leave(
         ),
     )
 
-    await log_activity(
-    db,
-    current,
-    "Leave requested",
-    "Employees",
-    target=(
-        f"{emp['name'] if emp else '—'} · "
-        f"{doc['from_date']} → {doc['to_date']}"
-    ),
-)
+    approvers = await db.users.find(
+        {"role": {"$in": ["Founder", "Admin", "Manager"]}},
+        {"_id": 1},
+    ).to_list(50)
 
-approvers = await db.users.find(
-    {"role": {"$in": ["Founder", "Admin", "Manager"]}},
-    {"_id": 1},
-).to_list(50)
+    for a in approvers:
+        await notify(
+            db,
+            str(a["_id"]),
+            "Leave request",
+            (
+                f"{emp['name'] if emp else 'Employee'} "
+                f"requested {doc['kind']} leave from "
+                f"{doc['from_date']} to {doc['to_date']}."
+            ),
+            kind="warning",
+            link="/employees",
+        )
 
-for a in approvers:
-    await notify(
-        db,
-        str(a["_id"]),
-        "Leave request",
-        (
-            f"{emp['name'] if emp else 'Employee'} "
-            f"requested {doc['kind']} leave from "
-            f"{doc['from_date']} to {doc['to_date']}."
-        ),
-        kind="warning",
-        link="/employees",
-    )
     return serialize(doc)
 
 
