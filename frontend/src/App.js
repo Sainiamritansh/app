@@ -6,6 +6,7 @@ import { ThemeProvider } from "@/contexts/ThemeContext";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { AppShell } from "@/components/layout/AppShell";
 import Login from "@/pages/Login";
+import AcceptInvite from "@/pages/AcceptInvite";
 import Dashboard from "@/pages/Dashboard";
 import Settings from "@/pages/Settings";
 import NotificationsPage from "@/pages/Notifications";
@@ -39,6 +40,7 @@ export default function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/dashboard" replace />} />
             <Route path="/login" element={<Login />} />
+            <Route path="/accept-invite" element={<AcceptInvite />} />
             <Route path="/dashboard"       element={<Shell module="dashboard"><Dashboard /></Shell>} />
             <Route path="/marketplace"     element={<Shell module="marketplace"><Marketplace /></Shell>} />
             <Route path="/task-board"      element={<Shell module="task-board"><TaskBoard /></Shell>} />

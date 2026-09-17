@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from bson import ObjectId
 
@@ -35,6 +34,8 @@ def _to_public(doc) -> UserPublic:
         phone=doc.get("phone"),
         designation=doc.get("designation"),
         department=doc.get("department"),
+        status=doc.get("status", "active"),
+        is_active=doc.get("is_active", True),
     )
 
 
@@ -65,41 +66,11 @@ async def login(payload: LoginRequest, request: Request):
     db = get_db()
 
     email = payload.email.lower().strip()
-
-    # --------------------------------------------------------
-    # 1. Verify user
-    # --------------------------------------------------------
-
     user = await db.users.find_one({"email": email})
+    if not user or not verify_password(payload.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not user or not verify_password(
-        payload.password,
-        user.get("password_hash", "")
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password",
-        )
-
-    # --------------------------------------------------------
-    # 2. Mark user as online
-    # --------------------------------------------------------
-
-    now = utc_now()
-
-    await db.users.update_one(
-        {"_id": user["_id"]},
-        {
-            "$set": {
-                "online": True,
-                "last_login_at": now.isoformat(),
-            }
-        },
-    )
-
-    # --------------------------------------------------------
-    # 3. Create access + refresh tokens
-    # --------------------------------------------------------
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"online": True, "last_login_at": utc_now().isoformat()}})
 
     uid = str(user["_id"])
 

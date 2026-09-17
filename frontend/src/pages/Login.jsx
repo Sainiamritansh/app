@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { motion } from "framer-motion";
-import { Eye, EyeOff, ArrowRight, ShieldCheck, Bike } from "lucide-react";
+import { Eye, EyeOff, ArrowRight, ShieldCheck, Bike, Loader2 } from "lucide-react";
 import { WavygoLogo } from "@/components/WavygoLogo";
 import { useAuth } from "@/contexts/AuthContext";
 import { AUTH } from "@/constants/testIds";
@@ -27,7 +27,9 @@ export default function Login() {
   const { user, login } = useAuth();
   const nav = useNavigate();
   const loc = useLocation();
-  const [email, setEmail] = useState("");
+  const queryParams = new URLSearchParams(loc.search);
+  const prefilledEmail = queryParams.get("email") || loc.state?.email || "";
+  const [email, setEmail] = useState(prefilledEmail);
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [showPw, setShowPw] = useState(false);
@@ -68,9 +70,7 @@ export default function Login() {
 
         <div className="relative z-10 h-full flex flex-col justify-between p-10 xl:p-14 text-white">
           <div className="flex items-center gap-3">
-            <div className="h-10 w-10 rounded-lg bg-white/95 flex items-center justify-center">
-              <WavygoLogo forceVariant="green" className="h-6 w-auto" />
-            </div>
+            <WavygoLogo forceVariant="white" className="h-9 w-auto" />
             <div>
               <div className="font-display text-[15px] font-semibold">WavyGo OS</div>
               <div className="text-[10px] uppercase tracking-[0.16em] text-white/60">Enterprise Operating System</div>
@@ -182,7 +182,7 @@ export default function Login() {
 
             <Button data-testid={AUTH.submitButton} type="submit" disabled={busy}
                     className="w-full h-11 bg-primary hover:bg-wavygo-600 text-primary-foreground font-medium">
-              {busy ? "Signing in…" : (<span className="inline-flex items-center gap-1.5">Sign in <ArrowRight className="h-4 w-4" /></span>)}
+              {busy ? <span className="inline-flex items-center gap-2"><Loader2 className="h-4 w-4 animate-spin" /> Signing in…</span> : (<span className="inline-flex items-center gap-1.5">Sign in <ArrowRight className="h-4 w-4" /></span>)}
             </Button>
           </form>
 

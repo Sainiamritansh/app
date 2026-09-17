@@ -8,7 +8,7 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://wavygo-foundation.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://app-eta-flax-97.vercel.app").rstrip("/")
 API = f"{BASE_URL}/api"
 
 FOUNDER  = {"email": "anilanand635@gmail.com", "password": "Wavygo@2026"}
@@ -328,8 +328,14 @@ def test_employees_invite_by_founder(founder_h):
     body = r.json()
     assert body["email"] == email
     assert body["role"] == "Employee"
-    assert body.get("temp_password") == "Wavygo@2026"
-    # Verify login with new user
+    assert "token" in body
+    token = body["token"]
+
+    # Accept invitation
+    r_accept = requests.post(f"{API}/employees/accept-invite", json={"token": token, "password": "Wavygo@2026"})
+    assert r_accept.status_code == 200, r_accept.text
+
+    # Verify login with new user after acceptance
     d = _login(email, "Wavygo@2026")
     assert d["user"]["email"] == email
 

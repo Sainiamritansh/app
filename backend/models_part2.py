@@ -148,9 +148,9 @@ class DepartmentIn(BaseModel):
 
 
 class EmployeeInviteIn(BaseModel):
-    email: EmailStr
+    email: str
     name: str
-    role: Literal["Founder", "Admin", "Manager", "Employee", "Intern"] = "Employee"
+    role: str = "Employee"
     designation: Optional[str] = None
     department: Optional[str] = None
     phone: Optional[str] = None

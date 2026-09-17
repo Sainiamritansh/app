@@ -28,13 +28,11 @@ export function Sidebar({ collapsed, onToggle }) {
       >
         {/* Brand block */}
         <div className={cn("flex items-center gap-3 px-4 pt-5 pb-4 border-b border-white/5", collapsed && "justify-center px-2")}>
-          <div className="h-9 w-9 rounded-lg bg-white flex items-center justify-center shrink-0 shadow-sm">
-            <WavygoLogo forceVariant="green" className="h-6 w-auto" />
-          </div>
-          {!collapsed && (
-            <div className="min-w-0">
-              <div className="font-display text-[15px] font-semibold tracking-tight leading-tight text-white">WavyGo OS</div>
-              <div className="text-[10px] uppercase tracking-[0.14em] text-sidebar-muted mt-0.5 truncate">Mobility · India</div>
+          {collapsed ? (
+            <WavygoLogo forceVariant="white" className="h-7 w-auto" mark />
+          ) : (
+            <div className="flex items-center gap-3">
+              <WavygoLogo forceVariant="white" className="h-8 w-auto max-w-[170px]" />
             </div>
           )}
         </div>
