@@ -191,3 +191,17 @@ class Session(BaseDocument):
     last_used_at: datetime = Field(default_factory=utc_now)
 
     revoked: bool = False
+
+class Attendance(BaseDocument):
+
+    user_id: str
+    employee_name: str
+    date: str
+
+    check_in: datetime
+    check_out: Optional[datetime] = None
+
+    session_id: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)    
