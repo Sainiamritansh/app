@@ -10,7 +10,6 @@ from starlette.middleware.cors import CORSMiddleware
 
 from db import get_db, utc_now, close_db
 from seed import seed_all
-from seed_part2 import seed_part2
 from routers.auth_router import router as auth_router
 from routers.users_router import router as users_router
 from routers.notifications_router import router as notifications_router
@@ -62,13 +61,25 @@ api.include_router(connect_router)
 
 app.include_router(api)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_origins_env = os.environ.get("CORS_ORIGINS", "*").strip()
+if cors_origins_env == "*" or not cors_origins_env:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://.*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    origins = [o.strip() for o in cors_origins_env.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_origin_regex=r"^https?://.*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @app.on_event("startup")
@@ -76,10 +87,9 @@ async def _startup():
     get_db()
     try:
         await seed_all()
-        await seed_part2()
-        logger.info("Seed complete (Part 1 + Part 2)")
+        logger.info("Founder account verification complete.")
     except Exception as e:
-        logger.exception("Seed failed: %s", e)
+        logger.exception("Startup user verification failed: %s", e)
 
 
 @app.on_event("shutdown")

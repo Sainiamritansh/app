@@ -11,7 +11,8 @@ from auth_utils import get_current_user, require_roles, hash_password
 from models import UserPublic
 from models_part2 import DepartmentIn, EmployeeInviteIn, AttendanceIn, LeaveIn, PerformanceIn
 from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
-from email_utils import send_invitation_email
+from email_utils import send_invitation_email, send_password_reset_email
+from dept_groups import sync_employee_department_group, add_member_to_department_channel, get_or_create_department_channel
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -238,6 +239,11 @@ async def accept_invite(payload: dict):
         {"$set": {"status": "accepted", "accepted_at": utc_iso()}}
     )
 
+    if inv.get("department"):
+        joined_user = await db.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+        if joined_user:
+            await add_member_to_department_channel(db, str(joined_user["_id"]), inv["department"])
+
     await notify(db, None, "New teammate joined", f"{inv['name']} accepted the invitation and joined as {inv['role']}.",
                  kind="success", link="/employees")
     
@@ -327,7 +333,9 @@ async def _find_user(db, employee_id: str):
 
 
 @router.post("/{employee_id}/reset-password")
-async def reset_employee_password(employee_id: str, payload: dict | None = None,
+async def reset_employee_password(employee_id: str,
+                                  background_tasks: BackgroundTasks,
+                                  payload: dict | None = None,
                                   current: UserPublic = Depends(require_roles("Founder", "Admin"))):
     db = get_db()
     target = await _find_user(db, employee_id)
@@ -335,16 +343,42 @@ async def reset_employee_password(employee_id: str, payload: dict | None = None,
         raise HTTPException(404, "Employee not found")
     if target.get("role") == "Founder":
         raise HTTPException(403, "Cannot reset the Founder password from here")
-    new_password = (payload or {}).get("new_password") or _gen_temp_password()
+
+    raw_pwd = (payload or {}).get("new_password")
+    if raw_pwd is not None and str(raw_pwd).strip():
+        raw_pwd = str(raw_pwd).strip()
+        if len(raw_pwd) < 6:
+            raise HTTPException(400, "Password must be at least 6 characters long")
+        new_password = raw_pwd
+    else:
+        new_password = _gen_temp_password()
+
     await db.users.update_one(
         {"_id": target["_id"]},
         {"$set": {"password_hash": hash_password(new_password), "updated_at": utc_iso()}},
     )
     await log_activity(db, current, "Reset password", "Employees", target=target["name"])
     await notify(db, str(target["_id"]), "Your password was reset",
-                 f"{current.name} reset your password. Please sign in with the new temporary password and update it if allowed.",
+                 f"{current.name} reset your password. Please sign in with the new password and update it if allowed.",
                  kind="warning", link="/settings")
-    return {"ok": True, "temp_password": new_password}
+
+    target_email = target.get("email")
+    target_name = target.get("name") or "Employee"
+    if target_email:
+        background_tasks.add_task(
+            send_password_reset_email,
+            recipient_email=target_email,
+            recipient_name=target_name,
+            new_password=new_password,
+            reset_by=current.name,
+        )
+
+    return {
+        "ok": True,
+        "temp_password": new_password,
+        "email": target_email,
+        "message": f"Password reset successfully and email dispatched to {target_email} via Brevo"
+    }
 
 
 @router.patch("/{employee_id}/status")
@@ -402,6 +436,7 @@ async def update_employee(employee_id: str, payload: dict,
     target = await _find_user(db, employee_id)
     if not target:
         raise HTTPException(404, "Employee not found")
+    old_department = target.get("department")
     if current.role == "Manager" and target.get("department") != current.department:
         raise HTTPException(403, "Managers can only edit teammates in their department")
     payload.pop("id", None); payload.pop("_id", None); payload.pop("password_hash", None); payload.pop("email", None)
@@ -410,6 +445,8 @@ async def update_employee(employee_id: str, payload: dict,
     if res.matched_count == 0:
         raise HTTPException(404, "Employee not found")
     doc = await db.users.find_one({"_id": target["_id"]}, {"password_hash": 0})
+    if "department" in payload:
+        await sync_employee_department_group(db, str(target["_id"]), old_department, payload.get("department"))
     await log_activity(db, current, "Updated employee", "Employees", target=doc["name"])
     return serialize(doc)
 
@@ -468,6 +505,7 @@ async def create_department(payload: DepartmentIn,
     doc["created_at"] = utc_iso()
     res = await db.departments.insert_one(doc)
     doc["_id"] = res.inserted_id
+    await get_or_create_department_channel(db, doc["name"])
     await log_activity(db, current, "Created department", "Employees", target=doc["name"])
     return serialize(doc)
 
