@@ -70,7 +70,8 @@ async def login(payload: LoginRequest, request: Request):
     if not user or not verify_password(payload.password, user.get("password_hash", "")):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    await db.users.update_one({"_id": user["_id"]}, {"$set": {"online": True, "last_login_at": utc_now().isoformat()}})
+    now = utc_now()
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"online": True, "last_login_at": now.isoformat()}})
 
     uid = str(user["_id"])
 
