@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Users, Plus, UserPlus, Building2, CalendarDays, Award, KeyRound, Mail, Copy, Check, Trash2, Pencil, Power, UserMinus, CheckCircle2, Loader2, Eye, EyeOff, Sparkles, Send, ShieldCheck } from "lucide-react";
+import { Users, Plus, UserPlus, Building2, CalendarDays, Award, KeyRound, Mail, Copy, Check, Trash2, Pencil, Power, UserMinus, CheckCircle2, Loader2, Eye, EyeOff, Sparkles, Send, ShieldCheck, ArrowLeft } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -35,6 +35,8 @@ function Directory() {
   const canReset = can("auth.reset_other_password");
   const canManageAccount = role === "Founder" || role === "Admin";
   const [rows, setRows] = useState([]);
+  const [departments, setDepartments] = useState([]);
+  const [selectedDepartment, setSelectedDepartment] = useState(null);
   const [invitations, setInvitations] = useState([]);
   const [q, setQ] = useState("");
   const [open, setOpen] = useState(false);
@@ -53,13 +55,28 @@ function Directory() {
   const [actionLoadingKey, setActionLoadingKey] = useState(null);
 
   const load = () => {
-    api.get("/employees").then(({ data }) => setRows(data)).catch(() => {});
+    if (selectedDepartment) {
+      api.get("/employees", { params: { department: selectedDepartment } }).then(({ data }) => setRows(data)).catch(() => {});
+    }
+    api.get("/employees/departments/list").then(({ data }) => setDepartments(data)).catch(() => {});
     api.get("/employees/invitations").then(({ data }) => setInvitations(data)).catch(() => {});
   };
 
   const [searchParams, setSearchParams] = useSearchParams();
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    api.get("/employees/departments/list").then(({ data }) => setDepartments(data)).catch(() => {});
+    api.get("/employees/invitations").then(({ data }) => setInvitations(data)).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    setQ("");
+    if (!selectedDepartment) {
+      setRows([]);
+      return;
+    }
+    api.get("/employees", { params: { department: selectedDepartment } }).then(({ data }) => setRows(data)).catch(() => {});
+  }, [selectedDepartment]);
 
   useEffect(() => {
     if (searchParams.get("create") === "invite" || searchParams.get("action") === "invite-teammate") {
@@ -265,10 +282,39 @@ function Directory() {
 
   return (
     <>
-      <div className="flex flex-col sm:flex-row gap-2 items-start sm:items-center justify-between mb-4">
-        <Input placeholder="Search by name, email, role, department…" value={q} onChange={(e) => setQ(e.target.value)} className="max-w-md" data-testid="employee-search" />
-        {canInvite && <Button onClick={() => { setCreatedInvite(null); setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" }); setOpen(true); }} data-testid="employee-invite-btn"><UserPlus className="h-4 w-4 mr-1.5" /> Invite teammate</Button>}
-      </div>
+      {selectedDepartment === null ? (
+        <>
+          <div className="flex justify-end mb-4">
+            {canInvite && <Button onClick={() => { setCreatedInvite(null); setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" }); setOpen(true); }} data-testid="employee-invite-btn"><UserPlus className="h-4 w-4 mr-1.5" /> Invite teammate</Button>}
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 mb-6">
+            {departments.map(d => (
+              <Card key={d.id || d.name} className="border-border hover-lift cursor-pointer" onClick={() => setSelectedDepartment(d.name)}>
+                <CardHeader className="pb-2">
+                  <div className="flex items-center gap-2">
+                    <div className="h-9 w-9 rounded-md bg-primary/10 text-primary flex items-center justify-center"><Building2 className="h-4.5 w-4.5" /></div>
+                    <div>
+                      <CardTitle className="font-display text-[15px]">{d.name}</CardTitle>
+                      <div className="text-[11.5px] text-muted-foreground">{d.headcount} teammate{d.headcount === 1 ? "" : "s"}{d.head_name ? ` · ${d.head_name}` : ""}</div>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-0 text-[13px] text-muted-foreground">{d.description || "—"}</CardContent>
+              </Card>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div className="mb-4">
+          <button type="button" onClick={() => setSelectedDepartment(null)} className="mb-3 inline-flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
+            <ArrowLeft className="h-4 w-4" /> Back to Departments
+          </button>
+          <div className="flex flex-col sm:flex-row gap-2 items-start sm:items-center justify-between">
+            <Input placeholder="Search by name, email, role…" value={q} onChange={(e) => setQ(e.target.value)} className="max-w-md" data-testid="employee-search" />
+            {canInvite && <Button onClick={() => { setCreatedInvite(null); setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" }); setOpen(true); }} data-testid="employee-invite-btn"><UserPlus className="h-4 w-4 mr-1.5" /> Invite teammate</Button>}
+          </div>
+        </div>
+      )}
 
       {pendingInvs.length > 0 && (
         <Card className="border-amber-500/20 bg-amber-500/5 mb-6">
@@ -325,7 +371,7 @@ function Directory() {
         </Card>
       )}
 
-      <Card className="border-border">
+      {selectedDepartment !== null && <Card className="border-border">
         {filtered.length === 0 ? <EmptyState icon={Users} title="No employees match" /> : (
           <Table>
             <TableHeader>
@@ -333,7 +379,6 @@ function Directory() {
                 <TableHead>Employee</TableHead>
                 <TableHead>Role</TableHead>
                 <TableHead>Designation</TableHead>
-                <TableHead>Department</TableHead>
                 <TableHead>Contact</TableHead>
                 <TableHead>Status</TableHead>
                 {(canEdit || canReset || canManageAccount) && <TableHead className="text-right">Actions</TableHead>}
@@ -356,7 +401,6 @@ function Directory() {
                     </TableCell>
                     <TableCell><Badge variant="secondary">{u.role}</Badge></TableCell>
                     <TableCell className="text-[13px]">{u.designation || "—"}</TableCell>
-                    <TableCell className="text-[13px]">{u.department || "—"}</TableCell>
                     <TableCell className="text-[13px] text-muted-foreground">{u.phone || "—"}</TableCell>
                     <TableCell>
                       <div className="flex items-center gap-1.5">
@@ -427,7 +471,7 @@ function Directory() {
             </TableBody>
           </Table>
         )}
-      </Card>
+      </Card>}
 
       <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) setCreatedInvite(null); }}>
         <DialogContent>

@@ -12,6 +12,7 @@ from models import UserPublic
 from models_part2 import DepartmentIn, EmployeeInviteIn, AttendanceIn, LeaveIn, PerformanceIn
 from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
 from email_utils import send_invitation_email, send_password_reset_email
+from dept_groups import sync_employee_department_group, add_member_to_department_channel, get_or_create_department_channel
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -238,6 +239,11 @@ async def accept_invite(payload: dict):
         {"$set": {"status": "accepted", "accepted_at": utc_iso()}}
     )
 
+    if inv.get("department"):
+        joined_user = await db.users.find_one({"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}})
+        if joined_user:
+            await add_member_to_department_channel(db, str(joined_user["_id"]), inv["department"])
+
     await notify(db, None, "New teammate joined", f"{inv['name']} accepted the invitation and joined as {inv['role']}.",
                  kind="success", link="/employees")
     
@@ -430,6 +436,7 @@ async def update_employee(employee_id: str, payload: dict,
     target = await _find_user(db, employee_id)
     if not target:
         raise HTTPException(404, "Employee not found")
+    old_department = target.get("department")
     if current.role == "Manager" and target.get("department") != current.department:
         raise HTTPException(403, "Managers can only edit teammates in their department")
     payload.pop("id", None); payload.pop("_id", None); payload.pop("password_hash", None); payload.pop("email", None)
@@ -438,6 +445,8 @@ async def update_employee(employee_id: str, payload: dict,
     if res.matched_count == 0:
         raise HTTPException(404, "Employee not found")
     doc = await db.users.find_one({"_id": target["_id"]}, {"password_hash": 0})
+    if "department" in payload:
+        await sync_employee_department_group(db, str(target["_id"]), old_department, payload.get("department"))
     await log_activity(db, current, "Updated employee", "Employees", target=doc["name"])
     return serialize(doc)
 
@@ -496,6 +505,7 @@ async def create_department(payload: DepartmentIn,
     doc["created_at"] = utc_iso()
     res = await db.departments.insert_one(doc)
     doc["_id"] = res.inserted_id
+    await get_or_create_department_channel(db, doc["name"])
     await log_activity(db, current, "Created department", "Employees", target=doc["name"])
     return serialize(doc)
 
