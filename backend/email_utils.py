@@ -30,7 +30,7 @@ def send_invitation_email(
         print("[Email] Warning: BREVO_API_KEY not configured")
         return False
 
-    accept_url =  f"{FRONTEND_URL}/accept-invite?token={token}"
+    accept_url = f"{FRONTEND_URL}/accept-invite?token={token}"
     url = "https://api.brevo.com/v3/smtp/email"
     headers = {
         "api-key": BREVO_API_KEY,
