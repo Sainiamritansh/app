@@ -1,11 +1,12 @@
 from __future__ import annotations
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from bson import ObjectId
 from db import get_db
 from auth_utils import get_current_user, require_roles
 from models import UserPublic
 from models_part2 import TaskIn, TaskStatusPatch, TaskCommentIn, SubtaskIn
 from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
+from email_utils import notify_assignment_by_email
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -69,7 +70,7 @@ async def _enrich_names(db, doc):
 
 
 @router.post("", status_code=201)
-async def create_task(payload: TaskIn, current: UserPublic = Depends(get_current_user)):
+async def create_task(payload: TaskIn, background_tasks: BackgroundTasks, current: UserPublic = Depends(get_current_user)):
     db = get_db()
     if current.role == "Intern":
         raise HTTPException(403, "Interns cannot create tasks")
@@ -87,6 +88,19 @@ async def create_task(payload: TaskIn, current: UserPublic = Depends(get_current
     if doc.get("assignee_id") and doc["assignee_id"] != current.id:
         await notify(db, doc["assignee_id"], "New task assigned",
                      f"{current.name} assigned you: {doc['title']}", kind="info", link="/task-board")
+    if doc.get("assignee_id"):
+        await notify_assignment_by_email(
+            db=db,
+            assignee_id=doc["assignee_id"],
+            item_type="task",
+            item_title=doc.get("title", "Untitled Task"),
+            assigned_by_name=current.name,
+            assigned_by_role=current.role,
+            priority=doc.get("priority"),
+            deadline=doc.get("due_date"),
+            item_id=str(doc["_id"]),
+            background_tasks=background_tasks,
+        )
     return serialize(doc)
 
 
@@ -111,7 +125,7 @@ def _can_touch_task(role, doc, uid):
 
 
 @router.patch("/{task_id}")
-async def update_task(task_id: str, payload: dict, current: UserPublic = Depends(get_current_user)):
+async def update_task(task_id: str, payload: dict, background_tasks: BackgroundTasks, current: UserPublic = Depends(get_current_user)):
     db = get_db()
     existing = await db.tasks.find_one({"_id": oid(task_id)})
     if not existing:
@@ -135,6 +149,19 @@ async def update_task(task_id: str, payload: dict, current: UserPublic = Depends
     if "assignee_id" in payload and payload["assignee_id"] and payload["assignee_id"] != current.id:
         await notify(db, payload["assignee_id"], "Task reassigned to you",
                      f"{current.name} moved '{doc['title']}' to you", kind="info", link="/task-board")
+    if "assignee_id" in payload and payload["assignee_id"] and payload["assignee_id"] != existing.get("assignee_id"):
+        await notify_assignment_by_email(
+            db=db,
+            assignee_id=payload["assignee_id"],
+            item_type="task",
+            item_title=doc.get("title", existing.get("title", "Untitled Task")),
+            assigned_by_name=current.name,
+            assigned_by_role=current.role,
+            priority=doc.get("priority", existing.get("priority")),
+            deadline=doc.get("due_date", existing.get("due_date")),
+            item_id=str(doc["_id"]),
+            background_tasks=background_tasks,
+        )
     await log_activity(db, current, "Updated task", "Task Board", target=doc["title"])
     return serialize(doc)
 
