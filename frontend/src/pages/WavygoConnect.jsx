@@ -9,8 +9,9 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck } from "lucide-react";
+import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, UserPlus } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -19,6 +20,7 @@ import { cn } from "@/lib/utils";
 import { formatDistanceToNow } from "date-fns";
 
 const KIND_ICON = { channel: Hash, dm: MessagesSquare, group: Users2, announcement: Megaphone };
+const KIND_LABEL = { channel: "Channel", group: "Group", announcement: "Announcement channel" };
 
 const HIGH_ROLES = ["Founder", "Admin", "Manager"];
 const HIGH_DESIG_KEYWORDS = [
@@ -35,6 +37,45 @@ function isHighDesignation(u) {
 
 function initials(name) { return (name || "?").split(" ").map(s => s[0]).filter(Boolean).slice(0, 2).join("").toUpperCase(); }
 
+const NO_IDS = [];
+
+/* Checkbox list of DM-eligible users (from /connect/users) for picking group members. */
+function MemberPicker({ users, selected, onChange, exclude = NO_IDS }) {
+  const [search, setSearch] = useState("");
+  const list = useMemo(() => {
+    const t = search.trim().toLowerCase();
+    return users.filter(u => !exclude.includes(u.id) && (!t ||
+      [u.name, u.email, u.role, u.designation, u.department].some(v => (v || "").toLowerCase().includes(t))));
+  }, [users, exclude, search]);
+  const toggle = (id) => onChange(selected.includes(id) ? selected.filter(x => x !== id) : [...selected, id]);
+  return (
+    <div>
+      <Label>Members{selected.length > 0 && <span className="text-muted-foreground font-normal"> · {selected.length} selected</span>}</Label>
+      <div className="relative mt-1">
+        <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+        <Input placeholder="Search people…" value={search} onChange={(e) => setSearch(e.target.value)} className="h-8 pl-8 text-[13px]" />
+      </div>
+      <div className="mt-2 max-h-[220px] overflow-y-auto scrollbar-thin rounded-md border border-border divide-y divide-border" data-testid="connect-member-picker">
+        {list.length === 0 ? (
+          <div className="text-center py-6 text-sm text-muted-foreground">No matching members found.</div>
+        ) : list.map(u => (
+          <label key={u.id} className="flex items-center gap-3 px-3 py-2 hover:bg-muted/70 cursor-pointer">
+            <Checkbox checked={selected.includes(u.id)} onCheckedChange={() => toggle(u.id)} />
+            <Avatar className="h-7 w-7">
+              <AvatarImage src={u.photo || undefined} />
+              <AvatarFallback className="text-[9px] bg-wavygo-100 text-wavygo-800">{initials(u.name)}</AvatarFallback>
+            </Avatar>
+            <div className="flex-1 min-w-0">
+              <div className="text-[13px] font-medium truncate">{u.name}</div>
+              <div className="text-[11px] text-muted-foreground truncate">{u.designation || u.role}{u.department ? ` · ${u.department}` : ""}</div>
+            </div>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function WavygoConnect() {
   const { user } = useAuth();
   const { can } = usePermission();
@@ -49,33 +90,56 @@ export default function WavygoConnect() {
   const [createOpen, setCreateOpen] = useState(false);
   const [dmOpen, setDmOpen] = useState(false);
   const [dmSearch, setDmSearch] = useState("");
-  const [form, setForm] = useState({ name: "", kind: "channel", description: "" });
+  const [form, setForm] = useState({ name: "", kind: "channel", description: "", members: [] });
+  const [addOpen, setAddOpen] = useState(false);
+  const [addSel, setAddSel] = useState([]);
   const [q, setQ] = useState("");
+  const [busy, setBusy] = useState(false);   // a create / add-members request is in flight
+  const sendingRef = useRef(false);          // blocks double sends (Enter pressed twice)
   const scrollRef = useRef(null);
+  const paneRef = useRef(null);
+  const revealRef = useRef(false);      // bring the pane into view once the picked channel's messages render
+  const activeIdRef = useRef(null);
+  const msgSigRef = useRef("");        // "<channel>:<count>:<last id>" of the rendered messages
+  const scrollNextRef = useRef(false); // scroll to bottom after the next messages render
 
-  async function loadChannels(selectId = null) {
-    const { data } = await api.get("/connect/channels");
-    setChannels(data);
-    if (selectId) setActiveId(selectId);
-    else if (!activeId && data.length) setActiveId(data[0].id);
+  // Open a channel; on the stacked (mobile) layout bring the message pane + composer into view.
+  function revealPane() {
+    paneRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }
+  function selectChannel(id) {
+    setActiveId(id);
+    if (window.matchMedia("(max-width: 1023px)").matches) {
+      revealRef.current = id !== activeIdRef.current;  // same channel: no re-render to wait for
+      requestAnimationFrame(revealPane);  // immediate feedback; repeated after the messages render
+    }
+  }
+
+  async function loadChannels(selectId = null, silent = false) {
+    try {
+      const { data } = await api.get("/connect/channels");
+      const openId = selectId || activeIdRef.current;
+      // the open channel is marked read as messages arrive, so never badge it
+      setChannels(data.map(c => (c.id === openId ? { ...c, unread: 0 } : c)));
+      if (selectId) selectChannel(selectId);
+      else setActiveId(prev => prev || data[0]?.id || null);
+    } catch (e) { if (!silent) toast.error(formatApiError(e)); }
   }
 
   async function loadUsers() {
     try {
-      const { data } = await api.get("/connect/dm-users");
+      const { data } = await api.get("/connect/users");
       setUsers(data || []);
-    } catch {
-      try {
-        const { data } = await api.get("/users");
-        setUsers(data || []);
-      } catch {
-        /* noop */
-      }
-    }
+    } catch (e) { toast.error(formatApiError(e)); }
   }
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { loadChannels(); loadUsers(); }, []);
+  // Load once on mount, then refresh the channel list every 15 s.
+  useEffect(() => {
+    loadChannels(); loadUsers();
+    const t = setInterval(() => loadChannels(null, true), 15000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (dmOpen) {
@@ -84,28 +148,71 @@ export default function WavygoConnect() {
     }
   }, [dmOpen]);
 
-  async function loadMessages(id) {
-    try { const { data } = await api.get(`/connect/channels/${id}/messages`); setMessages(data); }
-    catch (e) { toast.error(formatApiError(e)); }
-  }
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { if (createOpen || addOpen) loadUsers(); }, [createOpen, addOpen]);
+
+  function markRead(id) {
+    api.post(`/connect/channels/${id}/read`).catch(() => { /* retried on the next change */ });
+    setChannels(cs => cs.map(c => (c.id === id && c.unread ? { ...c, unread: 0 } : c)));
+  }
+
+  function isNearBottom() {
+    const el = scrollRef.current;
+    return !el || el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }
+
+  // Only re-render when the channel's messages changed; follow new messages only when the reader
+  // is already near the bottom (or just opened the channel / sent a message).
+  async function loadMessages(id, { scroll = false, silent = false } = {}) {
+    try {
+      const { data } = await api.get(`/connect/channels/${id}/messages`);
+      if (id !== activeIdRef.current) return;
+      const sig = `${id}:${data.length}:${data[data.length - 1]?.id || ""}`;
+      if (sig === msgSigRef.current) return;
+      msgSigRef.current = sig;
+      scrollNextRef.current = scroll || isNearBottom();
+      setMessages(data);
+      markRead(id);
+    } catch (e) { if (!silent) toast.error(formatApiError(e)); }
+  }
   useEffect(() => {
+    activeIdRef.current = activeId;
+    msgSigRef.current = "";
     if (activeId) {
-      loadMessages(activeId);
-      const t = setInterval(() => loadMessages(activeId), 5000);
+      loadMessages(activeId, { scroll: true });
+      const t = setInterval(() => loadMessages(activeId, { silent: true }), 5000);
       return () => clearInterval(t);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeId]);
 
-  useEffect(() => { if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight; }, [messages]);
+  useEffect(() => {
+    if (scrollNextRef.current && scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    scrollNextRef.current = false;
+    if (revealRef.current) { revealRef.current = false; revealPane(); }
+  }, [messages]);
 
   async function createChannel() {
+    if (!form.name.trim() || busy) return;
+    setBusy(true);
     try {
-      const { data } = await api.post("/connect/channels", { name: form.name, kind: form.kind, description: form.description, members: [] });
-      toast.success(`${form.kind} created`);
-      setCreateOpen(false); setForm({ name: "", kind: "channel", description: "" });
+      const members = form.kind === "group" ? form.members : [];
+      const { data } = await api.post("/connect/channels", { name: form.name.trim(), kind: form.kind, description: form.description.trim(), members });
+      toast.success(`${KIND_LABEL[form.kind] || "Channel"} created`);
+      setCreateOpen(false); setForm({ name: "", kind: "channel", description: "", members: [] });
       loadChannels(data.id);
-    } catch (e) { toast.error(formatApiError(e)); }
+    } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
+  }
+
+  async function addMembers() {
+    if (!activeId || addSel.length === 0 || busy) return;
+    setBusy(true);
+    try {
+      await api.post(`/connect/channels/${activeId}/members`, { member_ids: addSel });
+      toast.success(`${addSel.length} member${addSel.length > 1 ? "s" : ""} added`);
+      setAddOpen(false); setAddSel([]);
+      loadChannels();
+    } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
   }
 
   async function openDm(peerId) {
@@ -117,21 +224,24 @@ export default function WavygoConnect() {
   }
 
   async function send() {
-    if (!text.trim() || !activeId) return;
+    if (!text.trim() || !activeId || sendingRef.current) return;
+    sendingRef.current = true;
     try {
       await api.post(`/connect/channels/${activeId}/messages`, { body: text.trim() });
       setText("");
-      loadMessages(activeId);
-      loadChannels();
-    } catch (e) { toast.error(formatApiError(e)); }
+      loadMessages(activeId, { scroll: true });
+      loadChannels(null, true);
+    } catch (e) { toast.error(formatApiError(e)); } finally { sendingRef.current = false; }
   }
 
   const active = channels.find(c => c.id === activeId);
+  const canAddMembers = active?.kind === "group" &&
+    (active.created_by === user?.id || user?.role === "Founder" || user?.role === "Admin");
 
   const grouped = useMemo(() => {
     const g = { announcement: [], channel: [], group: [], dm: [] };
     for (const c of channels) {
-      if (q && !(c.name + (c.description || "")).toLowerCase().includes(q.toLowerCase())) continue;
+      if (q && !((c.display_name || c.name) + " " + (c.description || "")).toLowerCase().includes(q.toLowerCase())) continue;
       (g[c.kind] || (g[c.kind] = [])).push(c);
     }
     return g;
@@ -248,7 +358,9 @@ export default function WavygoConnect() {
             <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
             <Input placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} className="h-8 pl-8 text-[13px]" />
           </div>
-          <ScrollArea className="mt-3 flex-1">
+          {/* Radix renders the viewport content as display:table, which lets long previews widen the list
+              past the card and push unread badges out of view; force a block so rows truncate. */}
+          <ScrollArea className="mt-3 flex-1 [&_[data-radix-scroll-area-viewport]>div]:!block">
             {["announcement", "channel", "group", "dm"].map(kind => (
               (grouped[kind] || []).length > 0 && (
                 <div key={kind} className="mb-4">
@@ -262,7 +374,7 @@ export default function WavygoConnect() {
                       const displayName = c.display_name || c.name;
                       return (
                         <li key={c.id}>
-                          <button onClick={() => setActiveId(c.id)}
+                          <button onClick={() => selectChannel(c.id)}
                                   className={cn(
                                     "w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[13px] transition-colors",
                                     isActive ? "bg-primary/10 text-foreground font-medium" : "text-foreground/80 hover:bg-muted"
@@ -273,7 +385,15 @@ export default function WavygoConnect() {
                                 <AvatarFallback className="text-[8px] bg-wavygo-100 text-wavygo-800">{initials(displayName)}</AvatarFallback>
                               </Avatar>
                             ) : <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
-                            <span className="truncate flex-1 text-left">{displayName}</span>
+                            <span className="flex-1 min-w-0 text-left">
+                              <span className={cn("block truncate", c.unread > 0 && "font-semibold text-foreground")}>{displayName}</span>
+                              {c.last_body && <span className="block truncate text-[11px] font-normal text-muted-foreground">{c.last_body}</span>}
+                            </span>
+                            {c.unread > 0 && !isActive && (
+                              <Badge className="h-4 min-w-4 px-1 text-[10px] rounded-full justify-center shrink-0" data-testid="connect-unread-badge">
+                                {c.unread > 99 ? "99+" : c.unread}
+                              </Badge>
+                            )}
                           </button>
                         </li>
                       );
@@ -286,7 +406,7 @@ export default function WavygoConnect() {
         </Card>
 
         {/* Message pane */}
-        <Card className="border-border flex flex-col overflow-hidden">
+        <Card ref={paneRef} className="border-border flex flex-col overflow-hidden scroll-mt-20">
           {!active ? (
             <EmptyState icon={MessagesSquare} title="Select a channel" description="Pick a channel from the list to start chatting." />
           ) : (
@@ -316,6 +436,11 @@ export default function WavygoConnect() {
                       </div>
                       {active.description && <div className="text-[11.5px] text-muted-foreground">{active.description}</div>}
                     </div>
+                    {canAddMembers && (
+                      <Button variant="outline" size="sm" onClick={() => { setAddSel([]); setAddOpen(true); }} data-testid="connect-add-members-btn">
+                        <UserPlus className="h-4 w-4 mr-1.5" /> Add members
+                      </Button>
+                    )}
                   </>
                 )}
               </div>
@@ -372,8 +497,26 @@ export default function WavygoConnect() {
               </Select>
             </div>
             <div><Label>Description</Label><Textarea rows={2} value={form.description} onChange={(e) => setForm(s => ({ ...s, description: e.target.value }))} /></div>
+            {form.kind === "group" && (
+              <MemberPicker users={users} selected={form.members} onChange={(members) => setForm(s => ({ ...s, members }))} />
+            )}
           </div>
-          <DialogFooter><Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button><Button onClick={createChannel}>Create</Button></DialogFooter>
+          <DialogFooter><Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button><Button onClick={createChannel} disabled={!form.name.trim() || busy} data-testid="connect-create-submit">Create</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Add group members dialog */}
+      <Dialog open={addOpen} onOpenChange={setAddOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="font-display">Add members</DialogTitle>
+            <DialogDescription>{active ? `Add people to ${active.name}.` : ""}</DialogDescription>
+          </DialogHeader>
+          <MemberPicker users={users} selected={addSel} onChange={setAddSel} exclude={active?.members || NO_IDS} />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button>
+            <Button onClick={addMembers} disabled={addSel.length === 0 || busy} data-testid="connect-add-members-submit">Add</Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 

@@ -8,7 +8,10 @@ import uuid
 import pytest
 import requests
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://app-eta-flax-97.vercel.app").rstrip("/")
+# End-to-end suite against a running deployment. Opt in by pointing WAVYGO_E2E_URL at it
+# (e.g. a staging backend); without it the suite is skipped so CI never hits production.
+BASE_URL = os.environ.get("WAVYGO_E2E_URL", "").rstrip("/")
+pytestmark = pytest.mark.skipif(not BASE_URL, reason="set WAVYGO_E2E_URL to run the end-to-end suite")
 API = f"{BASE_URL}/api"
 
 FOUNDER  = {"email": "anilanand635@gmail.com", "password": "Wavygo@2026"}

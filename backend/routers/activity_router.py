@@ -26,6 +26,22 @@ def _serialize(doc):
     }
 
 
+def _scope_check(current: UserPublic):
+    if current.role in ("Employee", "Intern"):
+        raise HTTPException(status_code=403, detail="Activity logs are not available for your role")
+
+
+@router.get("/modules")
+async def list_modules(current: UserPublic = Depends(get_current_user)):
+    """Distinct module names in the caller's visible activity, for the module filter."""
+    db = get_db()
+    _scope_check(current)
+    q = {}
+    if current.role == "Manager":
+        q["user_id"] = {"$in": await _dept_ids(db, current.department)}
+    return sorted(m for m in await db.activity_logs.distinct("module", q) if m)
+
+
 @router.get("")
 async def list_activity(
     limit: int = Query(50, ge=1, le=200),
@@ -33,8 +49,7 @@ async def list_activity(
     current: UserPublic = Depends(get_current_user),
 ):
     db = get_db()
-    if current.role in ("Employee", "Intern"):
-        raise HTTPException(status_code=403, detail="Activity logs are not available for your role")
+    _scope_check(current)
     q = {}
     if module:
         q["module"] = module
