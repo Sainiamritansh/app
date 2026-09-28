@@ -91,6 +91,7 @@ Names only. Never commit `.env` files, passwords or API keys. [`backend/.env.exa
 | `BREVO_SENDER_EMAIL` | with Brevo | Verified sender address |
 | `BREVO_SENDER_NAME` | | Sender display name |
 | `CALENDAR_REMINDER_INTERVAL_SECONDS` | | How often calendar reminders are checked (default `60`) |
+| `MESSAGE_EDIT_WINDOW_MINUTES` | | How long senders can edit or delete a chat message (default `15`; `0` = no limit) |
 | `VAULT_TZ` | | Time zone for vault expiry dates (default `Asia/Kolkata`) |
 | `ANTHROPIC_API_KEY` | for AI | Enables WavyGo AI. Without it the AI page shows a setup message |
 | `ANTHROPIC_MODEL` | | Claude model for WavyGo AI (default `claude-opus-5`) |
@@ -228,7 +229,7 @@ Endpoints: `/api/employees` (list, invite, invitations, resend/revoke, accept-in
 - **Department groups** are created and kept in sync automatically from each employee's department. Their membership follows the org chart, so only Founder/Admin manage them and members can't leave them.
 - **Legacy channels** created before members-only existed stay public and joinable by everyone until a Founder/Admin makes them members-only.
 - **Announcements** are company-wide broadcasts; only Founder and Admin create and post in them.
-- **Edit and delete messages**: hover a message and open its `⋯` menu (Copy text, Edit, Delete). Only the sender can edit (inline; Enter saves, Esc cancels; shown as "(edited)"). The sender can delete their own messages and Founder/Admin can delete any message for moderation (logged in Activity Logs). Deleted messages stay in place as "This message was deleted" and their text is erased. Press `↑` in an empty message box to edit your last message.
+- **Edit and delete messages**: hover a message and open its `⋯` menu (Copy text, Edit, Delete). Only the sender can edit (inline; Enter saves, Esc cancels; shown as "(edited)"). The sender can delete their own messages and Founder/Admin can delete any message for moderation (logged in Activity Logs). Senders can edit or delete only within **15 minutes** of sending (`MESSAGE_EDIT_WINDOW_MINUTES`); Founder/Admin moderation deletes have no time limit. The menu shows how many minutes are left. Deleted messages stay in place as "This message was deleted" and their text is erased. Press `↑` in an empty message box to edit your last message.
 
 Endpoints: `/api/connect/channels` (list, create), `/departments`, `/channels/{id}/members` (list, add, `DELETE …/{user_id}` to remove or leave), `/channels/{id}/admins/{user_id}` (`POST` promote, `DELETE` demote), `POST /channels/{id}/members-only`, `/manage/channels` (Founder/Admin), `/dm-users`, `/users`, `/dm/{peer_id}`, `/channels/{id}/messages` (`PATCH` / `DELETE …/{message_id}` to edit or delete), `/join`, `/read`.
 
@@ -419,7 +420,7 @@ Frontend routes: `/login`, `/accept-invite`, `/reset-password`, `/dashboard`, `/
 
 ### 2026-09-29: chat message edit / delete
 
-- **WavyGo Connect**: edit your own messages (marked "(edited)") and delete them; Founder/Admin can delete any message. Channel previews follow edits and deletions, and other members see changes on the next poll.
+- **WavyGo Connect**: edit your own messages (marked "(edited)") and delete them within 15 minutes of sending; Founder/Admin can delete any message at any time. Channel previews follow edits and deletions, and other members see changes on the next poll.
 
 ### 2026-09-29: calendar redesign and calendar email
 
