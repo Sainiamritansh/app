@@ -1,5 +1,7 @@
 from __future__ import annotations
+import os
 import re
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -19,6 +21,9 @@ PUBLIC_KINDS = ("channel", "announcement")
 # Kinds whose membership is picked by the creator and managed by the channel's admins.
 MEMBER_KINDS = ("channel", "group")
 MANAGER_ROLES = ("Founder", "Admin")
+# Senders can edit or delete their own message only this long after sending (Founder/Admin
+# moderation deletes have no limit). 0 disables the limit.
+MESSAGE_EDIT_WINDOW = timedelta(minutes=float(os.environ.get("MESSAGE_EDIT_WINDOW_MINUTES", "15")))
 ACTIVE_USER = {"status": {"$ne": "deactivated"}, "is_active": {"$ne": False}}
 KIND_NAME = {"channel": "channel", "group": "group", "announcement": "announcement channel"}
 
@@ -563,7 +568,7 @@ async def list_messages(channel_id: str, limit: int = Query(100, ge=1, le=500),
     await _visible_channel(db, channel_id, current)
     docs = await db.messages.find({"channel_id": channel_id}).sort("created_at", -1).to_list(limit)
     docs.reverse()
-    return serialize_many(docs)
+    return [_with_window(d) for d in docs]
 
 
 @router.post("/channels/{channel_id}/messages", status_code=201)
@@ -588,7 +593,7 @@ async def send_message(channel_id: str, payload: MessageCreate, current: UserPub
     await db.channels.update_one({"_id": oid(channel_id)}, {"$set": {"last_message_at": doc["created_at"], "last_body": payload.body[:120]}})
     if ch["kind"] == "announcement":
         await notify(db, None, f"Announcement · {ch['name']}", payload.body[:180], kind="info", link="/wavygo-connect")
-    return serialize(doc)
+    return _with_window(doc)
 
 
 class MessageEdit(BaseModel):
@@ -607,6 +612,39 @@ async def _own_message(db, channel_id: str, message_id: str, current: UserPublic
     return ch, msg
 
 
+def _within_edit_window(msg: dict) -> bool:
+    if not MESSAGE_EDIT_WINDOW:
+        return True
+    try:
+        sent = datetime.fromisoformat(msg["created_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - sent <= MESSAGE_EDIT_WINDOW
+
+
+def _window_label() -> str:
+    minutes = MESSAGE_EDIT_WINDOW.total_seconds() / 60
+    return f"{minutes:g} minute{'s' if minutes != 1 else ''}"
+
+
+def _with_window(doc: dict) -> dict:
+    """Serialize a message and add when its sender's edit/delete window closes (null = no limit)."""
+    out = serialize(doc)
+    if MESSAGE_EDIT_WINDOW and not doc.get("deleted"):
+        try:
+            sent = datetime.fromisoformat(doc["created_at"])
+            if sent.tzinfo is None:
+                sent = sent.replace(tzinfo=timezone.utc)
+            out["editable_until"] = (sent + MESSAGE_EDIT_WINDOW).isoformat()
+        except (KeyError, TypeError, ValueError):
+            out["editable_until"] = None
+    else:
+        out["editable_until"] = None
+    return out
+
+
 async def _refresh_preview(db, channel_id: str, message: dict) -> None:
     """Keep the channel list preview in step when its latest message is edited or deleted."""
     latest = await db.messages.find_one({"channel_id": channel_id}, sort=[("created_at", -1)])
@@ -623,13 +661,15 @@ async def edit_message(channel_id: str, message_id: str, payload: MessageEdit,
     _, msg = await _own_message(db, channel_id, message_id, current)
     if msg.get("sender_id") != current.id:
         raise HTTPException(403, "You can only edit your own messages")
+    if not _within_edit_window(msg):
+        raise HTTPException(403, f"Messages can only be edited within {_window_label()} of sending")
     if payload.body == msg.get("body"):
-        return serialize(msg)
+        return _with_window(msg)
     now = utc_iso()
     await db.messages.update_one({"_id": msg["_id"]}, {"$set": {"body": payload.body, "edited_at": now, "updated_at": now}})
     msg.update(body=payload.body, edited_at=now, updated_at=now)
     await _refresh_preview(db, channel_id, msg)
-    return serialize(msg)
+    return _with_window(msg)
 
 
 @router.delete("/channels/{channel_id}/messages/{message_id}")
@@ -639,8 +679,11 @@ async def delete_message(channel_id: str, message_id: str, current: UserPublic =
     db = get_db()
     ch, msg = await _own_message(db, channel_id, message_id, current)
     own = msg.get("sender_id") == current.id
-    if not own and current.role not in MANAGER_ROLES:
+    moderator = current.role in MANAGER_ROLES
+    if not own and not moderator:
         raise HTTPException(403, "You can only delete your own messages")
+    if own and not moderator and not _within_edit_window(msg):
+        raise HTTPException(403, f"Messages can only be deleted within {_window_label()} of sending")
     now = utc_iso()
     fields = {"deleted": True, "body": "", "attachments": [], "deleted_at": now, "deleted_by": current.id, "updated_at": now}
     await db.messages.update_one({"_id": msg["_id"]}, {"$set": fields})
@@ -649,7 +692,7 @@ async def delete_message(channel_id: str, message_id: str, current: UserPublic =
     if not own:
         await log_activity(db, current, "Deleted message", "WavyGo Connect",
                            target=f"{msg.get('sender_name')} in {ch['name']}")
-    return serialize(msg)
+    return _with_window(msg)
 
 
 @router.post("/channels/{channel_id}/join")

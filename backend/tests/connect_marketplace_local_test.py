@@ -807,3 +807,35 @@ def test_edit_delete_unknown_message(api, users):
     ch = _group_with(api, users["manager"], users["employee"])
     for bad in ("nope", "0" * 24):
         assert call(api, users["employee"], "DELETE", f"/connect/channels/{ch['id']}/messages/{bad}").status_code == 404
+
+
+def _backdate(test_db, message_id, minutes):
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    test_db.messages.update_one({"_id": ObjectId(message_id)}, {"$set": {"created_at": old}})
+
+
+def test_messages_report_edit_window(api, users):
+    ch = _group_with(api, users["manager"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"])
+    assert msg["editable_until"] > msg["created_at"]
+
+
+def test_edit_and_delete_blocked_after_window(api, users, test_db):
+    ch = _group_with(api, users["founder"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"], "old news")
+    _backdate(test_db, msg["id"], 16)
+    path = f"/connect/channels/{ch['id']}/messages/{msg['id']}"
+    r = call(api, users["employee"], "PATCH", path, json={"body": "rewrite"})
+    assert r.status_code == 403 and "15 minutes" in r.text
+    assert call(api, users["employee"], "DELETE", path).status_code == 403
+    # Founder/Admin moderation has no time limit.
+    assert call(api, users["founder"], "DELETE", path).status_code == 200
+
+
+def test_edit_allowed_just_inside_window(api, users, test_db):
+    ch = _group_with(api, users["manager"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"], "fresh")
+    _backdate(test_db, msg["id"], 14)
+    r = call(api, users["employee"], "PATCH", f"/connect/channels/{ch['id']}/messages/{msg['id']}", json={"body": "fresher"})
+    assert r.status_code == 200, r.text

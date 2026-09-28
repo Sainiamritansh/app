@@ -116,6 +116,15 @@ export default function WavygoConnect() {
   const [editText, setEditText] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
   const [deleting, setDeleting] = useState(null);     // message awaiting delete confirmation
+  // Re-render every 30s so Edit/Delete disappear once a message's edit window closes.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(t);
+  }, []);
+  // Senders may edit/delete for a limited time (server-enforced; `editable_until` null = no limit).
+  const withinWindow = (m) => !m.editable_until || new Date(m.editable_until).getTime() > now;
+  const minutesLeft = (m) => (m.editable_until ? Math.max(1, Math.ceil((new Date(m.editable_until).getTime() - now) / 60000)) : null);
   const [text, setText] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [dmOpen, setDmOpen] = useState(false);
@@ -671,8 +680,10 @@ export default function WavygoConnect() {
                 {messages.length === 0 && <div className="text-center text-sm text-muted-foreground py-16">No messages yet. Say hello 👋</div>}
                 {messages.map(m => {
                   const mine = m.sender_id === user?.id;
-                  const canEditMsg = mine && !m.deleted;
-                  const canDeleteMsg = !m.deleted && (mine || isOrgAdmin);
+                  const open = withinWindow(m);
+                  const canEditMsg = mine && !m.deleted && open;
+                  const canDeleteMsg = !m.deleted && (isOrgAdmin || (mine && open));
+                  const left = mine && open ? minutesLeft(m) : null;
                   const editing = editingId === m.id;
                   return (
                     <div key={m.id} className={cn("group flex gap-2.5", mine && "flex-row-reverse")} data-testid="connect-message">
@@ -727,6 +738,12 @@ export default function WavygoConnect() {
                               <DropdownMenuContent align={mine ? "end" : "start"} className="w-40">
                                 <DropdownMenuItem onSelect={() => copyMessage(m)}><Copy className="h-4 w-4 mr-2" />Copy text</DropdownMenuItem>
                                 {canEditMsg && <DropdownMenuItem onSelect={() => startEdit(m)} data-testid="connect-message-edit"><Pencil className="h-4 w-4 mr-2" />Edit</DropdownMenuItem>}
+                                {mine && !open && !isOrgAdmin && (
+                                  <div className="px-2 py-1.5 text-[11px] text-muted-foreground">Edit and delete are only possible for 15 minutes after sending.</div>
+                                )}
+                                {left !== null && (
+                                  <div className="px-2 py-1 text-[11px] text-muted-foreground">Editable for {left} more min</div>
+                                )}
                                 {canDeleteMsg && (
                                   <>
                                     <DropdownMenuSeparator />
@@ -750,7 +767,7 @@ export default function WavygoConnect() {
                   <Input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => {
                            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
                            else if (e.key === "ArrowUp" && !text) {
-                             const last = [...messages].reverse().find((m) => m.sender_id === user?.id && !m.deleted);
+                             const last = [...messages].reverse().find((m) => m.sender_id === user?.id && !m.deleted && withinWindow(m));
                              if (last) { e.preventDefault(); startEdit(last); }
                            }
                          }}
