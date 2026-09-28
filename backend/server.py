@@ -120,9 +120,9 @@ async def _startup():
     get_db()
     try:
         await seed_all()
-        logger.info("Founder account verification complete.")
+        logger.info("Startup seed complete (Founder account created from env only if none existed).")
     except Exception as e:
-        logger.exception("Startup user verification failed: %s", e)
+        logger.exception("Startup seed failed: %s", e)
     try:
         db = get_db()
         await ensure_calendar_indexes(db)

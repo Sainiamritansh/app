@@ -10,6 +10,7 @@ import { Progress } from "@/components/ui/progress";
 import { api, formatApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import FolderSelect from "./FolderSelect";
+import AccessPicker, { EVERYONE_ACCESS } from "./AccessPicker";
 import { ACCEPT, extOf, formatBytes, parseTags, typeMeta, validateFile } from "./vaultUtils";
 
 const EXT_TYPES = {
@@ -20,7 +21,7 @@ const EXT_TYPES = {
   csv: "text/csv", txt: "text/plain",
 };
 
-const EMPTY = { title: "", folderId: "", tags: "", expiresOn: "", description: "" };
+const EMPTY = { title: "", folderId: "", tags: "", expiresOn: "", description: "", access: EVERYONE_ACCESS };
 
 /** Drag-and-drop / file-picker zone shared by the upload and new-version dialogs. */
 export function DropZone({ file, onFile, disabled, testId }) {
@@ -120,6 +121,7 @@ export default function UploadDialog({ open, onOpenChange, folders, defaultFolde
     if (tags.length) body.append("tags", tags.join(","));
     if (form.expiresOn) body.append("expires_on", form.expiresOn);
     if (form.description.trim()) body.append("description", form.description.trim());
+    body.append("access", JSON.stringify(form.access));
     setProgress(0);
     try {
       const { data } = await api.post("/vault/documents", body, {
@@ -138,7 +140,7 @@ export default function UploadDialog({ open, onOpenChange, folders, defaultFolde
       <DialogContent className="max-w-lg max-h-[92vh] overflow-y-auto" data-testid="vault-upload-dialog">
         <DialogHeader>
           <DialogTitle className="font-display tracking-tight">Upload document</DialogTitle>
-          <DialogDescription>Stored privately in the Company Vault. Only Founders can access it.</DialogDescription>
+          <DialogDescription>Stored privately in the Company Vault. Choose who can see it below; Founders and Admins always can.</DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           <DropZone file={file} onFile={chooseFile} disabled={busy} testId="vault-dropzone" />
@@ -166,6 +168,8 @@ export default function UploadDialog({ open, onOpenChange, folders, defaultFolde
             <Label htmlFor="vault-desc">Description</Label>
             <Textarea id="vault-desc" rows={2} value={form.description} onChange={set("description")} maxLength={2000} disabled={busy} />
           </div>
+          <AccessPicker value={form.access} onChange={(access) => setForm((f) => ({ ...f, access }))} disabled={busy}
+                        idPrefix="vault-upload-access" />
           {busy && (
             <div className="space-y-1.5">
               <Progress value={progress} className="h-1.5" />

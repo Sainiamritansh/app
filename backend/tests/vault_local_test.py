@@ -1,10 +1,13 @@
-"""Company Vault API tests — RBAC, folders, upload/download round trip, type and
-size validation, versions, metadata edits, deletes (GridFS cleanup), stats and
-expiry reminders.
+"""Company Vault API tests — RBAC (everyone views, Founder/Admin manage), per-item access
+(roles / departments / people, folder cascade, 404 for hidden items), folders, upload/download
+round trip, type and size validation, versions, metadata edits, deletes (GridFS cleanup), stats
+and expiry reminders.
 
 Runs against an isolated server and throwaway database (see local_harness.py).
 """
 import hashlib
+import json
+import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -32,25 +35,146 @@ def _day(offset: int) -> str:
     return (TODAY + timedelta(days=offset)).isoformat()
 
 
+def _access(**kw) -> dict:
+    return {"mode": "restricted", "roles": [], "departments": [], "user_ids": [], **kw}
+
+
+def _uname(prefix: str) -> str:
+    return f"{prefix} {uuid.uuid4().hex[:6]}"
+
+
+def _list_ids(api, user, **params) -> set:
+    r = call(api, user, "GET", "/vault/documents", params={"page_size": 100, **params})
+    assert r.status_code == 200, r.text
+    return {d["id"] for d in r.json()["items"]}
+
+
 # ------------------------- RBAC -------------------------
 
-@pytest.mark.parametrize("role", ["admin", "manager", "employee", "intern"])
-@pytest.mark.parametrize("method,path", [
-    ("GET", "/vault/documents"), ("GET", "/vault/stats"), ("GET", "/vault/folders"),
-    ("GET", "/vault/tags"), ("POST", "/vault/reminders/run"),
-])
-def test_non_founders_forbidden(api, users, role, method, path):
-    assert call(api, users[role], method, path).status_code == 403
+@pytest.mark.parametrize("role", ["founder", "admin", "manager", "employee", "intern"])
+@pytest.mark.parametrize("path", ["/vault/documents", "/vault/stats", "/vault/folders", "/vault/tags"])
+def test_every_role_can_view(api, users, role, path):
+    assert call(api, users[role], "GET", path).status_code == 200
 
 
-def test_non_founder_cannot_upload_or_download(api, users, test_db):
-    assert _upload(api, users["admin"]).status_code == 403
-    assert _upload(api, users["employee"]).status_code == 403
+@pytest.mark.parametrize("role", ["manager", "employee", "intern"])
+def test_view_only_roles_cannot_manage(api, users, role):
+    u = users[role]
+    assert _upload(api, u).status_code == 403
+    assert call(api, u, "POST", "/vault/folders", json={"name": _uname("Nope")}).status_code == 403
+    assert call(api, u, "POST", "/vault/reminders/run").status_code == 403
     doc = _ok_upload(api, users, title="RBAC doc")
-    for role in ("admin", "employee"):
-        assert call(api, users[role], "GET", f"/vault/documents/{doc['id']}/download").status_code == 403
-        assert call(api, users[role], "DELETE", f"/vault/documents/{doc['id']}").status_code == 403
-        assert call(api, users[role], "PATCH", f"/vault/documents/{doc['id']}", json={"title": "x"}).status_code == 403
+    assert call(api, u, "GET", f"/vault/documents/{doc['id']}").json()["can_edit"] is False
+    assert call(api, u, "GET", f"/vault/documents/{doc['id']}/download").status_code == 200
+    assert call(api, u, "DELETE", f"/vault/documents/{doc['id']}").status_code == 403
+    assert call(api, u, "PATCH", f"/vault/documents/{doc['id']}", json={"title": "x"}).status_code == 403
+    assert call(api, u, "POST", f"/vault/documents/{doc['id']}/versions",
+                files={"file": ("x.pdf", PDF)}).status_code == 403
+
+
+def test_admin_can_manage(api, users):
+    a = users["admin"]
+    r = _upload(api, a, title="Admin doc")
+    assert r.status_code == 201, r.text
+    assert r.json()["can_edit"] is True
+    doc = _ok_upload(api, users, title="Founder doc")
+    assert call(api, a, "PATCH", f"/vault/documents/{doc['id']}", json={"title": "Renamed"}).status_code == 200
+    assert call(api, a, "POST", "/vault/reminders/run").status_code == 200
+
+
+def test_owner_without_manage_permission_cannot_edit(api, users, test_db):
+    """A document uploaded by someone whose role no longer has vault.manage is view-only for them."""
+    m = users["manager"]
+    doc = _ok_upload(api, users, title="Legacy manager upload")
+    test_db.vault_documents.update_one({"_id": ObjectId(doc["id"])}, {"$set": {"uploaded_by": m["id"]}})
+    assert call(api, m, "GET", f"/vault/documents/{doc['id']}").json()["can_edit"] is False
+    assert call(api, m, "PATCH", f"/vault/documents/{doc['id']}", json={"title": "x"}).status_code == 403
+    assert call(api, m, "DELETE", f"/vault/documents/{doc['id']}").status_code == 403
+
+
+# ------------------------- per-item access -------------------------
+
+def test_role_restricted_document_is_hidden(api, users):
+    doc = _ok_upload(api, users, title="Managers only", tags="mgr-only-tag",
+                     access=json.dumps(_access(roles=["Manager"])))
+    assert doc["access"]["mode"] == "restricted" and doc["access"]["roles"] == ["Manager"]
+    assert doc["id"] in _list_ids(api, users["manager"])
+    assert doc["id"] in _list_ids(api, users["admin"])
+    e = users["employee"]
+    assert doc["id"] not in _list_ids(api, e)
+    assert call(api, e, "GET", f"/vault/documents/{doc['id']}").status_code == 404
+    assert call(api, e, "GET", f"/vault/documents/{doc['id']}/download").status_code == 404
+    assert call(api, e, "GET", f"/vault/documents/{doc['id']}/versions/1/download").status_code == 404
+    assert "mgr-only-tag" not in {t["tag"] for t in call(api, e, "GET", "/vault/tags").json()}
+    assert "mgr-only-tag" in {t["tag"] for t in call(api, users["manager"], "GET", "/vault/tags").json()}
+
+
+def test_department_and_person_access(api, users, test_db):
+    dept_doc = _ok_upload(api, users, title="Tech handbook", access=json.dumps(_access(departments=["  Tech "])))
+    assert dept_doc["access"]["departments"] == ["Tech"]
+    assert dept_doc["id"] in _list_ids(api, users["employee"])       # Tech
+    assert dept_doc["id"] not in _list_ids(api, users["employee2"])  # Sales
+
+    e2 = users["employee2"]
+    person_doc = _ok_upload(api, users, title="For employee2", access=json.dumps(_access(user_ids=[e2["id"]])))
+    assert person_doc["id"] in _list_ids(api, e2)
+    assert person_doc["id"] not in _list_ids(api, users["employee"])
+    assert test_db.notifications.count_documents(
+        {"user_id": e2["id"], "title": "Document shared with you", "link": f"/company-vault?doc={person_doc['id']}"}) == 1
+
+    nobody = _ok_upload(api, users, title="Owner only", access=json.dumps(_access()))
+    assert nobody["id"] not in _list_ids(api, users["manager"])
+    assert nobody["id"] in _list_ids(api, users["admin"])
+
+
+def test_restricted_folder_hides_its_documents(api, users, test_db):
+    f, e, e2 = users["founder"], users["employee"], users["employee2"]
+    folder = call(api, f, "POST", "/vault/folders",
+                  json={"name": _uname("Board"), "access": _access(user_ids=[e2["id"]])}).json()
+    doc = _ok_upload(api, users, title="Board minutes", folder_id=folder["id"])  # document itself: everyone
+    assert doc["id"] in _list_ids(api, e2)
+    assert folder["id"] in {x["id"] for x in call(api, e2, "GET", "/vault/folders").json()["folders"]}
+    assert doc["id"] not in _list_ids(api, e)
+    assert call(api, e, "GET", f"/vault/documents/{doc['id']}").status_code == 404
+    assert folder["id"] not in {x["id"] for x in call(api, e, "GET", "/vault/folders").json()["folders"]}
+    assert all(g["folder_id"] != folder["id"] for g in call(api, e, "GET", "/vault/stats").json()["by_folder"])
+
+    # Sharing a document with someone the folder still hides does not notify them.
+    shared = _ok_upload(api, users, title="Hidden share", folder_id=folder["id"],
+                        access=json.dumps(_access(user_ids=[e["id"]])))
+    assert test_db.notifications.count_documents({"user_id": e["id"], "link": f"/company-vault?doc={shared['id']}"}) == 0
+    assert call(api, e, "GET", f"/vault/documents/{shared['id']}").status_code == 404
+
+
+def test_document_in_deleted_folder_is_hidden(api, users, test_db):
+    f, e = users["founder"], users["employee"]
+    folder = call(api, f, "POST", "/vault/folders", json={"name": _uname("Gone")}).json()
+    doc = _ok_upload(api, users, title="Orphan", folder_id=folder["id"])
+    assert doc["id"] in _list_ids(api, e)
+    test_db.vault_folders.delete_one({"_id": ObjectId(folder["id"])})
+    assert doc["id"] not in _list_ids(api, e)
+    assert call(api, e, "GET", f"/vault/documents/{doc['id']}").status_code == 404
+    assert call(api, f, "GET", f"/vault/documents/{doc['id']}").status_code == 200
+
+
+def test_access_change_logged_only_when_changed(api, users, test_db):
+    f, e2 = users["founder"], users["employee2"]
+    doc = _ok_upload(api, users, title=_uname("Access log"))
+
+    def logs():
+        return test_db.activity_logs.count_documents({"action": "Changed document access", "target": doc["title"]})
+
+    r = call(api, f, "PATCH", f"/vault/documents/{doc['id']}", json={"access": doc["access"]})
+    assert r.status_code == 200 and logs() == 0
+    restricted = _access(user_ids=[e2["id"]])
+    assert call(api, f, "PATCH", f"/vault/documents/{doc['id']}", json={"access": restricted}).status_code == 200
+    assert logs() == 1
+    link = f"/company-vault?doc={doc['id']}"
+    assert test_db.notifications.count_documents({"user_id": e2["id"], "link": link}) == 1
+    # Re-sending the same access with another edit: no new access log or notification.
+    call(api, f, "PATCH", f"/vault/documents/{doc['id']}", json={"access": restricted, "description": "x"})
+    assert logs() == 1
+    assert test_db.notifications.count_documents({"user_id": e2["id"], "link": link}) == 1
 
 
 def test_unauthenticated(api):
@@ -78,7 +202,7 @@ def test_folder_crud(api, users, test_db):
     assert call(api, f, "DELETE", f"/vault/folders/{folder['id']}").status_code == 200
     assert test_db.vault_folders.count_documents({"_id": ObjectId(folder["id"])}) == 0
     assert call(api, f, "DELETE", f"/vault/folders/{folder['id']}").status_code == 404
-    assert call(api, users["admin"], "POST", "/vault/folders", json={"name": "Nope"}).status_code == 403
+    assert call(api, users["manager"], "POST", "/vault/folders", json={"name": "Nope"}).status_code == 403
     assert test_db.activity_logs.count_documents({"module": "Company Vault", "action": "Created vault folder"}) >= 1
 
 
@@ -177,7 +301,7 @@ def test_versions_restore_and_download(api, users, test_db):
 
     bad = call(api, f, "POST", f"/vault/documents/{doc['id']}/versions", files={"file": ("x.pdf", b"nope")})
     assert bad.status_code == 400
-    assert call(api, users["admin"], "POST", f"/vault/documents/{doc['id']}/versions",
+    assert call(api, users["employee"], "POST", f"/vault/documents/{doc['id']}/versions",
                 files={"file": ("x.pdf", PDF)}).status_code == 403
 
 

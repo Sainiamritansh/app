@@ -256,7 +256,7 @@ def test_operations_company_wide(api, users, data):
         d = ok(api, users[who], "/operations", **MARCH)
         t = d["tasks"]
         assert (t["created"], t["completed"], t["avg_cycle_days"]) == (2, 2, 4.0)
-        assert t["granularity"] == "week"
+        assert t["granularity"] == "day"
         assert t["overdue_total"] == 3
         depts = {x["department"]: x["overdue"] for x in t["overdue_by_department"]}
         assert depts == {"Tech": 1, "Sales": 1, "Unassigned": 1}

@@ -112,6 +112,23 @@ class CouponPayload(_Payload):
         # Codes are redeemed case-insensitively, so store one canonical spelling.
         return v.upper()
 
+    @field_validator("valid_from", "valid_till")
+    @classmethod
+    def _iso_day(cls, v: Optional[str]) -> Optional[str]:
+        # Validity is compared as YYYY-MM-DD text against today's IST date.
+        if v is None:
+            return v
+        try:
+            return datetime.strptime(v[:10], "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            raise ValueError("must be a date (YYYY-MM-DD)")
+
+    @model_validator(mode="after")
+    def _date_order(self):
+        if self.valid_from and self.valid_till and self.valid_from > self.valid_till:
+            raise ValueError("Valid from must be on or before valid till")
+        return self
+
 
 class ReviewPayload(_Payload):
     booking_id: Optional[str] = None
@@ -135,6 +152,14 @@ class BookingCreate(BookingIn):
     coupon_code: Optional[str] = Field(default=None, max_length=40)
 
 
+async def _release_coupon(db, code: str):
+    """Give back one use of a coupon (booking cancelled); never below zero."""
+    code = code.strip().upper()
+    await db.coupons.update_one(
+        {"code": {"$regex": f"^{re.escape(code)}$", "$options": "i"}, "used_count": {"$gt": 0}},
+        {"$inc": {"used_count": -1}})
+
+
 async def _redeem_coupon(db, code: str) -> dict:
     """Validate a coupon and count one use atomically (a limit of 0 means unlimited)."""
     code = code.strip().upper()
@@ -152,6 +177,12 @@ async def _redeem_coupon(db, code: str) -> dict:
     if res.modified_count == 0:
         raise HTTPException(409, f"Coupon {code} has reached its usage limit")
     return coupon
+
+
+async def _notify_founders(db, title: str, body: str, kind: str = "info"):
+    """Marketplace is Founder-only, so its alerts go to Founders rather than a company-wide broadcast."""
+    async for u in db.users.find({"role": "Founder", "status": {"$ne": "deactivated"}}, {"_id": 1}):
+        await notify(db, str(u["_id"]), title, body, kind=kind, link="/marketplace")
 
 
 def _validate(model_cls, data: dict) -> dict:
@@ -413,7 +444,7 @@ async def create_booking(payload: BookingCreate, current: UserPublic = Depends(g
     doc["_id"] = res.inserted_id
     await _sync_vehicle_status(db, payload.vehicle_id, doc["status"])
     await log_activity(db, current, "Created booking", "Marketplace", target=f"{doc['customer_name']} · {doc['vehicle_label']}")
-    await notify(db, None, "New booking created", f"{doc['customer_name']} booked {doc['vehicle_label']} in {doc['city']}.", kind="success", link="/marketplace")
+    await _notify_founders(db, "New booking created", f"{doc['customer_name']} booked {doc['vehicle_label']} in {doc['city']}.", kind="success")
     return serialize(doc)
 
 
@@ -438,7 +469,13 @@ async def update_booking_status(booking_id: str, payload: dict, current: UserPub
         vehicle = await db.vehicles.find_one({"_id": ObjectId(booking["vehicle_id"])}, {"status": 1})
         if vehicle and vehicle.get("status") in ("maintenance", "retired"):
             raise HTTPException(409, f"Vehicle is not available ({vehicle['status']})")
-    await db.bookings.update_one({"_id": booking["_id"]}, {"$set": {"status": status, "updated_at": utc_iso()}})
+    res = await db.bookings.update_one({"_id": booking["_id"], "status": current_status},
+                                       {"$set": {"status": status, "updated_at": utc_iso()}})
+    # Cancelling returns the coupon use it redeemed; the status-guarded update makes a repeat
+    # (or concurrent) cancel a no-op, so the use is given back once.
+    if (status == "cancelled" and current_status != "cancelled" and res.modified_count
+            and booking.get("coupon_code")):
+        await _release_coupon(db, booking["coupon_code"])
     await _sync_vehicle_status(db, booking.get("vehicle_id"), status)
     doc = await db.bookings.find_one({"_id": booking["_id"]})
     await log_activity(db, current, f"Booking → {status}", "Marketplace", target=doc.get("customer_name"))
@@ -489,9 +526,8 @@ async def update_kyc(kyc_id: str, payload: dict, current: UserPublic = Depends(g
     if ObjectId.is_valid(doc.get("subject_id") or ""):
         await db[subject_col].update_one({"_id": ObjectId(doc["subject_id"])}, {"$set": {"kyc_status": status}})
     await log_activity(db, current, f"KYC {status}", "Marketplace", target=doc["subject_name"])
-    await notify(db, None, f"KYC {status}", f"{doc['subject_name']} KYC marked {status}.",
-                 kind="success" if status == "approved" else ("warning" if status == "rejected" else "info"),
-                 link="/marketplace")
+    await _notify_founders(db, f"KYC {status}", f"{doc['subject_name']} KYC marked {status}.",
+                           kind="success" if status == "approved" else ("warning" if status == "rejected" else "info"))
     return serialize(doc)
 
 
@@ -520,7 +556,7 @@ async def create_support(payload: SupportPayload, current: UserPublic = Depends(
     res = await db.support_tickets.insert_one(doc)
     doc["_id"] = res.inserted_id
     await log_activity(db, current, "Support ticket opened", "Marketplace", target=doc["subject"])
-    await notify(db, None, "New support ticket", doc["subject"], kind="warning", link="/marketplace")
+    await _notify_founders(db, "New support ticket", doc["subject"], kind="warning")
     return serialize(doc)
 
 

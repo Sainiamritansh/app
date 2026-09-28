@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { Lock } from "lucide-react";
 import { PageHeader, EmptyState } from "@/components/module/ModulePrimitives";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { usePermission } from "@/hooks/usePermission";
-import FilterBar, { presetRange } from "@/components/analytics/FilterBar";
+import FilterBar, { DEFAULT_DAYS, parseDays, presetRange, todayIST } from "@/components/analytics/FilterBar";
 import MarketplaceTab from "@/components/analytics/MarketplaceTab";
 import OperationsTab from "@/components/analytics/OperationsTab";
 import { ErrorPanel, useAnalyticsData } from "@/components/analytics/shared";
@@ -15,17 +16,27 @@ export default function Analytics() {
   const meta = useAnalyticsData("/analytics/meta", null, can("analytics.view"));
   const m = meta.data;
 
-  const [preset, setPreset] = useState("30d");
-  const [custom, setCustom] = useState(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const days = parseDays(searchParams.get("days"));
+  const setDays = useCallback((d) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (d === DEFAULT_DAYS) next.delete("days"); else next.set("days", String(d));
+      return next;
+    }, { replace: true });
+  }, [setSearchParams]);
   const [city, setCity] = useState("");
   const [department, setDepartment] = useState("");
   const [tab, setTab] = useState(null);
   const [nonce, setNonce] = useState(0);
 
-  const range = useMemo(
-    () => (preset === "custom" && custom ? custom : presetRange(preset, m?.today)),
-    [preset, custom, m?.today],
-  );
+  // IST "today" re-checked every minute, so the range (and its label) rolls over at midnight.
+  const [today, setToday] = useState(todayIST);
+  useEffect(() => {
+    const t = setInterval(() => setToday(todayIST()), 60000);
+    return () => clearInterval(t);
+  }, []);
+  const range = useMemo(() => presetRange(days, today), [days, today]);
 
   useEffect(() => {
     if (m && !tab) setTab(m.marketplace ? "marketplace" : "operations");
@@ -73,9 +84,7 @@ export default function Analytics() {
               </TabsList>
             )}
             <FilterBar
-              preset={preset} range={range}
-              onPreset={(p) => { setPreset(p); setCustom(null); }}
-              onCustom={(r) => { setCustom(r); setPreset("custom"); }}
+              days={days} range={range} onDays={setDays}
               showCity={active === "marketplace"} cities={m.cities} city={city} onCity={setCity}
               showDepartment={active === "operations"} departments={m.departments}
               department={m.department_locked || department} onDepartment={setDepartment}

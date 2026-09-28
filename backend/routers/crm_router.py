@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 from db import get_db
 from auth_utils import get_current_user
@@ -528,6 +528,114 @@ async def customer_360(customer_id: str, current: UserPublic = Depends(view_user
         "followups": [_followup_out(f, today) for f in followups],
         "timeline": _timeline(bookings, tickets, kycs, reviews, notes, followups),
     }
+
+
+# ------------------------- customer records -------------------------
+# Marketplace customer CRUD is Founder-only; CRM editors (Founder/Admin/Manager) add and maintain
+# customer records here. Same `customers` collection and shape as Marketplace creates.
+
+class CustomerCreate(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(..., min_length=1, max_length=200)
+    email: EmailStr
+    phone: Optional[str] = Field(None, max_length=40)
+    city: str = Field(..., min_length=1, max_length=100)
+    tags: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def _blank_phone(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v
+
+
+class CustomerPatch(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: Optional[str] = Field(None, min_length=1, max_length=200)
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = Field(None, max_length=40)
+    city: Optional[str] = Field(None, min_length=1, max_length=100)
+
+    @field_validator("phone", mode="before")
+    @classmethod
+    def _blank_phone(cls, v):
+        return None if isinstance(v, str) and not v.strip() else v
+
+
+async def _ensure_unique_email(db, email: str, exclude: Optional[ObjectId] = None):
+    q: dict = {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}
+    if exclude is not None:
+        q["_id"] = {"$ne": exclude}
+    if await db.customers.find_one(q, {"_id": 1}):
+        raise HTTPException(409, f"A customer with email {email} already exists")
+
+
+@router.post("/customers", status_code=201)
+async def create_customer(payload: CustomerCreate, current: UserPublic = Depends(edit_user)):
+    db = get_db()
+    try:
+        tags = _clean_tags(payload.tags)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    email = str(payload.email).lower()
+    await _ensure_unique_email(db, email)
+    now = utc_iso()
+    doc = {"name": payload.name, "email": email, "phone": payload.phone, "city": payload.city,
+           "kyc_status": "pending", "created_at": now, "updated_at": now}
+    res = await db.customers.insert_one(doc)
+    cid = str(res.inserted_id)
+    if tags:
+        await db.crm_profiles.update_one(
+            {"customer_id": cid},
+            {"$set": {"tags": tags, "updated_at": now, "updated_by": current.id},
+             "$setOnInsert": {"customer_id": cid, "created_at": now}},
+            upsert=True,
+        )
+    await log_activity(db, current, "Added customer", MODULE, target=payload.name, meta={"customer_id": cid})
+    rows = await _compute_rows(db, {"_id": res.inserted_id})
+    return rows[0]
+
+
+@router.patch("/customers/{customer_id}")
+async def update_customer(customer_id: str, payload: CustomerPatch, current: UserPublic = Depends(edit_user)):
+    db = get_db()
+    c = await _customer_or_404(db, customer_id)
+    changes = {k: v for k, v in payload.model_dump(exclude_unset=True).items()
+               if v is not None or k == "phone"}
+    if "email" in changes:
+        changes["email"] = str(changes["email"]).lower()
+        if changes["email"] != (c.get("email") or "").lower():
+            await _ensure_unique_email(db, changes["email"], exclude=c["_id"])
+    changes = {k: v for k, v in changes.items() if v != c.get(k)}
+    if changes:
+        changes["updated_at"] = utc_iso()
+        await db.customers.update_one({"_id": c["_id"]}, {"$set": changes})
+        if "name" in changes:
+            # Keep the denormalised name on CRM records in step.
+            await db.crm_notes.update_many({"customer_id": customer_id}, {"$set": {"customer_name": changes["name"]}})
+            await db.crm_followups.update_many({"customer_id": customer_id}, {"$set": {"customer_name": changes["name"]}})
+        await log_activity(db, current, "Updated customer", MODULE, target=changes.get("name", c.get("name")),
+                           meta={"customer_id": customer_id, "fields": [k for k in changes if k != "updated_at"]})
+    rows = await _compute_rows(db, {"_id": c["_id"]})
+    return rows[0]
+
+
+@router.delete("/customers/{customer_id}")
+async def delete_customer(customer_id: str, current: UserPublic = Depends(edit_user)):
+    db = get_db()
+    c = await _customer_or_404(db, customer_id)
+    bookings = await db.bookings.count_documents({"customer_id": customer_id})
+    if bookings:
+        raise HTTPException(409, f"This customer has {bookings} booking(s) and can't be deleted")
+    tickets = await db.support_tickets.count_documents({"customer_id": customer_id})
+    if tickets:
+        raise HTTPException(409, f"This customer has {tickets} support ticket(s) and can't be deleted")
+    await db.customers.delete_one({"_id": c["_id"]})
+    await db.crm_profiles.delete_many({"customer_id": customer_id})
+    await db.crm_notes.delete_many({"customer_id": customer_id})
+    await db.crm_followups.delete_many({"customer_id": customer_id})
+    await db.kyc_requests.delete_many({"subject_type": "customer", "subject_id": customer_id})
+    await log_activity(db, current, "Deleted customer", MODULE, target=c.get("name"), meta={"customer_id": customer_id})
+    return {"ok": True}
 
 
 # ------------------------- tags -------------------------

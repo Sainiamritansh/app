@@ -327,8 +327,9 @@ async def create_task(payload: TaskIn, background_tasks: BackgroundTasks, curren
     # Notify assigned employee with the exact task ID
     if doc.get("assignee_id") and doc["assignee_id"] != current.id:
         await notify(db, doc["assignee_id"], "New task assigned",
-                     f"{current.name} assigned you: {doc['title']}", kind="info", link="/task-board")
-    if doc.get("assignee_id"):
+                     f"{current.name} assigned you: {doc['title']}", kind="info",
+                     link=f"/task-board?task_id={doc['_id']}")
+        # Self-assignment gets no email, same as the in-app notification.
         await notify_assignment_by_email(
             db=db,
             assignee_id=doc["assignee_id"],
@@ -429,7 +430,7 @@ async def update_task(task_id: str, payload: TaskPatchIn, background_tasks: Back
         await notify(db, new_assignee, "Task reassigned to you",
                      f"{current.name} moved '{doc['title']}' to you", kind="info",
                      link=f"/task-board?task_id={task_id}")
-    if new_assignee:
+    if new_assignee and new_assignee != current.id:
         await notify_assignment_by_email(
             db=db,
             assignee_id=new_assignee,

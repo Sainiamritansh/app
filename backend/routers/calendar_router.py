@@ -424,7 +424,10 @@ async def update_event(event_id: str, payload: CalendarEventPatch, current: User
         await _validate_participants(db, updates["participant_ids"])
     if "start_time" in updates or "reminder_minutes" in updates:
         minutes = updates["reminder_minutes"] if "reminder_minutes" in updates else existing.get("reminder_minutes")
-        updates.update(_reminder_fields(start, minutes))
+        # The edit form always resends start_time and reminder_minutes; only re-arm the reminder when
+        # one of them actually changed, or every edit (even a title fix) would send the reminder again.
+        if start != _as_utc(existing["start_time"]) or minutes != existing.get("reminder_minutes"):
+            updates.update(_reminder_fields(start, minutes))
     if not updates:
         return (await _serialize_events(db, [existing]))[0]
 
@@ -557,14 +560,18 @@ async def day_view(
 
 @router.get("/agenda")
 async def agenda(
-    start: Optional[str] = Query(None, description="Agenda start, YYYY-MM-DD or ISO 8601 datetime. Defaults to now."),
+    start: Optional[str] = Query(None, description="Agenda start, YYYY-MM-DD or ISO 8601 datetime. Defaults to the start of today in `tz`."),
     days: int = Query(30, ge=1, le=MAX_RANGE_DAYS),
     filters: EventFilters = Depends(),
     pagination: Pagination = Depends(),
     current: UserPublic = Depends(get_current_user),
 ):
-    """Upcoming events (including ones already in progress) for the next `days` days, paginated."""
-    range_start = _parse_instant(start, filters.zone, "start") if start else datetime.now(timezone.utc)
+    """Events for the next `days` days, paginated. The default start is local midnight today
+    (not "now"), so meetings earlier today are still listed under today."""
+    if start:
+        range_start = _parse_instant(start, filters.zone, "start")
+    else:
+        range_start = _local_midnight(datetime.now(filters.zone).date(), filters.zone)
     range_end = range_start + timedelta(days=days)
     db = get_db()
     result = await _paginate(db, _build_query(current, range_start, range_end, filters), pagination)

@@ -176,3 +176,55 @@ export function MonthSelect({ value, onChange, allowAll = false, testid, classNa
 }
 
 export const TH = "text-[11px] uppercase tracking-[0.1em]";
+
+export const VENDOR_CATEGORIES = [
+  { value: "fleet_partner", label: "Fleet partner" },
+  { value: "maintenance", label: "Maintenance & repairs" },
+  { value: "fuel_charging", label: "Fuel & charging" },
+  { value: "insurance", label: "Insurance" },
+  { value: "marketing", label: "Marketing" },
+  { value: "software", label: "Software & SaaS" },
+  { value: "rent_utilities", label: "Rent & utilities" },
+  { value: "logistics", label: "Logistics" },
+  { value: "professional_services", label: "Professional services" },
+  { value: "office_supplies", label: "Office supplies" },
+  { value: "other", label: "Other" },
+];
+
+export function categoryLabel(value) {
+  return VENDOR_CATEGORIES.find((c) => c.value === value)?.label || value || "—";
+}
+
+const BILL_TONES = {
+  pending: "bg-warning/10 text-warning",
+  paid: "bg-success/10 text-success",
+  cancelled: "bg-destructive/10 text-destructive",
+};
+
+export function BillStatus({ status, overdue }) {
+  if (overdue) return <StatusPill status="overdue" className="bg-destructive/10 text-destructive" />;
+  return <StatusPill status={status} className={BILL_TONES[status]} />;
+}
+
+/**
+ * Vendor picker for filters and forms. `vendors` is [{ id, name }]; an empty value means "all"
+ * when `allLabel` is given, otherwise the placeholder is shown.
+ */
+export function VendorSelect({ vendors, value, onChange, allLabel, placeholder = "Select vendor", testid, className, disabled }) {
+  const none = allLabel ? "all" : "";
+  return (
+    <Select value={value || none} onValueChange={(v) => onChange(v === "all" ? "" : v)} disabled={disabled}>
+      <SelectTrigger className={cn("h-9 w-full sm:w-[190px]", className)} data-testid={testid}>
+        <SelectValue placeholder={vendors ? placeholder : "Loading vendors…"} />
+      </SelectTrigger>
+      <SelectContent>
+        {allLabel && <SelectItem value="all">{allLabel}</SelectItem>}
+        {(vendors || []).map((v) => (
+          <SelectItem key={v.id} value={v.id}>
+            {v.name}{v.status === "inactive" || v.active === false ? " (inactive)" : ""}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}

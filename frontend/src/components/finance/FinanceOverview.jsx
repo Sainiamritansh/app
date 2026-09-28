@@ -1,7 +1,7 @@
 import {
   ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
 } from "recharts";
-import { IndianRupee, Percent, Receipt, Wallet, FileWarning, Landmark, RefreshCw, BarChart3 } from "lucide-react";
+import { IndianRupee, Percent, Receipt, Wallet, FileWarning, Landmark, RefreshCw, BarChart3, Building2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -60,6 +60,13 @@ export default function FinanceOverview({ onNavigate }) {
         <StatCard label="Bookings to invoice" value={c.uninvoiced_bookings.toLocaleString("en-IN")} icon={FileWarning}
                   tone={c.uninvoiced_bookings ? "danger" : "default"}
                   sub={c.draft_invoices ? `${c.draft_invoices} draft invoice${c.draft_invoices === 1 ? "" : "s"}` : "Confirmed · active · completed"} />
+        {c.bills_pending_count > 0 && (
+          <button type="button" className="text-left" onClick={() => onNavigate("bills")} data-testid="finance-overview-bills">
+            <StatCard label="Vendor bills payable" value={inr(c.bills_pending)} icon={Building2}
+                      tone={c.bills_overdue ? "danger" : "warning"}
+                      sub={c.bills_overdue ? `${inr(c.bills_overdue)} overdue` : `${c.bills_pending_count} pending bill${c.bills_pending_count === 1 ? "" : "s"}`} />
+          </button>
+        )}
       </div>
 
       <Card className="border-border" data-testid="finance-revenue-chart">

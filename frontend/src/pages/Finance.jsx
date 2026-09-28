@@ -7,12 +7,16 @@ import FinanceOverview from "@/components/finance/FinanceOverview";
 import InvoicesTab from "@/components/finance/InvoicesTab";
 import PayoutsTab from "@/components/finance/PayoutsTab";
 import StatementsTab from "@/components/finance/StatementsTab";
+import VendorsTab from "@/components/finance/VendorsTab";
+import BillsTab from "@/components/finance/BillsTab";
 import FinanceSettingsTab from "@/components/finance/FinanceSettingsTab";
 
 const TABS = [
   { value: "overview", label: "Overview" },
   { value: "invoices", label: "Invoices" },
   { value: "payouts", label: "Payouts" },
+  { value: "vendors", label: "Vendors" },
+  { value: "bills", label: "Bills" },
   { value: "statements", label: "Statements" },
   { value: "settings", label: "Settings" },
 ];
@@ -23,12 +27,13 @@ export default function Finance() {
   const tab = TABS.some((t) => t.value === params.get("tab")) ? params.get("tab") : "overview";
   const setTab = (v) => setParams((p) => { p.set("tab", v); return p; }, { replace: true });
   const canManage = can("finance.manage");
+  const viewVendorBills = (vendorId) => setParams((p) => { p.set("tab", "bills"); p.set("vendor", vendorId); return p; }, { replace: true });
 
   if (!can("finance.view")) {
     return (
       <div data-testid="finance-page">
         <PageHeader eyebrow="Module" title="Finance" />
-        <EmptyState icon={Lock} title="Finance is restricted" description="Only the Founder can view invoices, payouts and statements." />
+        <EmptyState icon={Lock} title="Finance is restricted" description="Only the Founder can view invoices, payouts, vendors and statements." />
       </div>
     );
   }
@@ -38,7 +43,7 @@ export default function Finance() {
       <PageHeader
         eyebrow="Module"
         title="Finance"
-        description="Customer invoices, vendor payouts and monthly statements — computed from live marketplace bookings."
+        description="Customer invoices, vendor payouts, vendor bills and monthly statements — computed from live marketplace bookings."
         badge="Live"
       />
       <Tabs value={tab} onValueChange={setTab} className="w-full">
@@ -50,6 +55,8 @@ export default function Finance() {
         <TabsContent value="overview" className="mt-6"><FinanceOverview onNavigate={setTab} /></TabsContent>
         <TabsContent value="invoices" className="mt-6"><InvoicesTab canManage={canManage} /></TabsContent>
         <TabsContent value="payouts" className="mt-6"><PayoutsTab canManage={canManage} /></TabsContent>
+        <TabsContent value="vendors" className="mt-6"><VendorsTab canManage={canManage} onViewBills={viewVendorBills} /></TabsContent>
+        <TabsContent value="bills" className="mt-6"><BillsTab canManage={canManage} /></TabsContent>
         <TabsContent value="statements" className="mt-6"><StatementsTab /></TabsContent>
         <TabsContent value="settings" className="mt-6"><FinanceSettingsTab canManage={canManage} /></TabsContent>
       </Tabs>

@@ -92,7 +92,7 @@ export default function MarketingOverview({ onOpenCampaign, onCreate, refreshKey
         </CardHeader>
         <CardContent>
           {!data.attribution.supported ? (
-            <div className="text-[13px] text-muted-foreground py-6 text-center">Available once bookings record the coupon used.</div>
+            <div className="text-[13px] text-muted-foreground py-6 text-center">Available once bookings redeem a coupon.</div>
           ) : data.top_campaigns.length === 0 ? (
             <div className="text-[13px] text-muted-foreground py-6 text-center">No attributed bookings yet.</div>
           ) : (

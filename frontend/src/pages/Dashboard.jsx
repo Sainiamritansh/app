@@ -191,7 +191,9 @@ export default function Dashboard() {
   // Marketplace / revenue sections are only sent to roles that can open Marketplace.
   const showMarketplace = !isEmployeeOrIntern && Array.isArray(data.revenue_series);
   const quickActions = QUICK_ACTIONS.filter((a) => canViewModule(a.module) && can(a.action)).slice(0, 4);
-  const pipelineLakhs = Math.round(data.opportunities.reduce((a, o) => a + (Number(o.value) || 0), 0) * 100) / 100;
+  // Whole open pipeline in the caller's scope (server total), not just the few deals listed.
+  const pipelineLakhs = Math.round((Number(data.pipeline?.value_lakhs) || 0) * 100) / 100;
+  const pipelineCount = data.pipeline?.count ?? data.opportunities.length;
 
   // Marks the notification read (updating the top-nav badge) and follows its link.
   const openNotification = async (n) => {
@@ -508,7 +510,7 @@ export default function Dashboard() {
             <div className="flex items-start justify-between">
               <div>
                 <CardTitle className="font-display text-[17px]">Opportunity summary</CardTitle>
-                <CardDescription>Deals in play · sum ₹{pipelineLakhs} L pipeline</CardDescription>
+                <CardDescription>{pipelineCount} open deal{pipelineCount === 1 ? "" : "s"} · ₹{pipelineLakhs} L total pipeline</CardDescription>
               </div>
               <Button variant="ghost" size="sm" onClick={() => nav("/opportunity-hub")} className="text-xs">Open hub</Button>
             </div>

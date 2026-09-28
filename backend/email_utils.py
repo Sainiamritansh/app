@@ -3,6 +3,7 @@ import html
 import logging
 import os
 import requests
+from urllib.parse import quote
 from hub_utils import find_user
 
 logger = logging.getLogger(__name__)
@@ -272,7 +273,11 @@ def send_assignment_email(
         subject = "New Task Assigned – Please Check ERP" if is_task else "New Opportunity Assigned – Please Check ERP"
 
     if not erp_url:
-        erp_url = f"{FRONTEND_URL}/task-board" if is_task else f"{FRONTEND_URL}/opportunity-hub"
+        if is_task:
+            # TaskBoard opens ?task_id=<id> directly; the Opportunity Hub opens ?opp=<id>
+            erp_url = f"{FRONTEND_URL}/task-board" + (f"?task_id={quote(str(item_id))}" if item_id else "")
+        else:
+            erp_url = f"{FRONTEND_URL}/opportunity-hub" + (f"?opp={quote(str(item_id))}" if item_id else "")
 
     url = BREVO_URL
     headers = {

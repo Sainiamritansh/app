@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   Download, Pencil, Trash2, UploadCloud, Loader2, RotateCcw, History, Folder, HardDrive, User,
-  CalendarClock, CalendarPlus, Fingerprint, AlertTriangle, RefreshCw, Copy, Check,
+  CalendarClock, CalendarPlus, Fingerprint, AlertTriangle, RefreshCw, Copy, Check, Lock, Globe2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
@@ -15,6 +15,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { api, formatApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { EditDocumentDialog, NewVersionDialog } from "./DocumentDialogs";
+import { accessSummary, normalizeAccess, useAccessOptions } from "./AccessPicker";
 import {
   PREVIEWABLE, blobErrorMessage, downloadFile, expiryBadge, fetchBlob, formatBytes, formatDate, formatDateTime, typeMeta,
 } from "./vaultUtils";
@@ -126,6 +127,8 @@ export default function DocumentSheet({ docId, initial, open, onOpenChange, fold
   const [versionOpen, setVersionOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const options = useAccessOptions();
+  const peopleById = Object.fromEntries((options?.people || []).map((p) => [p.id, p]));
 
   // Always load the fresh record (the list row may be stale, or we came from a notification link).
   useEffect(() => {
@@ -189,6 +192,10 @@ export default function DocumentSheet({ docId, initial, open, onOpenChange, fold
   const folderName = doc?.folder_id ? folders.find((f) => f.id === doc.folder_id)?.name || "Unknown folder" : "Unfiled";
   const badge = doc ? expiryBadge(doc) : null;
   const meta = doc ? typeMeta(doc.content_type) : null;
+  // vault.manage lets a role upload; changing an existing document is limited to its owner, Founders and Admins.
+  const canEdit = canManage && !!doc?.can_edit;
+  const access = normalizeAccess(doc?.access);
+  const folderAccess = doc?.folder_id ? normalizeAccess(folders.find((f) => f.id === doc.folder_id)?.access) : null;
 
   return (
     <>
@@ -232,7 +239,7 @@ export default function DocumentSheet({ docId, initial, open, onOpenChange, fold
                   <Button size="sm" className="gap-1.5" onClick={() => download()} disabled={!!busy} data-testid="vault-download">
                     {busy === "dl-current" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />} Download
                   </Button>
-                  {canManage && (
+                  {canEdit && (
                     <>
                       <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setVersionOpen(true)} disabled={!!busy} data-testid="vault-new-version">
                         <UploadCloud className="h-4 w-4" /> New version
@@ -254,6 +261,17 @@ export default function DocumentSheet({ docId, initial, open, onOpenChange, fold
 
                 <section className="space-y-3">
                   <Row icon={Folder} label="Folder">{folderName}</Row>
+                  <Row icon={access.mode === "restricted" ? Lock : Globe2} label="Access">
+                    <span data-testid="vault-access-summary">{accessSummary(access, peopleById)}</span>
+                    {folderAccess?.mode === "restricted" && (
+                      <span className="block text-[11.5px] text-muted-foreground mt-0.5">
+                        Also limited by the folder: {accessSummary(folderAccess, peopleById)}
+                      </span>
+                    )}
+                    {doc.access_legacy && (
+                      <span className="block text-[11.5px] text-muted-foreground mt-0.5">Added before access control; visible to everyone.</span>
+                    )}
+                  </Row>
                   <Row icon={HardDrive} label="Size">{formatBytes(doc.size)}</Row>
                   <Row icon={User} label="Uploaded by">{doc.uploaded_by_name || "Unknown"}</Row>
                   <Row icon={CalendarPlus} label="Added">{formatDateTime(doc.created_at)}</Row>
@@ -300,7 +318,7 @@ export default function DocumentSheet({ docId, initial, open, onOpenChange, fold
                                     title="Download" onClick={() => download(v.version)} disabled={!!busy}>
                               {busy === `dl-${v.version}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
                             </Button>
-                            {canManage && !current && (
+                            {canEdit && !current && (
                               <Button variant="ghost" size="icon" className="h-8 w-8" aria-label={`Restore version ${v.version}`}
                                       title="Restore as current" onClick={() => restore(v.version)} disabled={!!busy}>
                                 {busy === `restore-${v.version}` ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
@@ -318,7 +336,7 @@ export default function DocumentSheet({ docId, initial, open, onOpenChange, fold
         </SheetContent>
       </Sheet>
 
-      {doc && canManage && (
+      {doc && canEdit && (
         <>
           <EditDocumentDialog doc={doc} open={editOpen} onOpenChange={setEditOpen} folders={folders}
                               onSaved={(d) => { setEditOpen(false); updated(d); }} />

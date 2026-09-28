@@ -10,6 +10,10 @@ Every figure is derived from the Marketplace collections (`bookings`, `vendors`,
   payouts            one doc per vendor per payout batch (`batch_id`), status pending / paid
   payout_items       one doc per booking included in a payout - unique `booking_id` guarantees a
                      booking can be paid out at most once
+  finance_vendors    Finance's supplier / payee directory (contact, GSTIN, category, status). A finance
+                     vendor may be linked to a Marketplace fleet vendor (`marketplace_vendor_id`) so its
+                     booking payouts roll into the vendor's spend and history
+  vendor_bills       bills / expenses owed to a finance vendor, status pending / paid / cancelled
 
 Rules
 - Revenue counts bookings with status confirmed, active or completed (never pending / cancelled),
@@ -101,6 +105,13 @@ async def ensure_indexes(db) -> None:
     await db.payout_items.create_index("payout_id")
     await db.payouts.create_index([("created_at", -1)])
     await db.payouts.create_index("batch_id")
+    await db.payouts.create_index("vendor_id")
+    await db.invoices.create_index("vendor_id")
+    await db.finance_vendors.create_index("name_key", unique=True)
+    await db.finance_vendors.create_index("marketplace_vendor_id")
+    await db.vendor_bills.create_index([("vendor_id", 1), ("bill_date", -1)])
+    await db.vendor_bills.create_index([("bill_date", -1), ("created_at", -1)])
+    await db.vendor_bills.create_index("status")
     _indexes_ready = True
 
 
@@ -427,7 +438,7 @@ async def _issue(db, inv: dict, settings: dict) -> dict:
     return await db.invoices.find_one({"_id": inv["_id"]})
 
 
-def _invoice_query(status, month, customer_id, q) -> dict:
+def _invoice_query(status, month, customer_id, q, vendor_id=None) -> dict:
     query: dict = {}
     if status:
         if status not in ("draft", "issued", "paid", "void"):
@@ -439,6 +450,8 @@ def _invoice_query(status, month, customer_id, q) -> dict:
         query["invoice_date"] = {"$regex": f"^{month}-"}
     if customer_id:
         query["customer_id"] = customer_id
+    if vendor_id:
+        query["vendor_id"] = vendor_id
     if q:
         rx = {"$regex": re.escape(q.strip()), "$options": "i"}
         query["$or"] = [{"number": rx}, {"customer_name": rx}, {"customer_email": rx}, {"booking_id": rx}]
@@ -447,10 +460,11 @@ def _invoice_query(status, month, customer_id, q) -> dict:
 
 @router.get("/invoices")
 async def list_invoices(status: Optional[str] = None, month: Optional[str] = None, customer_id: Optional[str] = None,
-                        q: Optional[str] = None, limit: int = Query(100, ge=1, le=500), skip: int = Query(0, ge=0),
+                        q: Optional[str] = None, vendor_id: Optional[str] = None,
+                        limit: int = Query(100, ge=1, le=500), skip: int = Query(0, ge=0),
                         current: UserPublic = Viewer):
     db = get_db()
-    query = _invoice_query(status, month, customer_id, q)
+    query = _invoice_query(status, month, customer_id, q, vendor_id)
     total = await db.invoices.count_documents(query)
     docs = await db.invoices.find(query).sort([("invoice_date", -1), ("created_at", -1)]).skip(skip).to_list(limit)
     agg = await db.invoices.aggregate([
@@ -463,9 +477,9 @@ async def list_invoices(status: Optional[str] = None, month: Optional[str] = Non
 
 @router.get("/invoices/export")
 async def export_invoices(status: Optional[str] = None, month: Optional[str] = None, customer_id: Optional[str] = None,
-                          q: Optional[str] = None, current: UserPublic = Viewer):
+                          q: Optional[str] = None, vendor_id: Optional[str] = None, current: UserPublic = Viewer):
     db = get_db()
-    docs = await db.invoices.find(_invoice_query(status, month, customer_id, q)).sort(
+    docs = await db.invoices.find(_invoice_query(status, month, customer_id, q, vendor_id)).sort(
         [("invoice_date", 1), ("number", 1)]).to_list(None)
     header = ["Invoice number", "Invoice date", "Status", "Customer", "Customer email", "Booking id", "City",
               "Place of supply", "Taxable value", "GST %", "CGST", "SGST", "IGST", "GST total", "Total",
@@ -970,6 +984,12 @@ async def overview(current: UserPublic = Viewer):
     rev = await db.bookings.find({"status": {"$in": REVENUE_STATUSES}}, {"_id": 1}).to_list(None)
     rev_ids = [str(b["_id"]) for b in rev]
     uninvoiced = len(rev_ids) - len(await _live_invoice_booking_ids(db, rev_ids))
+    bills_pending = await db.vendor_bills.aggregate([
+        {"$match": {"status": "pending"}},
+        {"$group": {"_id": None, "n": {"$sum": 1}, "total": {"$sum": "$total"},
+                    "overdue": {"$sum": {"$cond": [{"$and": [{"$gt": [{"$ifNull": ["$due_date", ""]}, ""]},
+                                                              {"$lt": ["$due_date", _today().isoformat()]}]},
+                                                   "$total", 0]}}}}]).to_list(1)
     return {
         "month": month, "label": _month_label(month),
         "commission_pct": settings["commission_pct"], "gst_pct": settings["gst_pct"],
@@ -982,8 +1002,467 @@ async def overview(current: UserPublic = Viewer):
             "draft_invoices": drafts, "uninvoiced_bookings": uninvoiced,
             "payouts_pending": _money(pending_payouts[0]["net"]) if pending_payouts else 0.0,
             "payouts_pending_count": pending_payouts[0]["n"] if pending_payouts else 0,
+            "bills_pending": _money(bills_pending[0]["total"]) if bills_pending else 0.0,
+            "bills_pending_count": bills_pending[0]["n"] if bills_pending else 0,
+            "bills_overdue": _money(bills_pending[0]["overdue"]) if bills_pending else 0.0,
         },
         "series": [{"month": ym, "label": _month_start(ym).strftime("%b"), "revenue": stats[ym]["gross_revenue"],
                     "commission": stats[ym]["platform_commission"], "gst": stats[ym]["gst_collected"]}
                    for ym in sorted(stats)],
     }
+
+
+# ------------------------------------------------------------------ vendors (suppliers / payees)
+
+VENDOR_CATEGORIES = ("fleet_partner", "maintenance", "fuel_charging", "insurance", "marketing", "software",
+                     "rent_utilities", "logistics", "professional_services", "office_supplies", "other")
+VendorCategory = Literal["fleet_partner", "maintenance", "fuel_charging", "insurance", "marketing", "software",
+                         "rent_utilities", "logistics", "professional_services", "office_supplies", "other"]
+BILL_STATUSES = ("pending", "paid", "cancelled")
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+TAX_ID_RE = re.compile(r"^[A-Z0-9/-]{5,20}$")
+
+
+def _blank_to_none(v):
+    return None if isinstance(v, str) and not v.strip() else v
+
+
+class VendorIn(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    name: str = Field(min_length=2, max_length=120)
+    contact_person: Optional[str] = Field(None, max_length=120)
+    email: Optional[str] = Field(None, max_length=200)
+    phone: Optional[str] = Field(None, max_length=20, pattern=r"^[0-9+()\- ]{6,20}$")
+    tax_id: Optional[str] = Field(None, max_length=20)
+    category: VendorCategory = "other"
+    address: Optional[str] = Field(None, max_length=500)
+    notes: Optional[str] = Field(None, max_length=1000)
+    status: Literal["active", "inactive"] = "active"
+    payment_terms_days: Optional[int] = Field(None, ge=0, le=365)
+    marketplace_vendor_id: Optional[str] = None
+
+    @field_validator("contact_person", "email", "phone", "tax_id", "address", "notes", "marketplace_vendor_id",
+                     "payment_terms_days", mode="before")
+    @classmethod
+    def _blank(cls, v):
+        return _blank_to_none(v)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v):
+        if v is not None and not EMAIL_RE.match(v):
+            raise ValueError("Enter a valid email address")
+        return v.lower() if v else v
+
+    @field_validator("tax_id")
+    @classmethod
+    def _tax_id(cls, v):
+        if v is None:
+            return v
+        v = v.upper().replace(" ", "")
+        if not TAX_ID_RE.match(v):
+            raise ValueError("GSTIN / tax id must be 5-20 letters or digits")
+        if len(v) == 15 and not GSTIN_RE.match(v):
+            raise ValueError("GSTIN must be 15 characters (e.g. 10ABCDE1234F1Z5)")
+        return v
+
+
+class BillIn(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+    vendor_id: str
+    bill_number: Optional[str] = Field(None, max_length=60)
+    bill_date: str = Field(pattern=DATE_RE)
+    due_date: Optional[str] = Field(None, pattern=DATE_RE)
+    description: str = Field(min_length=2, max_length=300)
+    category: Optional[VendorCategory] = None
+    amount: float = Field(gt=0, le=1_000_000_000)
+    gst_amount: float = Field(0, ge=0, le=1_000_000_000)
+    notes: Optional[str] = Field(None, max_length=500)
+
+    @field_validator("bill_number", "due_date", "notes", "category", mode="before")
+    @classmethod
+    def _blank(cls, v):
+        return _blank_to_none(v)
+
+
+def _name_key(name: str) -> str:
+    return re.sub(r"\s+", " ", name.strip()).lower()
+
+
+async def _get_vendor(db, vendor_id: str) -> dict:
+    v = await db.finance_vendors.find_one({"_id": oid(vendor_id)})
+    if not v:
+        raise HTTPException(404, "Vendor not found")
+    return v
+
+
+async def _check_marketplace_link(db, mp_id: Optional[str], exclude: Optional[ObjectId] = None) -> Optional[str]:
+    """Validates the optional link to a Marketplace fleet vendor (one finance vendor per marketplace vendor)."""
+    if not mp_id:
+        return None
+    mp = await db.vendors.find_one({"_id": oid(mp_id)}, {"name": 1})
+    if not mp:
+        raise HTTPException(400, "Marketplace vendor not found")
+    q: dict = {"marketplace_vendor_id": mp_id}
+    if exclude is not None:
+        q["_id"] = {"$ne": exclude}
+    other = await db.finance_vendors.find_one(q, {"name": 1})
+    if other:
+        raise HTTPException(409, f"That marketplace vendor is already linked to {other.get('name')}")
+    return mp.get("name")
+
+
+async def _bill_stats(db, vendor_ids: Optional[list[str]] = None) -> dict[str, dict]:
+    """Per finance vendor: paid (spent), pending (outstanding), overdue, count, last bill date."""
+    today = _today().isoformat()
+    match: dict = {"status": {"$ne": "cancelled"}}
+    if vendor_ids is not None:
+        match["vendor_id"] = {"$in": vendor_ids}
+    rows = await db.vendor_bills.aggregate([
+        {"$match": match},
+        {"$group": {
+            "_id": "$vendor_id",
+            "bills": {"$sum": 1},
+            "paid": {"$sum": {"$cond": [{"$eq": ["$status", "paid"]}, "$total", 0]}},
+            "pending": {"$sum": {"$cond": [{"$eq": ["$status", "pending"]}, "$total", 0]}},
+            "pending_count": {"$sum": {"$cond": [{"$eq": ["$status", "pending"]}, 1, 0]}},
+            "overdue": {"$sum": {"$cond": [{"$and": [{"$eq": ["$status", "pending"]},
+                                                      {"$gt": [{"$ifNull": ["$due_date", ""]}, ""]},
+                                                      {"$lt": ["$due_date", today]}]}, "$total", 0]}},
+            "last_bill_date": {"$max": "$bill_date"},
+        }}]).to_list(None)
+    return {r["_id"]: r for r in rows}
+
+
+async def _payout_stats(db, mp_ids: list[str]) -> dict[str, dict]:
+    if not mp_ids:
+        return {}
+    rows = await db.payouts.aggregate([
+        {"$match": {"vendor_id": {"$in": mp_ids}}},
+        {"$group": {"_id": "$vendor_id",
+                    "paid": {"$sum": {"$cond": [{"$eq": ["$status", "paid"]}, "$net", 0]}},
+                    "pending": {"$sum": {"$cond": [{"$eq": ["$status", "pending"]}, "$net", 0]}},
+                    "count": {"$sum": 1}}}]).to_list(None)
+    return {r["_id"]: r for r in rows}
+
+
+def _vendor_out(v: dict, bills: Optional[dict], payouts: Optional[dict]) -> dict:
+    b, p = bills or {}, payouts or {}
+    bills_paid, bills_pending = _money(b.get("paid")), _money(b.get("pending"))
+    payouts_paid, payouts_pending = _money(p.get("paid")), _money(p.get("pending"))
+    out = serialize(v)
+    out.pop("name_key", None)
+    out.update({
+        "bills_count": b.get("bills", 0), "pending_bills": b.get("pending_count", 0),
+        "bills_paid": bills_paid, "bills_pending": bills_pending, "overdue": _money(b.get("overdue")),
+        "payouts_count": p.get("count", 0), "payouts_paid": payouts_paid, "payouts_pending": payouts_pending,
+        "total_spent": _money(bills_paid + payouts_paid), "outstanding": _money(bills_pending + payouts_pending),
+        "last_bill_date": b.get("last_bill_date"),
+    })
+    return out
+
+
+@router.get("/vendors")
+async def list_vendors(q: Optional[str] = None, status: Optional[Literal["active", "inactive"]] = None,
+                       category: Optional[VendorCategory] = None, current: UserPublic = Viewer):
+    db = get_db()
+    query: dict = {}
+    if status:
+        query["status"] = status
+    if category:
+        query["category"] = category
+    if q and q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [{"name": rx}, {"contact_person": rx}, {"email": rx}, {"phone": rx}, {"tax_id": rx}]
+    docs = await db.finance_vendors.find(query).sort("name_key", 1).to_list(1000)
+    bills = await _bill_stats(db, [str(d["_id"]) for d in docs])
+    payouts = await _payout_stats(db, [d["marketplace_vendor_id"] for d in docs if d.get("marketplace_vendor_id")])
+    items = [_vendor_out(d, bills.get(str(d["_id"])), payouts.get(d.get("marketplace_vendor_id"))) for d in docs]
+    totals = {k: _money(sum(i[k] for i in items)) for k in ("total_spent", "outstanding", "overdue")}
+    totals["vendors"] = len(items)
+    totals["active"] = sum(1 for i in items if i.get("status") == "active")
+    return {"items": items, "totals": totals}
+
+
+@router.get("/vendors/marketplace-options")
+async def marketplace_vendor_options(current: UserPublic = Viewer):
+    """Marketplace (fleet) vendors, for linking a finance vendor and for filtering invoices / payouts."""
+    db = get_db()
+    linked = {d["marketplace_vendor_id"]: str(d["_id"]) async for d in db.finance_vendors.find(
+        {"marketplace_vendor_id": {"$nin": [None, ""]}}, {"marketplace_vendor_id": 1})}
+    docs = await db.vendors.find({}, {"name": 1, "active": 1}).sort("name", 1).to_list(2000)
+    return [{"id": str(d["_id"]), "name": d.get("name") or "Unnamed vendor", "active": d.get("active", True),
+             "finance_vendor_id": linked.get(str(d["_id"]))} for d in docs]
+
+
+@router.post("/vendors", status_code=201)
+async def create_vendor(payload: VendorIn, current: UserPublic = Manager):
+    db = get_db()
+    await _ready(db)
+    data = payload.model_dump()
+    mp_name = await _check_marketplace_link(db, data.get("marketplace_vendor_id"))
+    now = utc_iso()
+    doc = {**data, "name_key": _name_key(data["name"]), "marketplace_vendor_name": mp_name,
+           "created_by": current.name, "created_at": now, "updated_at": now}
+    try:
+        res = await db.finance_vendors.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, f"A vendor named {data['name']} already exists")
+    doc["_id"] = res.inserted_id
+    await log_activity(db, current, "Added finance vendor", MODULE, target=doc["name"],
+                       meta={"vendor_id": str(doc["_id"]), "category": doc["category"]})
+    return _vendor_out(doc, None, None)
+
+
+async def _vendor_history(db, v: dict, limit: int = 300) -> list[dict]:
+    """Bills plus (for a linked marketplace vendor) booking payouts, newest first."""
+    rows = []
+    async for b in db.vendor_bills.find({"vendor_id": str(v["_id"])}).sort("bill_date", -1).limit(limit):
+        rows.append({"type": "bill", "id": str(b["_id"]), "date": b.get("bill_date"),
+                     "reference": b.get("bill_number"), "description": b.get("description"),
+                     "amount": b.get("total"), "status": b.get("status"), "due_date": b.get("due_date"),
+                     "paid_on": (b.get("payment") or {}).get("paid_on"),
+                     "overdue": bool(b.get("status") == "pending" and b.get("due_date")
+                                     and b["due_date"] < _today().isoformat())})
+    if v.get("marketplace_vendor_id"):
+        async for p in db.payouts.find({"vendor_id": v["marketplace_vendor_id"]}).sort("created_at", -1).limit(limit):
+            rows.append({"type": "payout", "id": str(p["_id"]),
+                         "date": p.get("paid_on") or str(p.get("created_at") or "")[:10],
+                         "reference": p.get("reference") or f"batch {p.get('batch_id')}",
+                         "description": f"Booking payout {p.get('period_start')} to {p.get('period_end')} · "
+                                        f"{p.get('bookings_count')} booking(s)",
+                         "amount": p.get("net"), "status": p.get("status"), "due_date": None,
+                         "paid_on": p.get("paid_on"), "overdue": False})
+    rows.sort(key=lambda r: r["date"] or "", reverse=True)
+    return rows[:limit]
+
+
+@router.get("/vendors/{vendor_id}")
+async def get_vendor(vendor_id: str, current: UserPublic = Viewer):
+    db = get_db()
+    v = await _get_vendor(db, vendor_id)
+    bills = await _bill_stats(db, [str(v["_id"])])
+    mp = v.get("marketplace_vendor_id")
+    payouts = await _payout_stats(db, [mp] if mp else [])
+    out = _vendor_out(v, bills.get(str(v["_id"])), payouts.get(mp))
+    out["history"] = await _vendor_history(db, v)
+    return out
+
+
+@router.put("/vendors/{vendor_id}")
+async def update_vendor(vendor_id: str, payload: VendorIn, current: UserPublic = Manager):
+    db = get_db()
+    await _ready(db)
+    v = await _get_vendor(db, vendor_id)
+    data = payload.model_dump()
+    mp_name = await _check_marketplace_link(db, data.get("marketplace_vendor_id"), exclude=v["_id"])
+    changed = sorted(k for k, val in data.items() if v.get(k) != val)
+    try:
+        await db.finance_vendors.update_one({"_id": v["_id"]}, {"$set": {
+            **data, "name_key": _name_key(data["name"]), "marketplace_vendor_name": mp_name,
+            "updated_at": utc_iso(), "updated_by": current.name}})
+    except DuplicateKeyError:
+        raise HTTPException(409, f"A vendor named {data['name']} already exists")
+    if data["name"] != v.get("name"):
+        await db.vendor_bills.update_many({"vendor_id": str(v["_id"])}, {"$set": {"vendor_name": data["name"]}})
+    if changed:
+        await log_activity(db, current, "Updated finance vendor", MODULE, target=data["name"], meta={"fields": changed})
+    return await get_vendor(vendor_id, current)
+
+
+@router.delete("/vendors/{vendor_id}")
+async def delete_vendor(vendor_id: str, current: UserPublic = Manager):
+    db = get_db()
+    v = await _get_vendor(db, vendor_id)
+    n = await db.vendor_bills.count_documents({"vendor_id": str(v["_id"])})
+    if n:
+        raise HTTPException(400, f"{v['name']} has {n} bill(s). Mark the vendor inactive instead.")
+    await db.finance_vendors.delete_one({"_id": v["_id"]})
+    await log_activity(db, current, "Deleted finance vendor", MODULE, target=v["name"])
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ vendor bills (expenses)
+
+def _bill_query(vendor_id, status, month, category, q) -> dict:
+    query: dict = {}
+    if vendor_id:
+        query["vendor_id"] = vendor_id
+    if status == "overdue":
+        query["status"] = "pending"
+        query["due_date"] = {"$gt": "", "$lt": _today().isoformat()}
+    elif status:
+        if status not in BILL_STATUSES:
+            raise ValueError("Invalid status")
+        query["status"] = status
+    if month:
+        if not re.match(MONTH_RE, month):
+            raise ValueError("Invalid month: expected YYYY-MM")
+        query["bill_date"] = {"$regex": f"^{month}-"}
+    if category:
+        if category not in VENDOR_CATEGORIES:
+            raise ValueError("Invalid category")
+        query["category"] = category
+    if q and q.strip():
+        rx = {"$regex": re.escape(q.strip()), "$options": "i"}
+        query["$or"] = [{"bill_number": rx}, {"description": rx}, {"vendor_name": rx}]
+    return query
+
+
+def _bill_out(b: dict) -> dict:
+    out = serialize(b)
+    out["overdue"] = bool(b.get("status") == "pending" and b.get("due_date") and b["due_date"] < _today().isoformat())
+    return out
+
+
+def _check_bill_dates(bill_date: str, due_date: Optional[str]) -> None:
+    if _parse_date(bill_date, "bill_date") > _today():
+        raise HTTPException(400, "Bill date cannot be in the future")
+    if due_date and _parse_date(due_date, "due_date") < date.fromisoformat(bill_date):
+        raise HTTPException(400, "Due date must be on or after the bill date")
+
+
+async def _bill_fields(db, payload: BillIn, current_vendor_id: Optional[str] = None) -> dict:
+    v = await _get_vendor(db, payload.vendor_id)
+    if v.get("status") == "inactive" and str(v["_id"]) != current_vendor_id:
+        raise HTTPException(400, f"{v['name']} is inactive; reactivate the vendor to record bills")
+    _check_bill_dates(payload.bill_date, payload.due_date)
+    due = payload.due_date
+    if not due and v.get("payment_terms_days") is not None:
+        due = (date.fromisoformat(payload.bill_date) + timedelta(days=v["payment_terms_days"])).isoformat()
+    amount, gst = _money(payload.amount), _money(payload.gst_amount)
+    return {"vendor_id": str(v["_id"]), "vendor_name": v["name"], "bill_number": payload.bill_number,
+            "bill_date": payload.bill_date, "due_date": due, "description": payload.description,
+            "category": payload.category or v.get("category") or "other", "amount": amount, "gst_amount": gst,
+            "total": _money(Decimal(str(amount)) + Decimal(str(gst))), "notes": payload.notes}
+
+
+async def _get_bill(db, bill_id: str) -> dict:
+    b = await db.vendor_bills.find_one({"_id": oid(bill_id)})
+    if not b:
+        raise HTTPException(404, "Bill not found")
+    return b
+
+
+@router.get("/bills")
+async def list_bills(vendor_id: Optional[str] = None, status: Optional[str] = None, month: Optional[str] = None,
+                     category: Optional[str] = None, q: Optional[str] = None,
+                     limit: int = Query(100, ge=1, le=500), skip: int = Query(0, ge=0),
+                     current: UserPublic = Viewer):
+    db = get_db()
+    query = _bill_query(vendor_id, status, month, category, q)
+    total = await db.vendor_bills.count_documents(query)
+    docs = await db.vendor_bills.find(query).sort([("bill_date", -1), ("created_at", -1)]).skip(skip).to_list(limit)
+    agg = await db.vendor_bills.aggregate([
+        {"$match": query}, {"$group": {"_id": "$status", "n": {"$sum": 1}, "total": {"$sum": "$total"}}}]).to_list(None)
+    summary = {s: {"count": 0, "total": 0.0} for s in BILL_STATUSES}
+    for a in agg:
+        summary[a["_id"]] = {"count": a["n"], "total": _money(a["total"])}
+    od = await db.vendor_bills.aggregate([
+        {"$match": {**query, "status": "pending", "due_date": {"$gt": "", "$lt": _today().isoformat()}}},
+        {"$group": {"_id": None, "n": {"$sum": 1}, "total": {"$sum": "$total"}}}]).to_list(1)
+    summary["overdue"] = {"count": od[0]["n"], "total": _money(od[0]["total"])} if od else {"count": 0, "total": 0.0}
+    return {"items": [_bill_out(d) for d in docs], "total": total, "summary": summary}
+
+
+@router.get("/bills/export")
+async def export_bills(vendor_id: Optional[str] = None, status: Optional[str] = None, month: Optional[str] = None,
+                       category: Optional[str] = None, q: Optional[str] = None, current: UserPublic = Viewer):
+    db = get_db()
+    docs = await db.vendor_bills.find(_bill_query(vendor_id, status, month, category, q)).sort(
+        [("bill_date", 1), ("created_at", 1)]).to_list(None)
+    header = ["Bill date", "Bill number", "Vendor", "Category", "Description", "Amount", "GST", "Total", "Status",
+              "Due date", "Paid on", "Payment method", "Payment reference", "Cancel reason"]
+    rows = []
+    for d in docs:
+        p = d.get("payment") or {}
+        rows.append([d.get("bill_date"), d.get("bill_number"), d.get("vendor_name"), d.get("category"),
+                     d.get("description"), d.get("amount"), d.get("gst_amount"), d.get("total"), d.get("status"),
+                     d.get("due_date"), p.get("paid_on"), p.get("method"), p.get("reference"), d.get("cancel_reason")])
+    await log_activity(db, current, "Exported vendor bills CSV", MODULE, target=month or "all", meta={"rows": len(rows)})
+    return _csv_response(f"wavygo-vendor-bills-{month or 'all'}.csv", header, rows)
+
+
+@router.post("/bills", status_code=201)
+async def create_bill(payload: BillIn, current: UserPublic = Manager):
+    db = get_db()
+    await _ready(db)
+    fields = await _bill_fields(db, payload)
+    now = utc_iso()
+    doc = {**fields, "status": "pending", "payment": None, "paid_at": None, "cancel_reason": None,
+           "created_by": current.name, "created_at": now, "updated_at": now}
+    res = await db.vendor_bills.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    await log_activity(db, current, "Recorded vendor bill", MODULE, target=f"{doc['vendor_name']} · ₹{doc['total']:,.2f}",
+                       meta={"bill_id": str(doc["_id"]), "vendor_id": doc["vendor_id"], "total": doc["total"]})
+    return _bill_out(doc)
+
+
+@router.put("/bills/{bill_id}")
+async def update_bill(bill_id: str, payload: BillIn, current: UserPublic = Manager):
+    db = get_db()
+    b = await _get_bill(db, bill_id)
+    if b["status"] != "pending":
+        raise HTTPException(400, f"Only pending bills can be edited; this bill is {b['status']}")
+    fields = await _bill_fields(db, payload, current_vendor_id=b["vendor_id"])
+    res = await db.vendor_bills.update_one({"_id": b["_id"], "status": "pending"},
+                                           {"$set": {**fields, "updated_at": utc_iso(), "updated_by": current.name}})
+    if not res.matched_count:
+        raise HTTPException(409, "Bill changed, reload and try again")
+    b = await db.vendor_bills.find_one({"_id": b["_id"]})
+    await log_activity(db, current, "Updated vendor bill", MODULE, target=f"{b['vendor_name']} · ₹{b['total']:,.2f}")
+    return _bill_out(b)
+
+
+@router.post("/bills/{bill_id}/pay")
+async def pay_bill(bill_id: str, payload: PayIn, current: UserPublic = Manager):
+    db = get_db()
+    b = await _get_bill(db, bill_id)
+    if b["status"] != "pending":
+        raise HTTPException(400, "Bill is already paid" if b["status"] == "paid" else "Cancelled bills cannot be paid")
+    paid_on = payload.paid_on or _today().isoformat()
+    if _parse_date(paid_on, "paid_on") > _today():
+        raise HTTPException(400, "Payment date cannot be in the future")
+    if paid_on < b["bill_date"]:
+        raise HTTPException(400, "Payment date cannot be before the bill date")
+    payment = {"paid_on": paid_on, "method": payload.method, "reference": (payload.reference or "").strip() or None,
+               "recorded_by": current.name}
+    res = await db.vendor_bills.update_one({"_id": b["_id"], "status": "pending"}, {"$set": {
+        "status": "paid", "payment": payment, "paid_at": utc_iso(), "updated_at": utc_iso()}})
+    if not res.modified_count:
+        raise HTTPException(409, "Bill changed, reload and try again")
+    b = await db.vendor_bills.find_one({"_id": b["_id"]})
+    await log_activity(db, current, "Paid vendor bill", MODULE, target=f"{b['vendor_name']} · ₹{b['total']:,.2f}",
+                       meta={"method": payload.method, "bill_id": str(b["_id"])})
+    await notify(db, current.id, "Vendor bill paid",
+                 f"{b['vendor_name']} · ₹{b['total']:,.2f} via {payload.method.replace('_', ' ')}", kind="success", link=LINK)
+    return _bill_out(b)
+
+
+@router.post("/bills/{bill_id}/cancel")
+async def cancel_bill(bill_id: str, payload: VoidIn, current: UserPublic = Manager):
+    db = get_db()
+    b = await _get_bill(db, bill_id)
+    if b["status"] == "cancelled":
+        raise HTTPException(400, "Bill is already cancelled")
+    res = await db.vendor_bills.update_one({"_id": b["_id"], "status": b["status"]}, {"$set": {
+        "status": "cancelled", "cancel_reason": payload.reason, "cancelled_from": b["status"],
+        "cancelled_at": utc_iso(), "updated_at": utc_iso()}})
+    if not res.modified_count:
+        raise HTTPException(409, "Bill changed, reload and try again")
+    b = await db.vendor_bills.find_one({"_id": b["_id"]})
+    await log_activity(db, current, "Cancelled vendor bill", MODULE, target=f"{b['vendor_name']} · ₹{b['total']:,.2f}",
+                       meta={"reason": payload.reason, "was": b["cancelled_from"]})
+    return _bill_out(b)
+
+
+@router.delete("/bills/{bill_id}")
+async def delete_bill(bill_id: str, current: UserPublic = Manager):
+    """Only pending bills can be deleted (e.g. entered by mistake); paid bills are cancelled instead."""
+    db = get_db()
+    b = await _get_bill(db, bill_id)
+    res = await db.vendor_bills.delete_one({"_id": b["_id"], "status": "pending"})
+    if not res.deleted_count:
+        raise HTTPException(400, "Only pending bills can be deleted; cancel it instead")
+    await log_activity(db, current, "Deleted vendor bill", MODULE, target=f"{b['vendor_name']} · ₹{b['total']:,.2f}")
+    return {"ok": True}

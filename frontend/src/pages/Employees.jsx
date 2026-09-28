@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { PageHeader, StatCard, StatusPill, EmptyState } from "@/components/module/ModulePrimitives";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
@@ -34,9 +34,9 @@ const ALL_EMPLOYEES = "__all__";
 const NO_DEPARTMENT = "__none__";
 
 // Local calendar date (YYYY-MM-DD); toISOString() would give the UTC date.
+// Attendance days are company-local (IST) dates on the server, whatever the browser's timezone.
 function todayLocal() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 }
 
 function currentQuarter() {
@@ -70,7 +70,7 @@ function DepartmentSelect({ value, onChange, departments, disabled }) {
   );
 }
 
-function Directory() {
+function Directory({ onChange }) {
   const { user } = useAuth();
   const { can, role } = usePermission();
   const canInvite = can("employee.invite");
@@ -112,6 +112,7 @@ function Directory() {
   const load = () => {
     if (selectedDepartment) loadRows(selectedDepartment);
     loadMeta();
+    onChange?.();
   };
 
   const [searchParams, setSearchParams] = useSearchParams();
@@ -848,7 +849,7 @@ function Directory() {
   );
 }
 
-function Attendance() {
+function Attendance({ onChange }) {
   const { user } = useAuth();
   const { can } = usePermission();
   const canDir = can("employee.view_directory");
@@ -907,6 +908,7 @@ function Attendance() {
       await api.post(checkedIn ? "/employees/attendance/check-out" : "/employees/attendance/check-in");
       toast.success(checkedIn ? "Checked out" : "Checked in");
       load();
+      onChange?.();
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -925,6 +927,7 @@ function Attendance() {
       toast.success("Attendance recorded");
       setOpen(false);
       load();
+      onChange?.();
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -1016,7 +1019,7 @@ function Attendance() {
   );
 }
 
-function Leave() {
+function Leave({ onChange }) {
   const { user } = useAuth();
   const { can } = usePermission();
   const canDir = can("employee.view_directory");
@@ -1059,6 +1062,7 @@ function Leave() {
       setOpen(false);
       setForm({ employee_id: user?.id || "", from_date: "", to_date: "", kind: "casual", reason: "" });
       load();
+      onChange?.();
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -1072,6 +1076,7 @@ function Leave() {
       await api.patch(`/employees/leave/requests/${id}`, { status });
       toast.success(`Leave ${status}`);
       load();
+      onChange?.();
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -1422,9 +1427,17 @@ export default function Employees() {
   const showPerformance = role !== "Intern";
   const personal = role === "Employee" || role === "Intern";
   const [stats, setStats] = useState(null);
-  useEffect(() => {
-    api.get("/employees/stats/overview").then(({ data }) => setStats(data)).catch((e) => toast.error(formatApiError(e)));
+  const [tab, setTab] = useState(canDir ? "directory" : "attendance");
+  const [searchParams] = useSearchParams();
+  const loadStats = useCallback(({ quiet = false } = {}) => {
+    api.get("/employees/stats/overview").then(({ data }) => setStats(data)).catch((e) => { if (!quiet) toast.error(formatApiError(e)); });
   }, []);
+  const refreshStats = useCallback(() => loadStats({ quiet: true }), [loadStats]);
+  useEffect(() => { loadStats(); }, [loadStats]);
+  // Quick-create "Invite teammate" may arrive while another tab is open: show the Directory,
+  // whose own effect then opens the invite dialog and clears the parameter.
+  const wantsInvite = searchParams.get("create") === "invite" || searchParams.get("action") === "invite-teammate";
+  useEffect(() => { if (wantsInvite && canDir) setTab("directory"); }, [wantsInvite, canDir]);
   return (
     <div data-testid="employees-page">
       <PageHeader
@@ -1452,7 +1465,7 @@ export default function Employees() {
           <StatCard label="Pending leave" value={stats.pending_leave} icon={CalendarDays} tone="warning" />
         </div>
       )}
-      <Tabs defaultValue={canDir ? "directory" : "attendance"}>
+      <Tabs value={tab} onValueChange={setTab}>
         <TabsList className="flex flex-wrap h-auto gap-1 justify-start">
           {canDir && <TabsTrigger value="directory" data-testid="emp-tab-directory">Directory</TabsTrigger>}
           <TabsTrigger value="attendance" data-testid="emp-tab-attendance">Attendance</TabsTrigger>
@@ -1460,9 +1473,9 @@ export default function Employees() {
           {showPerformance && <TabsTrigger value="performance" data-testid="emp-tab-performance">Performance</TabsTrigger>}
           {canDepts && <TabsTrigger value="departments" data-testid="emp-tab-departments">Departments</TabsTrigger>}
         </TabsList>
-        {canDir && <TabsContent value="directory" className="mt-6"><Directory /></TabsContent>}
-        <TabsContent value="attendance" className="mt-6"><Attendance /></TabsContent>
-        <TabsContent value="leave" className="mt-6"><Leave /></TabsContent>
+        {canDir && <TabsContent value="directory" className="mt-6"><Directory onChange={refreshStats} /></TabsContent>}
+        <TabsContent value="attendance" className="mt-6"><Attendance onChange={refreshStats} /></TabsContent>
+        <TabsContent value="leave" className="mt-6"><Leave onChange={refreshStats} /></TabsContent>
         {showPerformance && <TabsContent value="performance" className="mt-6"><Performance /></TabsContent>}
         {canDepts && <TabsContent value="departments" className="mt-6"><Departments /></TabsContent>}
       </Tabs>

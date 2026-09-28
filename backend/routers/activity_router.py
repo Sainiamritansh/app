@@ -10,6 +10,11 @@ async def _dept_ids(db, department):
         return []
     return [str(u["_id"]) async for u in db.users.find({"department": department}, {"_id": 1})]
 
+async def _team_ids(db, current: UserPublic):
+    """A Manager's department members, always including the Manager (who may have no department)."""
+    ids = await _dept_ids(db, current.department)
+    return ids if current.id in ids else ids + [current.id]
+
 router = APIRouter(prefix="/activity", tags=["activity"])
 
 
@@ -38,7 +43,7 @@ async def list_modules(current: UserPublic = Depends(get_current_user)):
     _scope_check(current)
     q = {}
     if current.role == "Manager":
-        q["user_id"] = {"$in": await _dept_ids(db, current.department)}
+        q["user_id"] = {"$in": await _team_ids(db, current)}
     return sorted(m for m in await db.activity_logs.distinct("module", q) if m)
 
 
@@ -54,6 +59,6 @@ async def list_activity(
     if module:
         q["module"] = module
     if current.role == "Manager":
-        q["user_id"] = {"$in": await _dept_ids(db, current.department)}
+        q["user_id"] = {"$in": await _team_ids(db, current)}
     docs = await db.activity_logs.find(q).sort("created_at", -1).to_list(limit)
     return [_serialize(d) for d in docs]

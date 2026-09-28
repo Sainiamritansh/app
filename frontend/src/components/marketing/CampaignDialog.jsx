@@ -33,6 +33,12 @@ function fromCampaign(c) {
   };
 }
 
+// Selected values no longer offered (renamed / deleted in Marketplace) stay visible so they can be removed.
+function withStale(options, value) {
+  const known = new Set(options.map((o) => o.value));
+  return [...options, ...value.filter((v) => !known.has(v)).map((v) => ({ value: v, label: `${v} (removed)` }))];
+}
+
 function Chips({ options, value, onChange, testid }) {
   const toggle = (v) => onChange(value.includes(v) ? value.filter((x) => x !== v) : [...value, v]);
   return (
@@ -62,7 +68,8 @@ export default function CampaignDialog({ open, onOpenChange, campaign, meta, onS
     if (!open) return;
     setForm(campaign ? fromCampaign(campaign) : blank(user?.id));
     setErrors({});
-  }, [open, campaign, user]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, campaign, user?.id]);
 
   const set = (k) => (e) => {
     const v = e?.target ? e.target.value : e;
@@ -180,6 +187,9 @@ export default function CampaignDialog({ open, onOpenChange, campaign, meta, onS
                   <SelectContent>
                     <SelectItem value={NONE}>No segment</SelectItem>
                     {(meta?.segments || []).map((s) => <SelectItem key={s.id} value={s.id}>{s.name}</SelectItem>)}
+                    {meta && form.audience_segment_id && !(meta.segments || []).some((s) => s.id === form.audience_segment_id) && (
+                      <SelectItem value={form.audience_segment_id}>{campaign?.audience_segment_name || "Segment"} (removed)</SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
               </div>
@@ -189,6 +199,9 @@ export default function CampaignDialog({ open, onOpenChange, campaign, meta, onS
                   <SelectTrigger data-testid="campaign-owner"><SelectValue placeholder="Me" /></SelectTrigger>
                   <SelectContent>
                     {owners.map((o) => <SelectItem key={o.id} value={o.id}>{o.name}{o.id === user?.id ? " (me)" : ""} · {o.role}</SelectItem>)}
+                    {owners.length > 0 && form.owner_id && !owners.some((o) => o.id === form.owner_id) && (
+                      <SelectItem value={form.owner_id}>{campaign?.owner_name || "Previous owner"} (inactive)</SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
               </div>
@@ -200,15 +213,15 @@ export default function CampaignDialog({ open, onOpenChange, campaign, meta, onS
 
             <div className="space-y-1.5">
               <Label>Target cities <span className="text-muted-foreground font-normal">(none = all cities)</span></Label>
-              {meta?.cities?.length ? (
-                <Chips options={meta.cities.map((c) => ({ value: c, label: c }))} value={form.city_targets} onChange={set("city_targets")} testid="campaign-cities" />
+              {meta?.cities?.length || form.city_targets.length ? (
+                <Chips options={withStale((meta?.cities || []).map((c) => ({ value: c, label: c })), form.city_targets)} value={form.city_targets} onChange={set("city_targets")} testid="campaign-cities" />
               ) : <p className="text-[12.5px] text-muted-foreground">No cities set up in Marketplace yet.</p>}
             </div>
 
             <div className="space-y-1.5">
               <Label>Linked coupon codes</Label>
-              {meta?.coupons?.length ? (
-                <Chips options={meta.coupons.map((c) => ({ value: c.code, label: `${c.code} · ${c.discount_pct}%${c.active === false ? " (inactive)" : ""}` }))}
+              {meta?.coupons?.length || form.coupon_codes.length ? (
+                <Chips options={withStale((meta?.coupons || []).map((c) => ({ value: c.code, label: `${c.code} · ${c.discount_pct}%${c.active === false ? " (inactive)" : ""}` })), form.coupon_codes)}
                        value={form.coupon_codes} onChange={set("coupon_codes")} testid="campaign-coupons" />
               ) : <p className="text-[12.5px] text-muted-foreground">No coupons in Marketplace yet.</p>}
             </div>

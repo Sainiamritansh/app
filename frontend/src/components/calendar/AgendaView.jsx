@@ -4,7 +4,7 @@ import { MapPin, Users, Video, Loader2, CalendarDays } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/module/ModulePrimitives";
 import { cn } from "@/lib/utils";
-import { categoryStyle, dayLabel, eventStart, formatEventTime, isInProgress } from "./calendarUtils";
+import { categoryStyle, dayLabel, eventEnd, eventStart, formatEventTime, isInProgress } from "./calendarUtils";
 
 /** Group events under the local day they start on (or the agenda start, for ones already running). */
 function groupByDay(events, from) {
@@ -46,13 +46,18 @@ export default function AgendaView({ data, from, onSelectEvent, onLoadMore, load
             {events.map((ev) => {
               const style = categoryStyle(ev.category);
               const live = isInProgress(ev, now);
+              // Earlier today's meetings stay listed, just de-emphasised once they are over.
+              const past = !ev.all_day && eventEnd(ev) <= now;
               return (
                 <li key={ev.id}>
                   <button
                     type="button"
                     onClick={() => onSelectEvent(ev)}
                     data-testid="calendar-agenda-item"
-                    className="w-full flex items-start gap-3 rounded-lg px-2.5 py-2.5 text-left hover:bg-muted/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    className={cn(
+                      "w-full flex items-start gap-3 rounded-lg px-2.5 py-2.5 text-left hover:bg-muted/60 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                      past && "opacity-60",
+                    )}
                   >
                     <span className={cn("mt-1 h-9 w-1 rounded-full shrink-0", style.dot)} />
                     <div className="w-32 shrink-0 text-[12.5px] text-muted-foreground tabular-nums pt-0.5">{formatEventTime(ev)}</div>

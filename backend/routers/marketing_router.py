@@ -8,8 +8,8 @@ Dates are calendar days in the company timezone (Asia/Kolkata), end date inclusi
 
 Attribution uses only what marketplace data records. A booking is attributed to a campaign
 when it carries one of the campaign's linked coupon codes (booking field `coupon_code` or
-`coupon`) and was created inside the campaign window. Marketplace bookings do not store a
-coupon today, so attribution reports `supported: false` until they do; coupon `used_count`
+`coupon`) and was created inside the campaign window. Until some booking has redeemed a coupon,
+attribution reports `supported: false`; coupon `used_count`
 is lifetime-only and cannot be split by date, so it is shown as context, never attributed.
 """
 # No `from __future__ import annotations`: FastAPI resolves body models from runtime annotations.
@@ -37,7 +37,7 @@ REVENUE_STATUSES = ("confirmed", "active", "completed")
 # Booking fields that may carry the coupon code a customer redeemed.
 BOOKING_COUPON_FIELDS = ("coupon_code", "coupon")
 ATTRIBUTION_UNSUPPORTED_REASON = (
-    "Marketplace bookings don't record which coupon was used, so bookings and revenue can't be "
+    "No marketplace booking has redeemed a coupon yet, so bookings and revenue can't be "
     "attributed to campaigns yet. Coupon redemption counts are lifetime totals and can't be split by campaign dates."
 )
 
@@ -248,12 +248,17 @@ class CampaignPatch(_CampaignFields):
 NULLABLE = {"audience_segment_id", "audience_note", "notes"}
 
 
-async def _validate_refs(db, data: dict, current: UserPublic) -> dict:
-    """Resolve and validate references; returns the fields to store."""
+async def _validate_refs(db, data: dict, current: UserPublic, before: Optional[dict] = None) -> dict:
+    """Resolve and validate references; returns the fields to store. On update (`before`), values the
+    campaign already holds are kept even if their segment / city / coupon / owner has since been renamed
+    or removed, so an unrelated edit never fails; the user can still clear or replace them."""
+    before = before or {}
     out = {}
     if "audience_segment_id" in data:
         sid = data["audience_segment_id"]
-        if sid:
+        if sid and sid == before.get("audience_segment_id"):
+            out["audience_segment_id"], out["audience_segment_name"] = sid, before.get("audience_segment_name")
+        elif sid:
             seg = await db.crm_segments.find_one({"_id": ObjectId(sid)}) if ObjectId.is_valid(sid) else None
             if not seg:
                 raise ValueError("Unknown CRM segment")
@@ -262,6 +267,8 @@ async def _validate_refs(db, data: dict, current: UserPublic) -> dict:
             out["audience_segment_id"], out["audience_segment_name"] = None, None
     if data.get("city_targets") is not None:
         known = {c["name"].lower(): c["name"] for c in await db.cities.find({}, {"name": 1}).to_list(None) if c.get("name")}
+        for old in before.get("city_targets") or []:
+            known.setdefault(str(old).lower(), old)
         cities = []
         for city in data["city_targets"]:
             name = known.get(str(city).strip().lower())
@@ -272,6 +279,8 @@ async def _validate_refs(db, data: dict, current: UserPublic) -> dict:
         out["city_targets"] = cities
     if data.get("coupon_codes") is not None:
         known = {_norm_code(c["code"]): c["code"] for c in await db.coupons.find({}, {"code": 1}).to_list(None) if c.get("code")}
+        for old in before.get("coupon_codes") or []:
+            known.setdefault(_norm_code(old), old)
         codes = []
         for code in data["coupon_codes"]:
             real = known.get(_norm_code(code))
@@ -284,6 +293,8 @@ async def _validate_refs(db, data: dict, current: UserPublic) -> dict:
         owner_id = data["owner_id"] or current.id
         if owner_id == current.id:
             out["owner_id"], out["owner_name"] = current.id, current.name
+        elif owner_id == before.get("owner_id"):
+            out["owner_id"], out["owner_name"] = owner_id, before.get("owner_name")
         else:
             u = await db.users.find_one({"_id": ObjectId(owner_id)}) if ObjectId.is_valid(owner_id) else None
             if not u or u.get("status") == "deactivated" or u.get("is_active") is False:
@@ -477,7 +488,7 @@ async def update_campaign(campaign_id: str, payload: CampaignPatch, current: Use
     changes = {k: v for k, v in data.items() if k not in ("audience_segment_id", "city_targets", "coupon_codes", "owner_id")}
     if "channels" in changes:
         changes["channels"] = list(dict.fromkeys(changes["channels"]))
-    changes.update(await _validate_refs(db, data, current))
+    changes.update(await _validate_refs(db, data, current, before))
     changed = _changed_fields(before, changes)
     if not changed:
         supported, coupon_bookings = await _load_attribution(db)

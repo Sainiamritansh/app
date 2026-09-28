@@ -6,14 +6,19 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { api, formatApiError } from "@/lib/api";
+import AccessPicker, { normalizeAccess } from "./AccessPicker";
 
-/** Create a folder (folder = null) or rename an existing one. */
+/** Create a folder (folder = null) or rename / change access of an existing one. */
 export default function FolderDialog({ open, onOpenChange, folder, onSaved }) {
   const [name, setName] = useState("");
+  const [access, setAccess] = useState(normalizeAccess(null));
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
-    if (open) setName(folder?.name || "");
+    if (open) {
+      setName(folder?.name || "");
+      setAccess(normalizeAccess(folder?.access));
+    }
   }, [open, folder]);
 
   const submit = async (e) => {
@@ -23,9 +28,9 @@ export default function FolderDialog({ open, onOpenChange, folder, onSaved }) {
     setSaving(true);
     try {
       const { data } = folder
-        ? await api.patch(`/vault/folders/${folder.id}`, { name: value })
-        : await api.post("/vault/folders", { name: value });
-      toast.success(folder ? "Folder renamed" : "Folder created");
+        ? await api.patch(`/vault/folders/${folder.id}`, { name: value, access })
+        : await api.post("/vault/folders", { name: value, access });
+      toast.success(folder ? "Folder saved" : "Folder created");
       onSaved(data);
     } catch (e2) {
       toast.error(formatApiError(e2));
@@ -36,10 +41,10 @@ export default function FolderDialog({ open, onOpenChange, folder, onSaved }) {
 
   return (
     <Dialog open={open} onOpenChange={(v) => !saving && onOpenChange(v)}>
-      <DialogContent className="max-w-sm" data-testid="vault-folder-dialog">
+      <DialogContent className="max-w-md max-h-[92vh] overflow-y-auto" data-testid="vault-folder-dialog">
         <DialogHeader>
-          <DialogTitle className="font-display tracking-tight">{folder ? "Rename folder" : "New folder"}</DialogTitle>
-          <DialogDescription>Folders group related documents, e.g. Legal, Insurance or Licences.</DialogDescription>
+          <DialogTitle className="font-display tracking-tight">{folder ? "Edit folder" : "New folder"}</DialogTitle>
+          <DialogDescription>Folders group related documents, e.g. Legal, Insurance or Licences. A restricted folder hides everything inside it from people outside its access list.</DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           <div>
@@ -47,6 +52,7 @@ export default function FolderDialog({ open, onOpenChange, folder, onSaved }) {
             <Input id="vault-folder-name" value={name} onChange={(e) => setName(e.target.value)} maxLength={60}
                    autoFocus disabled={saving} data-testid="vault-folder-name" />
           </div>
+          <AccessPicker value={access} onChange={setAccess} disabled={saving} idPrefix="vault-folder-access" scope="folder" />
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>Cancel</Button>
             <Button type="submit" disabled={saving || !name.trim()} data-testid="vault-folder-save">

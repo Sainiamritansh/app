@@ -219,12 +219,34 @@ def test_upcoming_calendar_is_real_and_visibility_scoped(api, users, test_db):
     assert starts == sorted(starts)
 
 
+def test_upcoming_calendar_includes_in_progress_events(api, users, test_db):
+    test_db.calendar_events.delete_many({})
+    started = _now_ist() - timedelta(minutes=30)
+    running_id = _event(test_db, "Running now", started, users["founder"]["id"])  # ends in 30 minutes
+    _event(test_db, "Finished", _now_ist() - timedelta(hours=2), users["founder"]["id"])
+    events = _stats(api, users["founder"])["upcoming_events"]
+    assert [e["id"] for e in events] == [str(running_id)]
+    assert events[0]["when"].startswith("Now, until ")
+
+
 def test_opportunities_are_real(api, users, test_db):
     test_db.opportunities.insert_one({"title": "Real deal", "type": "Partnership", "status": "open",
                                       "value_lakhs": 12, "deadline": "2099-01-01"})
     test_db.opportunities.insert_one({"title": "Lost deal", "type": "Partnership", "status": "lost"})
     opps = _stats(api, users["founder"])["opportunities"]
     assert [o["title"] for o in opps] == ["Real deal"]
+
+
+def test_pipeline_total_covers_all_open_deals(api, users, test_db):
+    test_db.opportunities.delete_many({})
+    test_db.opportunities.insert_many([
+        {"title": f"Deal {i}", "type": "Partnership", "status": "open", "value_lakhs": 10, "deadline": "2099-01-01"}
+        for i in range(5)
+    ] + [{"title": "Won", "type": "Partnership", "status": "won", "value_lakhs": 99}])
+    data = _stats(api, users["founder"])
+    assert len(data["opportunities"]) == 3
+    assert data["pipeline"] == {"count": 5, "value_lakhs": 50}
+    test_db.opportunities.delete_many({})
 
 
 # ------------------------- public live KPIs -------------------------

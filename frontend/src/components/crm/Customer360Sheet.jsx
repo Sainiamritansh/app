@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 import { fmtDate, inr, initials, relativeDays, useResource } from "./crmShared";
 import { ErrorBlock, LifecyclePill } from "./StateBlocks";
 import FollowupDialog from "./FollowupDialog";
+import CustomerDialog from "./CustomerDialog";
 
 const TIMELINE_ICONS = {
   booking: { icon: Bike, cls: "bg-primary/10 text-primary" },
@@ -259,16 +260,32 @@ function Timeline({ items }) {
   );
 }
 
-export default function Customer360Sheet({ customerId, open, onOpenChange, canEdit, tagSuggestions, onChanged }) {
+export default function Customer360Sheet({ customerId, open, onOpenChange, canEdit, tagSuggestions, cities, onChanged, onDeleted }) {
   const { data, error, loading, reload, setData } = useResource(customerId ? `/crm/customers/${customerId}` : null, null,
     { enabled: Boolean(open && customerId) });
   const [fuOpen, setFuOpen] = useState(false);
   const [fuEditing, setFuEditing] = useState(null);
+  const [editOpen, setEditOpen] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const changed = () => { reload({ background: true }); onChanged?.(); };
   const actions = useFollowupActions(changed);
   const ready = data && data.customer?.id === customerId;
   const c = ready ? data.customer : null;
   const m = ready ? data.metrics : null;
+
+  async function removeCustomer() {
+    if (!window.confirm(`Delete ${c.name}? Their CRM notes, tags and follow-ups are deleted too. Customers with bookings or tickets can't be deleted.`)) return;
+    setDeleting(true);
+    try {
+      await api.delete(`/crm/customers/${customerId}`);
+      toast.success("Customer deleted");
+      onDeleted?.();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -307,6 +324,17 @@ export default function Customer360Sheet({ customerId, open, onOpenChange, canEd
                 {c.phone && <a href={`tel:${c.phone.replace(/\s/g, "")}`} className="inline-flex items-center gap-1.5 hover:text-foreground"><Phone className="h-3.5 w-3.5" />{c.phone}</a>}
                 {c.city && <span className="inline-flex items-center gap-1.5"><MapPin className="h-3.5 w-3.5" />{c.city}</span>}
               </div>
+              {canEdit && (
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" className="h-8 gap-1.5" onClick={() => setEditOpen(true)} data-testid="crm-edit-customer">
+                    <Pencil className="h-3.5 w-3.5" /> Edit details
+                  </Button>
+                  <Button size="sm" variant="ghost" className="h-8 gap-1.5 text-destructive" disabled={deleting} onClick={removeCustomer}
+                          data-testid="crm-delete-customer">
+                    {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />} Delete
+                  </Button>
+                </div>
+              )}
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
                 <Kpi label="Lifetime value" value={inr(data.kpis.ltv)} />
                 <Kpi label="Bookings" value={data.kpis.bookings} />
@@ -356,6 +384,7 @@ export default function Customer360Sheet({ customerId, open, onOpenChange, canEd
         )}
         <FollowupDialog open={fuOpen} onOpenChange={setFuOpen} customerId={customerId} customerName={c?.name}
                         followup={fuEditing} onSaved={changed} />
+        <CustomerDialog open={editOpen} onOpenChange={setEditOpen} customer={c} cities={cities} onSaved={changed} />
       </SheetContent>
     </Sheet>
   );

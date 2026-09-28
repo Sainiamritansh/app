@@ -13,25 +13,39 @@ VAULT_TZ (default Asia/Kolkata). `send_expiry_reminders(db)` notifies every
 Founder once at 30 days, once at 7 days and once when expired; the stages already
 sent are tracked in `reminders_sent` and reset whenever the expiry date changes.
 
+Access control: every folder and document carries `access` ({mode: everyone|restricted,
+roles, departments, user_ids}) plus a derived `access_keys` list ("*", "role:<Role>",
+"dept:<casefolded name>", "user:<id>") used for filtering. A user sees an item when they are a
+Founder/Admin, its owner, or share a key with it. A restricted folder also hides every document
+in it (cascade); a document whose folder no longer exists counts as hidden (owner + Founders/Admins
+only), in both the list filter and single-document checks. Restricted with no roles/departments/people
+means owner + Founders/Admins only.
+Items stored before access control existed have no `access_keys` and stay visible to everyone
+who can open the vault. Only the owner, Founders and Admins may edit, re-version, delete or
+change access of an item. Module-level entry is still gated by permissions.py (vault.view /
+vault.manage).
+
 Server wiring (outside this module): call `await ensure_indexes(db)` on startup and
 `await send_expiry_reminders(db)` periodically from the background loop.
 """
 # No `from __future__ import annotations`: FastAPI resolves Form/File/Query
 # parameters and the Pydantic bodies below from runtime annotations.
 import hashlib
+import json
 import logging
 import math
 import os
 import re
 from datetime import date, datetime, timedelta
-from typing import AsyncIterator, Optional
+from types import SimpleNamespace
+from typing import AsyncIterator, Literal, Optional
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 # pyrefly: ignore [missing-import]
@@ -79,7 +93,15 @@ SORTS = {
     "expiry": [("expires_on", 1), ("_id", 1)],
 }
 REMINDER_STAGES = ("30d", "7d", "expired")
-HIDDEN_FIELDS = ("title_lower", "reminders_sent", "file_id")
+HIDDEN_FIELDS = ("title_lower", "reminders_sent", "file_id", "access_keys")
+
+# Access control
+ROLES = ("Founder", "Admin", "Manager", "Employee", "Intern")
+VAULT_ADMIN_ROLES = {"Founder", "Admin"}  # see and manage every item regardless of its access
+EVERYONE = "*"
+MAX_ACCESS_DEPTS = 50
+MAX_ACCESS_USERS = 200
+MAX_DEPT_LEN = 80
 
 
 # ------------------------- storage (swap for S3 here) -------------------------
@@ -127,7 +149,150 @@ async def _delete(db, storage_id: str) -> None:
 
 def _require(current: UserPublic, action: str) -> None:
     if not can(current.role, action):
-        raise HTTPException(403, "Only Founders can access the Company Vault")
+        if action == "vault.view":
+            raise HTTPException(403, "You don't have access to the Company Vault")
+        raise HTTPException(403, "You don't have permission to change the Company Vault")
+
+
+# ------------------------- access control -------------------------
+
+RoleName = Literal["Founder", "Admin", "Manager", "Employee", "Intern"]
+
+
+class AccessIn(BaseModel):
+    mode: Literal["everyone", "restricted"] = "everyone"
+    roles: list[RoleName] = Field(default_factory=list, max_length=len(ROLES))
+    departments: list[str] = Field(default_factory=list, max_length=MAX_ACCESS_DEPTS)
+    user_ids: list[str] = Field(default_factory=list, max_length=MAX_ACCESS_USERS)
+
+
+def _default_access() -> dict:
+    return {"mode": "everyone", "roles": [], "departments": [], "user_ids": []}
+
+
+def _norm_dept(name: Optional[str]) -> str:
+    return " ".join((name or "").split())
+
+
+def _is_vault_admin(current: UserPublic) -> bool:
+    return current.role in VAULT_ADMIN_ROLES
+
+
+def _viewer_keys(current: UserPublic) -> list[str]:
+    keys = [EVERYONE, f"role:{current.role}", f"user:{current.id}"]
+    dept = _norm_dept(current.department).casefold()
+    if dept:
+        keys.append(f"dept:{dept}")
+    return keys
+
+
+def _access_match(current: UserPublic) -> dict:
+    """Mongo filter: items whose access list admits this user (legacy items have no keys)."""
+    return {"$or": [{"access_keys": {"$exists": False}}, {"access_keys": {"$in": _viewer_keys(current)}}]}
+
+
+def _keys_admit(item: dict, current: UserPublic) -> bool:
+    keys = item.get("access_keys")
+    if keys is None:  # legacy item, created before access control
+        return True
+    return bool(set(keys) & set(_viewer_keys(current)))
+
+
+def _can_see_folder(folder: dict, current: UserPublic) -> bool:
+    return _is_vault_admin(current) or folder.get("created_by") == current.id or _keys_admit(folder, current)
+
+
+def _can_edit(item: dict, owner_field: str, current: UserPublic) -> bool:
+    # Owner rights never bypass vault.manage (an owner whose role lost it becomes view-only).
+    if not can(current.role, "vault.manage"):
+        return False
+    return _is_vault_admin(current) or item.get(owner_field) == current.id
+
+
+def _require_edit(item: dict, owner_field: str, current: UserPublic, what: str = "document") -> None:
+    if not _can_edit(item, owner_field, current):
+        raise HTTPException(403, f"Only the {what}'s owner, Founders or Admins can change it")
+
+
+async def _clean_access(db, raw: Optional[AccessIn]) -> dict:
+    """Validate an access setting; returns {"access": ..., "access_keys": [...]}."""
+    if raw is None or raw.mode == "everyone":
+        return {"access": _default_access(), "access_keys": [EVERYONE]}
+    roles = [r for r in ROLES if r in set(raw.roles)]
+    departments: list[str] = []
+    seen: set[str] = set()
+    for d in raw.departments:
+        d = _norm_dept(d)
+        if not d:
+            continue
+        if len(d) > MAX_DEPT_LEN:
+            raise HTTPException(422, f"Department names can be at most {MAX_DEPT_LEN} characters")
+        if d.casefold() not in seen:
+            seen.add(d.casefold())
+            departments.append(d)
+    user_ids: list[str] = []
+    for u in raw.user_ids:
+        u = (u or "").strip()
+        if not ObjectId.is_valid(u):
+            raise HTTPException(422, "Invalid employee id in access list")
+        if u not in user_ids:
+            user_ids.append(u)
+    if user_ids:
+        found = {str(d["_id"]) async for d in db.users.find(
+            {"_id": {"$in": [ObjectId(u) for u in user_ids]}}, {"_id": 1})}
+        if any(u not in found for u in user_ids):
+            raise HTTPException(422, "Some selected employees no longer exist")
+    keys = [f"role:{r}" for r in roles] + [f"dept:{d.casefold()}" for d in departments] \
+        + [f"user:{u}" for u in user_ids]
+    return {"access": {"mode": "restricted", "roles": roles, "departments": departments, "user_ids": user_ids},
+            "access_keys": keys}
+
+
+def _parse_access_form(value: Optional[str]) -> Optional[AccessIn]:
+    """Multipart uploads send access as a JSON string."""
+    if not value or not value.strip():
+        return None
+    try:
+        return AccessIn.model_validate(json.loads(value))
+    except (ValueError, ValidationError):
+        raise HTTPException(422, "access must be JSON: {mode, roles, departments, user_ids}")
+
+
+def _access_out(item: dict) -> dict:
+    return item.get("access") or _default_access()
+
+
+async def _visible_folder_ids(db, current: UserPublic) -> Optional[list[str]]:
+    """Ids of folders this user may see; None means all (Founder/Admin)."""
+    if _is_vault_admin(current):
+        return None
+    flt = {"$or": [{"created_by": current.id}, _access_match(current)]}
+    return [str(f["_id"]) async for f in db.vault_folders.find(flt, {"_id": 1})]
+
+
+async def _doc_filter(db, current: UserPublic) -> dict:
+    """Mongo filter for documents this user may see. Owners always see their own documents;
+    everyone else needs the document's access AND its folder's access (cascade)."""
+    if _is_vault_admin(current):
+        return {}
+    folder_ids = await _visible_folder_ids(db, current)
+    return {"$or": [
+        {"uploaded_by": current.id},
+        {"$and": [_access_match(current), {"folder_id": {"$in": [None, *folder_ids]}}]},
+    ]}
+
+
+async def _can_see_doc(db, doc: dict, current: UserPublic) -> bool:
+    if _is_vault_admin(current) or doc.get("uploaded_by") == current.id:
+        return True
+    if not _keys_admit(doc, current):
+        return False
+    if doc.get("folder_id"):
+        folder = await db.vault_folders.find_one({"_id": oid(doc["folder_id"])}, {"created_by": 1, "access_keys": 1})
+        # Same rule as _doc_filter: a missing folder is not in the visible-folder list, so the doc is hidden.
+        if not folder or not _can_see_folder(folder, current):
+            return False
+    return True
 
 
 def _today() -> date:
@@ -232,7 +397,7 @@ def _expiry_state(expires_on: Optional[str], today: date) -> tuple[Optional[str]
     return "valid", days
 
 
-def _out(doc: dict, today: Optional[date] = None) -> dict:
+def _out(doc: dict, today: Optional[date] = None, current: Optional[UserPublic] = None) -> dict:
     today = today or _today()
     out = {k: v for k, v in doc.items() if k not in HIDDEN_FIELDS and k != "_id"}
     out["id"] = str(doc["_id"])
@@ -241,22 +406,26 @@ def _out(doc: dict, today: Optional[date] = None) -> dict:
         for ver in sorted(doc.get("versions", []), key=lambda v: v["version"], reverse=True)
     ]
     out["expiry_status"], out["days_to_expiry"] = _expiry_state(doc.get("expires_on"), today)
+    out["access"] = _access_out(doc)
+    out["access_legacy"] = "access_keys" not in doc
+    out["can_edit"] = bool(current and _can_edit(doc, "uploaded_by", current))
     return out
 
 
-async def _load(db, doc_id: str) -> dict:
+async def _load(db, doc_id: str, current: UserPublic) -> dict:
+    """Load a document the user may see; hidden documents are reported as not found."""
     doc = await db.vault_documents.find_one({"_id": oid(doc_id)})
-    if not doc:
+    if not doc or not await _can_see_doc(db, doc, current):
         raise HTTPException(404, "Document not found")
     return doc
 
 
-async def _folder_name(db, folder_id: Optional[str]) -> Optional[str]:
-    """Validate a folder id; returns the folder name (None for unfiled)."""
+async def _folder_name(db, folder_id: Optional[str], current: UserPublic) -> Optional[str]:
+    """Validate a folder id the user may see; returns the folder name (None for unfiled)."""
     if not folder_id:
         return None
     folder = await db.vault_folders.find_one({"_id": oid(folder_id)})
-    if not folder:
+    if not folder or not _can_see_folder(folder, current):
         raise HTTPException(422, "Folder not found")
     return folder["name"]
 
@@ -310,6 +479,9 @@ async def ensure_indexes(db) -> None:
     await db.vault_documents.create_index("tags")
     await db.vault_documents.create_index("expires_on", sparse=True)
     await db.vault_documents.create_index("title_lower")
+    await db.vault_documents.create_index("access_keys")
+    await db.vault_documents.create_index("uploaded_by")
+    await db.vault_folders.create_index("access_keys")
 
 
 def _stage_for(days: int) -> Optional[str]:
@@ -361,6 +533,20 @@ async def send_expiry_reminders(db) -> int:
 
 class FolderIn(BaseModel):
     name: str = Field(min_length=1, max_length=60)
+    access: Optional[AccessIn] = None
+
+
+class FolderPatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=60)
+    access: Optional[AccessIn] = None
+
+
+def _folder_out(f: dict, current: UserPublic, counts: Optional[dict] = None) -> dict:
+    c = (counts or {}).get(str(f["_id"]), {})
+    return {"id": str(f["_id"]), "name": f["name"], "count": c.get("count", 0), "size": c.get("size", 0),
+            "created_at": f.get("created_at"), "created_by": f.get("created_by"),
+            "access": _access_out(f), "access_legacy": "access_keys" not in f,
+            "can_edit": _can_edit(f, "created_by", current)}
 
 
 def _folder_name_clean(name: str) -> str:
@@ -374,14 +560,14 @@ def _folder_name_clean(name: str) -> str:
 async def list_folders(current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.view")
     db = get_db()
+    vis = await _doc_filter(db, current)
     counts = {r["_id"]: r for r in await db.vault_documents.aggregate([
+        {"$match": vis},
         {"$group": {"_id": "$folder_id", "count": {"$sum": 1}, "size": {"$sum": "$size"}}},
     ]).to_list(None)}
-    folders = []
-    async for f in db.vault_folders.find({}).sort("name_lower", 1):
-        c = counts.get(str(f["_id"]), {})
-        folders.append({"id": str(f["_id"]), "name": f["name"], "count": c.get("count", 0),
-                        "size": c.get("size", 0), "created_at": f.get("created_at")})
+    folder_ids = await _visible_folder_ids(db, current)
+    flt = {} if folder_ids is None else {"_id": {"$in": [ObjectId(i) for i in folder_ids]}}
+    folders = [_folder_out(f, current, counts) async for f in db.vault_folders.find(flt).sort("name_lower", 1)]
     unfiled = counts.get(None, {})
     return {"folders": folders, "unfiled_count": unfiled.get("count", 0),
             "total_count": sum(c["count"] for c in counts.values())}
@@ -392,43 +578,73 @@ async def create_folder(body: FolderIn, current: UserPublic = Depends(get_curren
     _require(current, "vault.manage")
     db = get_db()
     name = _folder_name_clean(body.name)
+    access = await _clean_access(db, body.access)
     # Explicit check; the unique index from ensure_indexes() is the race-proof backstop.
     if await db.vault_folders.find_one({"name_lower": name.lower()}, {"_id": 1}):
         raise HTTPException(409, "A folder with this name already exists")
-    doc = {"name": name, "name_lower": name.lower(), "created_by": current.id, "created_at": utc_iso()}
+    doc = {"name": name, "name_lower": name.lower(), "created_by": current.id, "created_at": utc_iso(), **access}
     try:
         res = await db.vault_folders.insert_one(doc)
     except DuplicateKeyError:
         raise HTTPException(409, "A folder with this name already exists")
-    await log_activity(db, current, "Created vault folder", MODULE, target=name)
-    return {"id": str(res.inserted_id), "name": name, "count": 0, "size": 0, "created_at": doc["created_at"]}
+    doc["_id"] = res.inserted_id
+    await log_activity(db, current, "Created vault folder", MODULE, target=name,
+                       meta={"access": access["access"]["mode"]})
+    return _folder_out(doc, current)
+
+
+async def _load_folder(db, folder_id: str, current: UserPublic) -> dict:
+    folder = await db.vault_folders.find_one({"_id": oid(folder_id)})
+    if not folder or not _can_see_folder(folder, current):
+        raise HTTPException(404, "Folder not found")
+    return folder
 
 
 @router.patch("/folders/{folder_id}")
-async def rename_folder(folder_id: str, body: FolderIn, current: UserPublic = Depends(get_current_user)):
+async def update_folder(folder_id: str, body: FolderPatch, current: UserPublic = Depends(get_current_user)):
+    """Rename a folder and/or change its access (owner, Founder or Admin)."""
     _require(current, "vault.manage")
     db = get_db()
-    name = _folder_name_clean(body.name)
-    if await db.vault_folders.find_one({"name_lower": name.lower(), "_id": {"$ne": oid(folder_id)}}, {"_id": 1}):
-        raise HTTPException(409, "A folder with this name already exists")
-    try:
-        old = await db.vault_folders.find_one_and_update(
-            {"_id": oid(folder_id)}, {"$set": {"name": name, "name_lower": name.lower()}})
-    except DuplicateKeyError:
-        raise HTTPException(409, "A folder with this name already exists")
-    if not old:
-        raise HTTPException(404, "Folder not found")
-    await log_activity(db, current, "Renamed vault folder", MODULE, target=f"{old['name']} → {name}")
-    return {"id": folder_id, "name": name}
+    folder = await _load_folder(db, folder_id, current)
+    _require_edit(folder, "created_by", current, "folder")
+    fields = body.model_dump(exclude_unset=True)
+    updates: dict = {}
+    old_name = folder["name"]
+    if fields.get("name") is not None:
+        name = _folder_name_clean(body.name)
+        if await db.vault_folders.find_one({"name_lower": name.lower(), "_id": {"$ne": folder["_id"]}}, {"_id": 1}):
+            raise HTTPException(409, "A folder with this name already exists")
+        if name != old_name:
+            updates.update(name=name, name_lower=name.lower())
+    if "access" in fields:
+        updates.update(await _clean_access(db, body.access))
+    if updates:
+        try:
+            folder = await db.vault_folders.find_one_and_update(
+                {"_id": folder["_id"]}, {"$set": updates}, return_document=ReturnDocument.AFTER)
+        except DuplicateKeyError:
+            raise HTTPException(409, "A folder with this name already exists")
+        if not folder:
+            raise HTTPException(404, "Folder not found")
+        if "name" in updates:
+            await log_activity(db, current, "Renamed vault folder", MODULE, target=f"{old_name} → {folder['name']}")
+        if "access" in updates:
+            await log_activity(db, current, "Changed vault folder access", MODULE, target=folder["name"],
+                               meta={"folder_id": folder_id, "access": updates["access"]})
+    vis = await _doc_filter(db, current)
+    counts = {r["_id"]: r for r in await db.vault_documents.aggregate([
+        {"$match": {"$and": [vis, {"folder_id": folder_id}]}},
+        {"$group": {"_id": "$folder_id", "count": {"$sum": 1}, "size": {"$sum": "$size"}}},
+    ]).to_list(None)}
+    return _folder_out(folder, current, counts)
 
 
 @router.delete("/folders/{folder_id}")
 async def delete_folder(folder_id: str, current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.manage")
     db = get_db()
-    folder = await db.vault_folders.find_one({"_id": oid(folder_id)})
-    if not folder:
-        raise HTTPException(404, "Folder not found")
+    folder = await _load_folder(db, folder_id, current)
+    _require_edit(folder, "created_by", current, "folder")
     if await db.vault_documents.count_documents({"folder_id": folder_id}, limit=1):
         raise HTTPException(409, "Folder is not empty. Move or delete its documents first.")
     await db.vault_folders.delete_one({"_id": folder["_id"]})
@@ -441,7 +657,9 @@ async def delete_folder(folder_id: str, current: UserPublic = Depends(get_curren
 @router.get("/tags")
 async def list_tags(current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.view")
-    rows = await get_db().vault_documents.aggregate([
+    db = get_db()
+    rows = await db.vault_documents.aggregate([
+        {"$match": await _doc_filter(db, current)},
         {"$unwind": "$tags"},
         {"$group": {"_id": "$tags", "count": {"$sum": 1}}},
         {"$sort": {"count": -1, "_id": 1}},
@@ -482,6 +700,9 @@ async def list_documents(
                              "$lte": (today + timedelta(days=EXPIRY_WINDOW_DAYS)).isoformat()}
     elif expiry == "any":
         flt["expires_on"] = {"$ne": None}
+    vis = await _doc_filter(db, current)
+    if vis:
+        flt["$and"] = [vis]
     total = await db.vault_documents.count_documents(flt)
     skip = (page - 1) * page_size
     if sort == "expiry" and "expires_on" not in flt:
@@ -497,7 +718,7 @@ async def list_documents(
         docs = await db.vault_documents.find(flt).sort(SORTS[sort]) \
             .skip(skip).limit(page_size).to_list(page_size)
     return {
-        "items": [_out(d, today) for d in docs],
+        "items": [_out(d, today, current) for d in docs],
         "total": total, "page": page, "page_size": page_size,
         "pages": max(1, math.ceil(total / page_size)),
     }
@@ -512,12 +733,15 @@ async def upload_document(
     description: Optional[str] = Form(None),
     expires_on: Optional[str] = Form(None),
     note: Optional[str] = Form(None),
+    access: Optional[str] = Form(None, description='JSON: {"mode": "everyone"|"restricted", "roles": [], '
+                                                    '"departments": [], "user_ids": []}'),
     current: UserPublic = Depends(get_current_user),
 ):
     _require(current, "vault.manage")
     db = get_db()
     folder_id = (folder_id or "").strip() or None
-    folder_name = await _folder_name(db, folder_id)
+    folder_name = await _folder_name(db, folder_id, current)
+    access_fields = await _clean_access(db, _parse_access_form(access))
     tag_list = _clean_tags(tags)
     expiry = _parse_expiry(expires_on)
     description = _clean_text(description, "Description", 2000)
@@ -539,7 +763,7 @@ async def upload_document(
         "checksum": checksum, "file_id": storage_id, "version": 1,
         "uploaded_by": current.id, "uploaded_by_name": current.name,
         "created_at": now, "updated_at": now, "expires_on": expiry, "reminders_sent": [],
-        "versions": [version],
+        "versions": [version], **access_fields,
     }
     try:
         res = await db.vault_documents.insert_one(doc)
@@ -548,17 +772,35 @@ async def upload_document(
         raise
     doc["_id"] = res.inserted_id
     await log_activity(db, current, "Uploaded document", MODULE, target=title,
-                       meta={"document_id": str(res.inserted_id), "folder": folder_name, "size": len(data)})
+                       meta={"document_id": str(res.inserted_id), "folder": folder_name, "size": len(data),
+                             "access": access_fields["access"]["mode"]})
     await _notify_founders(db, "Document added to Vault",
                            f"{current.name} uploaded “{title}” ({_human_size(len(data))}).",
                            _doc_link(res.inserted_id), exclude=current.id)
-    return _out(doc)
+    await _notify_shared(db, doc, current, None)
+    return _out(doc, current=current)
+
+
+async def _notify_shared(db, doc: dict, current: UserPublic, before: Optional[list[str]]) -> None:
+    """Tell people who were individually given access (only newly added ones when `before` is given).
+    People who still can't open it (e.g. the folder is restricted, or they lack vault.view) are skipped."""
+    ids = set((doc.get("access") or {}).get("user_ids") or []) - set(before or []) - {current.id}
+    if not ids:
+        return
+    async for u in db.users.find({"_id": {"$in": [ObjectId(i) for i in ids]}, "status": {"$ne": "deactivated"},
+                                  "is_active": {"$ne": False}}, {"role": 1, "department": 1}):
+        uid = str(u["_id"])
+        viewer = SimpleNamespace(id=uid, role=u.get("role"), department=u.get("department"))
+        if not can(viewer.role, "vault.view") or not await _can_see_doc(db, doc, viewer):
+            continue
+        await notify(db, uid, "Document shared with you",
+                     f"{current.name} shared “{doc['title']}” in the Company Vault.", link=_doc_link(doc["_id"]))
 
 
 @router.get("/documents/{doc_id}")
 async def get_document(doc_id: str, current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.view")
-    return _out(await _load(get_db(), doc_id))
+    return _out(await _load(get_db(), doc_id, current), current=current)
 
 
 class DocumentPatch(BaseModel):
@@ -567,13 +809,15 @@ class DocumentPatch(BaseModel):
     tags: Optional[list[str]] = None
     description: Optional[str] = Field(None, max_length=2000)
     expires_on: Optional[str] = None
+    access: Optional[AccessIn] = None
 
 
 @router.patch("/documents/{doc_id}")
 async def update_document(doc_id: str, body: DocumentPatch, current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.manage")
     db = get_db()
-    doc = await _load(db, doc_id)
+    doc = await _load(db, doc_id, current)
+    _require_edit(doc, "uploaded_by", current)
     fields = body.model_dump(exclude_unset=True)
     updates: dict = {}
     if "title" in fields:
@@ -581,7 +825,8 @@ async def update_document(doc_id: str, body: DocumentPatch, current: UserPublic 
         updates.update(title=title, title_lower=title.lower())
     if "folder_id" in fields:
         folder_id = (fields["folder_id"] or "").strip() or None
-        await _folder_name(db, folder_id)
+        if folder_id != doc.get("folder_id"):
+            await _folder_name(db, folder_id, current)
         updates["folder_id"] = folder_id
     if "tags" in fields:
         updates["tags"] = _clean_tags(fields["tags"] or [])
@@ -591,8 +836,14 @@ async def update_document(doc_id: str, body: DocumentPatch, current: UserPublic 
         updates["expires_on"] = _parse_expiry(fields["expires_on"])
         if updates["expires_on"] != doc.get("expires_on"):
             updates["reminders_sent"] = []
+    before_users = (doc.get("access") or {}).get("user_ids") or []
+    if "access" in fields:
+        new_access = await _clean_access(db, body.access)
+        # Only a real change counts (the edit dialog always re-sends the current access).
+        if new_access["access"] != _access_out(doc):
+            updates.update(new_access)
     if not updates:
-        return _out(doc)
+        return _out(doc, current=current)
     updates["updated_at"] = utc_iso()
     doc = await db.vault_documents.find_one_and_update(
         {"_id": doc["_id"]}, {"$set": updates}, return_document=ReturnDocument.AFTER)
@@ -601,14 +852,20 @@ async def update_document(doc_id: str, body: DocumentPatch, current: UserPublic 
     changed = [k for k in fields if k in updates]
     await log_activity(db, current, "Edited document details", MODULE, target=doc["title"],
                        meta={"document_id": doc_id, "fields": changed})
-    return _out(doc)
+    if "access" in updates:
+        await log_activity(db, current, "Changed document access", MODULE, target=doc["title"],
+                           meta={"document_id": doc_id, "access": updates["access"]})
+        await _notify_shared(db, doc, current, before_users)
+    return _out(doc, current=current)
 
 
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.manage")
     db = get_db()
-    doc = await db.vault_documents.find_one_and_delete({"_id": oid(doc_id)})
+    existing = await _load(db, doc_id, current)
+    _require_edit(existing, "uploaded_by", current)
+    doc = await db.vault_documents.find_one_and_delete({"_id": existing["_id"]})
     if not doc:
         raise HTTPException(404, "Document not found")
     for storage_id in {v["file_id"] for v in doc.get("versions", [])} | {doc.get("file_id")}:
@@ -625,7 +882,7 @@ async def delete_document(doc_id: str, current: UserPublic = Depends(get_current
 async def download_document(doc_id: str, inline: bool = False, current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.view")
     db = get_db()
-    doc = await _load(db, doc_id)
+    doc = await _load(db, doc_id, current)
     chunks, length = await _get_stream(db, doc["file_id"])
     if not inline:
         await log_activity(db, current, "Downloaded document", MODULE, target=doc["title"],
@@ -668,7 +925,8 @@ async def upload_version(
 ):
     _require(current, "vault.manage")
     db = get_db()
-    doc = await _load(db, doc_id)
+    doc = await _load(db, doc_id, current)
+    _require_edit(doc, "uploaded_by", current)
     note = _clean_text(note, "Note", 300)
     data, name, ctype = await _read_upload(file)
     storage_id = await _put_bytes(db, data, name, ctype)
@@ -685,7 +943,7 @@ async def upload_version(
     await _notify_founders(db, "New document version",
                            f"{current.name} uploaded version {updated['version']} of “{doc['title']}”.",
                            _doc_link(doc_id), exclude=current.id)
-    return _out(updated)
+    return _out(updated, current=current)
 
 
 @router.get("/documents/{doc_id}/versions/{number}/download")
@@ -693,7 +951,7 @@ async def download_version(doc_id: str, number: int, inline: bool = False,
                            current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.view")
     db = get_db()
-    doc = await _load(db, doc_id)
+    doc = await _load(db, doc_id, current)
     v = _find_version(doc, number)
     chunks, length = await _get_stream(db, v["file_id"])
     if not inline:
@@ -706,7 +964,8 @@ async def download_version(doc_id: str, number: int, inline: bool = False,
 async def restore_version(doc_id: str, number: int, current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.manage")
     db = get_db()
-    doc = await _load(db, doc_id)
+    doc = await _load(db, doc_id, current)
+    _require_edit(doc, "uploaded_by", current)
     v = _find_version(doc, number)
     if number == doc["version"]:
         raise HTTPException(409, "This is already the current version")
@@ -717,7 +976,7 @@ async def restore_version(doc_id: str, number: int, current: UserPublic = Depend
     })
     await log_activity(db, current, "Restored document version", MODULE, target=doc["title"],
                        meta={"document_id": doc_id, "from_version": number, "version": updated["version"]})
-    return _out(updated)
+    return _out(updated, current=current)
 
 
 # ------------------------- stats / ops -------------------------
@@ -728,7 +987,8 @@ async def vault_stats(current: UserPublic = Depends(get_current_user)):
     db = get_db()
     today = _today()
     horizon = (today + timedelta(days=EXPIRY_WINDOW_DAYS)).isoformat()
-    rows = await db.vault_documents.aggregate([{"$facet": {
+    vis = await _doc_filter(db, current)
+    rows = await db.vault_documents.aggregate([{"$match": vis}, {"$facet": {
         "totals": [{"$group": {"_id": None, "count": {"$sum": 1}, "size": {"$sum": "$size"}}}],
         "by_folder": [{"$group": {"_id": "$folder_id", "count": {"$sum": 1}, "size": {"$sum": "$size"}}}],
         "expired": [{"$match": {"expires_on": {"$ne": None, "$lt": today.isoformat()}}}, {"$count": "n"}],
@@ -739,6 +999,10 @@ async def vault_stats(current: UserPublic = Depends(get_current_user)):
     }}]).to_list(1)
     r = rows[0]
     names = {str(f["_id"]): f["name"] async for f in db.vault_folders.find({}, {"name": 1})}
+    # A user's own document can sit in a folder they can't see; don't reveal that folder's name.
+    folder_ids = await _visible_folder_ids(db, current)
+    if folder_ids is not None:
+        names = {k: v for k, v in names.items() if k in set(folder_ids)}
     by_folder = sorted(
         ({"folder_id": g["_id"], "name": names.get(g["_id"], "Unfiled") if g["_id"] else "Unfiled",
           "count": g["count"], "size": g["size"]} for g in r["by_folder"]),
@@ -760,6 +1024,8 @@ async def vault_stats(current: UserPublic = Depends(get_current_user)):
 @router.post("/reminders/run")
 async def run_reminders(current: UserPublic = Depends(get_current_user)):
     _require(current, "vault.manage")
+    if not _is_vault_admin(current):
+        raise HTTPException(403, "Only Founders or Admins can run vault reminders")
     db = get_db()
     sent = await send_expiry_reminders(db)
     await log_activity(db, current, "Ran vault expiry reminders", MODULE, meta={"sent": sent})

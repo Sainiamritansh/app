@@ -1,6 +1,7 @@
-import { useState } from "react";
-import { CalendarClock } from "lucide-react";
+import { useEffect, useState } from "react";
+import { CalendarClock, Plus } from "lucide-react";
 import { EmptyState } from "@/components/module/ModulePrimitives";
+import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -9,12 +10,16 @@ import { ErrorBlock, RowSkeletons } from "./StateBlocks";
 import { FollowupItem, useFollowupActions } from "./Customer360Sheet";
 import FollowupDialog from "./FollowupDialog";
 
-export default function FollowupsPanel({ canEdit, onOpenCustomer, refreshKey }) {
+export default function FollowupsPanel({ canEdit, onOpenCustomer, refreshKey, onChanged }) {
   const [status, setStatus] = useState("open");
   const [mine, setMine] = useState(false);
   const [editing, setEditing] = useState(null);
-  const { data, error, loading, reload } = useResource("/crm/followups", { status, mine: mine || undefined, _k: refreshKey });
-  const actions = useFollowupActions(() => reload({ background: true }));
+  const [creating, setCreating] = useState(false);
+  const { data, error, loading, reload } = useResource("/crm/followups", { status, mine: mine || undefined });
+  useEffect(() => { if (refreshKey) reload({ background: true }); }, [refreshKey, reload]);
+  // Completing / deleting / editing here also changes the overview's open & overdue counts.
+  const changed = () => { reload({ background: true }); onChanged?.(); };
+  const actions = useFollowupActions(changed);
 
   const overdue = data ? data.filter((f) => f.overdue).length : 0;
 
@@ -29,6 +34,11 @@ export default function FollowupsPanel({ canEdit, onOpenCustomer, refreshKey }) 
           </TabsList>
         </Tabs>
         <div className="flex items-center gap-2">
+          {canEdit && (
+            <Button size="sm" className="gap-1.5 mr-2" onClick={() => setCreating(true)} data-testid="crm-new-followup">
+              <Plus className="h-4 w-4" /> New follow-up
+            </Button>
+          )}
           <Label htmlFor="fu-mine" className="text-[13px] cursor-pointer">Only mine</Label>
           <Switch id="fu-mine" checked={mine} onCheckedChange={setMine} data-testid="crm-followups-mine" />
         </div>
@@ -42,7 +52,10 @@ export default function FollowupsPanel({ canEdit, onOpenCustomer, refreshKey }) 
         <RowSkeletons rows={4} />
       ) : data.length === 0 ? (
         <EmptyState icon={CalendarClock} title={status === "done" ? "Nothing completed yet" : "No open follow-ups"}
-                    description="Schedule follow-ups from a customer's profile; owners are notified." />
+                    description="Schedule a follow-up here or from a customer's profile; owners are notified."
+                    action={canEdit && status !== "done" && (
+                      <Button size="sm" className="gap-1.5" onClick={() => setCreating(true)}><Plus className="h-4 w-4" /> New follow-up</Button>
+                    )} />
       ) : (
         <ul className="space-y-2">
           {data.map((f) => (
@@ -52,7 +65,8 @@ export default function FollowupsPanel({ canEdit, onOpenCustomer, refreshKey }) 
         </ul>
       )}
       <FollowupDialog open={Boolean(editing)} onOpenChange={(o) => !o && setEditing(null)} followup={editing}
-                      customerName={editing?.customer_name} onSaved={() => reload({ background: true })} />
+                      customerName={editing?.customer_name} onSaved={changed} />
+      <FollowupDialog open={creating} onOpenChange={setCreating} onSaved={changed} />
     </div>
   );
 }

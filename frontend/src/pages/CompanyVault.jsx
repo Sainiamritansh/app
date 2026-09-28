@@ -20,6 +20,7 @@ import {
 import UploadDialog from "@/components/vault/UploadDialog";
 import DocumentSheet from "@/components/vault/DocumentSheet";
 import FolderDialog from "@/components/vault/FolderDialog";
+import { AccessBadge, accessSummary, useAccessOptions } from "@/components/vault/AccessPicker";
 import { expiryBadge, formatBytes, formatDate, typeMeta } from "@/components/vault/vaultUtils";
 import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { usePermission } from "@/hooks/usePermission";
@@ -69,7 +70,7 @@ function TypeIcon({ contentType, className }) {
   );
 }
 
-function DocumentCard({ doc, folderName, onOpen }) {
+function DocumentCard({ doc, folderName, onOpen, peopleById }) {
   const meta = typeMeta(doc.content_type);
   return (
     <button
@@ -80,7 +81,10 @@ function DocumentCard({ doc, folderName, onOpen }) {
     >
       <div className="flex items-start justify-between gap-2">
         <TypeIcon contentType={doc.content_type} className="h-10 w-10" />
-        <ExpiryPill doc={doc} />
+        <div className="flex flex-wrap justify-end gap-1">
+          <AccessBadge access={doc.access} peopleById={peopleById} />
+          <ExpiryPill doc={doc} />
+        </div>
       </div>
       <div className="font-display text-[14.5px] font-semibold text-foreground mt-3 line-clamp-2 break-words">{doc.title}</div>
       <div className="text-[12px] text-muted-foreground mt-0.5 truncate">{doc.file_name}</div>
@@ -98,17 +102,20 @@ function DocumentCard({ doc, folderName, onOpen }) {
   );
 }
 
-function DocumentRow({ doc, folderName, onOpen }) {
+function DocumentRow({ doc, folderName, onOpen, peopleById }) {
   return (
     <tr className="border-b border-border last:border-0 hover:bg-muted/40 cursor-pointer" onClick={onOpen} data-testid={`vault-row-${doc.id}`}>
       <td className="p-3">
         <div className="flex items-center gap-3 min-w-0">
           <TypeIcon contentType={doc.content_type} className="h-9 w-9" />
           <div className="min-w-0">
-            <button type="button" className="text-[13.5px] font-medium text-foreground truncate block max-w-full text-left hover:underline"
-                    onClick={(e) => { e.stopPropagation(); onOpen(); }}>
-              {doc.title}
-            </button>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <button type="button" className="text-[13.5px] font-medium text-foreground truncate block max-w-full text-left hover:underline"
+                      onClick={(e) => { e.stopPropagation(); onOpen(); }}>
+                {doc.title}
+              </button>
+              <AccessBadge access={doc.access} peopleById={peopleById} showLabel={false} className="shrink-0" />
+            </div>
             <div className="text-[11.5px] text-muted-foreground truncate">
               {doc.file_name}<span className="md:hidden"> · {formatBytes(doc.size)}</span>
             </div>
@@ -144,7 +151,7 @@ function ListSkeleton({ view }) {
   );
 }
 
-function FolderButton({ active, icon: Icon, label, count, onClick, menu, testId }) {
+function FolderButton({ active, icon: Icon, label, count, onClick, menu, testId, restricted }) {
   return (
     <div className={cn("group flex items-center rounded-md shrink-0 lg:shrink transition-colors", active ? "bg-muted" : "hover:bg-muted/60")}>
       <button
@@ -156,6 +163,7 @@ function FolderButton({ active, icon: Icon, label, count, onClick, menu, testId 
       >
         <Icon className={cn("h-4 w-4 shrink-0", active ? "text-primary" : "text-muted-foreground")} />
         <span className="truncate">{label}</span>
+        {restricted && <Lock className="h-3 w-3 shrink-0 text-primary" aria-label={`Restricted: ${restricted}`} />}
         <span className="ml-auto pl-2 text-[11.5px] text-muted-foreground tabular-nums">{count}</span>
       </button>
       {menu}
@@ -191,6 +199,11 @@ export default function CompanyVault() {
   const [folderToDelete, setFolderToDelete] = useState(null);
   const [deletingFolder, setDeletingFolder] = useState(false);
   const requestId = useRef(0);
+  const accessOptions = useAccessOptions();
+  const peopleById = useMemo(
+    () => Object.fromEntries((accessOptions?.people || []).map((p) => [p.id, p])),
+    [accessOptions],
+  );
 
   const folders = useMemo(() => folderData?.folders || [], [folderData]);
   const folderNames = useMemo(() => Object.fromEntries(folders.map((f) => [f.id, f.name])), [folders]);
@@ -286,7 +299,7 @@ export default function CompanyVault() {
     return (
       <div data-testid="vault-page">
         <PageHeader eyebrow="Module" title="Company Vault" />
-        <EmptyState icon={Lock} title="Founders only" description="The Company Vault holds confidential company documents and is limited to Founders." />
+        <EmptyState icon={Lock} title="No access" description="Your role doesn't have access to the Company Vault. Ask a Founder or Admin if you need a document from it." />
       </div>
     );
   }
@@ -314,7 +327,7 @@ export default function CompanyVault() {
     </div>
   );
 
-  const folderMenu = (f) => canManage && (
+  const folderMenu = (f) => canManage && f.can_edit && (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button variant="ghost" size="icon" className="h-7 w-7 mr-0.5 shrink-0 lg:opacity-0 lg:group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100"
@@ -323,7 +336,7 @@ export default function CompanyVault() {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
-        <DropdownMenuItem onClick={() => setFolderDialog({ open: true, folder: f })}><Pencil className="h-4 w-4 mr-2" /> Rename</DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setFolderDialog({ open: true, folder: f })}><Pencil className="h-4 w-4 mr-2" /> Rename &amp; access</DropdownMenuItem>
         <DropdownMenuItem className="text-destructive focus:text-destructive" onClick={() => setFolderToDelete(f)}>
           <Trash2 className="h-4 w-4 mr-2" /> Delete
         </DropdownMenuItem>
@@ -350,7 +363,8 @@ export default function CompanyVault() {
                         onClick={() => chooseFolder(ALL)} testId="vault-folder-all" />
           {folders.map((f) => (
             <FolderButton key={f.id} active={folder === f.id} icon={folder === f.id ? FolderOpen : Folder} label={f.name}
-                          count={f.count} onClick={() => chooseFolder(f.id)} menu={folderMenu(f)} testId={`vault-folder-${f.id}`} />
+                          count={f.count} onClick={() => chooseFolder(f.id)} menu={folderMenu(f)} testId={`vault-folder-${f.id}`}
+                          restricted={f.access?.mode === "restricted" ? accessSummary(f.access, peopleById) : null} />
           ))}
           <FolderButton active={folder === UNFILED} icon={Inbox} label="Unfiled" count={folderData.unfiled_count}
                         onClick={() => chooseFolder(UNFILED)} testId="vault-folder-unfiled" />
@@ -436,7 +450,7 @@ export default function CompanyVault() {
       <div className={cn("transition-opacity", loading && "opacity-60 pointer-events-none")}>
         {view === "grid" ? (
           <div className="grid gap-3 grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4" data-testid="vault-grid">
-            {docs.items.map((d) => <DocumentCard key={d.id} doc={d} folderName={nameOf(d.folder_id)} onOpen={() => openDoc(d)} />)}
+            {docs.items.map((d) => <DocumentCard key={d.id} doc={d} folderName={nameOf(d.folder_id)} onOpen={() => openDoc(d)} peopleById={peopleById} />)}
           </div>
         ) : (
           <div className="rounded-xl border border-border bg-card overflow-hidden" data-testid="vault-list">
@@ -452,7 +466,7 @@ export default function CompanyVault() {
                 </tr>
               </thead>
               <tbody>
-                {docs.items.map((d) => <DocumentRow key={d.id} doc={d} folderName={nameOf(d.folder_id)} onOpen={() => openDoc(d)} />)}
+                {docs.items.map((d) => <DocumentRow key={d.id} doc={d} folderName={nameOf(d.folder_id)} onOpen={() => openDoc(d)} peopleById={peopleById} />)}
               </tbody>
             </table>
           </div>
@@ -485,7 +499,7 @@ export default function CompanyVault() {
       <PageHeader
         eyebrow="Module"
         title="Company Vault"
-        description="Confidential company documents with version history and expiry reminders. Visible to Founders only."
+        description="Confidential company documents with version history and expiry reminders. Each folder and document can be limited to specific roles, departments or people."
         actions={canManage && (
           <Button onClick={() => setUploadOpen(true)} className="gap-1.5 font-medium" data-testid="vault-upload">
             <Plus className="h-4 w-4" /> Upload
