@@ -9,6 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Progress } from "@/components/ui/progress";
 import { api, formatApiError } from "@/lib/api";
 import FolderSelect from "./FolderSelect";
+import AccessPicker, { normalizeAccess } from "./AccessPicker";
 import { DropZone } from "./UploadDialog";
 import { parseTags, validateFile } from "./vaultUtils";
 
@@ -20,7 +21,7 @@ export function EditDocumentDialog({ doc, open, onOpenChange, folders, onSaved }
     if (open && doc) {
       setForm({
         title: doc.title || "", folderId: doc.folder_id || "", tags: (doc.tags || []).join(", "),
-        expiresOn: doc.expires_on || "", description: doc.description || "",
+        expiresOn: doc.expires_on || "", description: doc.description || "", access: normalizeAccess(doc.access),
       });
     }
   }, [open, doc]);
@@ -39,6 +40,7 @@ export function EditDocumentDialog({ doc, open, onOpenChange, folders, onSaved }
         tags: parseTags(form.tags),
         expires_on: form.expiresOn || null,
         description: form.description.trim() || null,
+        access: form.access,
       });
       toast.success("Details saved");
       onSaved(data);
@@ -54,7 +56,7 @@ export function EditDocumentDialog({ doc, open, onOpenChange, folders, onSaved }
       <DialogContent className="max-w-lg max-h-[92vh] overflow-y-auto" data-testid="vault-edit-dialog">
         <DialogHeader>
           <DialogTitle className="font-display tracking-tight">Edit details</DialogTitle>
-          <DialogDescription>Changing the expiry date re-arms the expiry reminders.</DialogDescription>
+          <DialogDescription>Changing the expiry date re-arms the expiry reminders. Access applies on top of the folder's access.</DialogDescription>
         </DialogHeader>
         <form onSubmit={submit} className="space-y-4">
           <div>
@@ -79,6 +81,8 @@ export function EditDocumentDialog({ doc, open, onOpenChange, folders, onSaved }
             <Label htmlFor="vault-edit-desc">Description</Label>
             <Textarea id="vault-edit-desc" rows={3} value={form.description} onChange={set("description")} maxLength={2000} disabled={saving} />
           </div>
+          <AccessPicker value={form.access} onChange={(access) => setForm((f) => ({ ...f, access }))} disabled={saving}
+                        idPrefix="vault-edit-access" />
           <DialogFooter className="gap-2">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>Cancel</Button>
             <Button type="submit" disabled={saving} className="gap-1.5" data-testid="vault-edit-save">

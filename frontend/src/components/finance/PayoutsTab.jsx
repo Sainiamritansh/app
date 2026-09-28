@@ -15,7 +15,7 @@ import { EmptyState, StatusPill } from "@/components/module/ModulePrimitives";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import {
-  inr, formatDate, todayIST, useFinanceResource, LoadError, TableSkeleton, TH,
+  inr, formatDate, todayIST, useFinanceResource, LoadError, TableSkeleton, TH, VendorSelect,
 } from "@/components/finance/financeShared";
 
 function previousMonthRange() {
@@ -117,7 +117,9 @@ function PayPayoutDialog({ payout, onClose, onDone }) {
 export default function PayoutsTab({ canManage }) {
   const outstanding = useFinanceResource("/finance/payouts/outstanding");
   const [status, setStatus] = useState("");
-  const payouts = useFinanceResource("/finance/payouts", status ? { status } : null);
+  const [vendorId, setVendorId] = useState("");
+  const payouts = useFinanceResource("/finance/payouts", { ...(status ? { status } : {}), ...(vendorId ? { vendor_id: vendorId } : {}) });
+  const payoutVendors = (outstanding.data?.vendors || []).map((v) => ({ id: v.vendor_id, name: v.vendor_name }));
   const [createOpen, setCreateOpen] = useState(false);
   const [paying, setPaying] = useState(null);
   const [toCancel, setToCancel] = useState(null);
@@ -215,20 +217,23 @@ export default function PayoutsTab({ canManage }) {
               <CardTitle className="font-display text-[17px]">Payouts</CardTitle>
               <CardDescription>Each booking is paid out at most once.</CardDescription>
             </div>
-            <Select value={status || "all"} onValueChange={(v) => setStatus(v === "all" ? "" : v)}>
-              <SelectTrigger className="h-9 w-full sm:w-[140px]" data-testid="finance-payout-status"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="all">All payouts</SelectItem>
-                <SelectItem value="pending">Pending</SelectItem>
-                <SelectItem value="paid">Paid</SelectItem>
-              </SelectContent>
-            </Select>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <VendorSelect vendors={outstanding.data ? payoutVendors : null} value={vendorId} onChange={setVendorId} allLabel="All vendors" testid="finance-payout-vendor" />
+              <Select value={status || "all"} onValueChange={(v) => setStatus(v === "all" ? "" : v)}>
+                <SelectTrigger className="h-9 w-full sm:w-[140px]" data-testid="finance-payout-status"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="all">All payouts</SelectItem>
+                  <SelectItem value="pending">Pending</SelectItem>
+                  <SelectItem value="paid">Paid</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
         </CardHeader>
         {!payouts.data && payouts.error ? (
           <div className="p-4 pt-0"><LoadError error={payouts.error} onRetry={payouts.reload} loading={payouts.loading} what="payouts" /></div>
         ) : !payouts.data ? <TableSkeleton rows={4} /> : payouts.data.length === 0 ? (
-          <div className="p-4 pt-0"><EmptyState icon={Wallet} title={status ? `No ${status} payouts` : "No payouts yet"} description="Create a payout batch to settle vendors for completed bookings." /></div>
+          <div className="p-4 pt-0"><EmptyState icon={Wallet} title={status || vendorId ? `No ${status ? `${status} ` : ""}payouts${vendorId ? " for this vendor" : ""}` : "No payouts yet"} description="Create a payout batch to settle vendors for completed bookings." /></div>
         ) : (
           <Table>
             <TableHeader>

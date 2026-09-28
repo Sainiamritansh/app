@@ -47,8 +47,8 @@ function Bars({ rows, valueKey, max = 100, format, labelKey, sub }) {
 }
 
 export default function MarketplaceTab({ range, city, canExport }) {
-  const params = { from: range.from, to: range.to, ...(city ? { city } : {}) };
-  const rangeParams = { from: range.from, to: range.to };
+  const params = { days: range.days, from: range.from, to: range.to, ...(city ? { city } : {}) };
+  const rangeParams = { days: range.days, from: range.from, to: range.to };
   const [drill, setDrill] = useState(null);
 
   const summary = useAnalyticsData("/analytics/marketplace/summary", params);
@@ -130,7 +130,7 @@ export default function MarketplaceTab({ range, city, canExport }) {
         description="Customers grouped by first paid-booking month · % who booked again in each following month"
         actions={exp("cohorts")} loading={cohorts.loading} error={cohorts.error} onRetry={cohorts.reload} height={220}
         empty={!cohortRows.some((c) => c.size > 0)} emptyIcon={Repeat} emptyTitle="No new customers in this range"
-        emptyDescription="Cohorts start from each customer's first paid booking. Try a longer range such as 12M."
+        emptyDescription="Cohorts start from each customer's first paid booking. Try a longer range such as 90D."
       >
         {cohorts.data && <CohortHeatmap data={cohorts.data} />}
       </ChartCard>

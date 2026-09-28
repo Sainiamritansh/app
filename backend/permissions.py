@@ -12,7 +12,7 @@ MODULE_ACCESS = {
     "opportunity-hub": {"Founder", "Admin", "Manager", "Employee"},
     "employees":       {"Founder", "Admin", "Manager", "Employee", "Intern"},
     "wavygo-connect":  {"Founder", "Admin", "Manager", "Employee", "Intern"},
-    "company-vault":   {"Founder"},
+    "company-vault":   {"Founder", "Admin", "Manager", "Employee", "Intern"},
     "finance":         {"Founder"},
     "crm":             {"Founder", "Admin", "Manager"},
     "marketing":       {"Founder", "Admin", "Manager"},
@@ -42,7 +42,7 @@ ACTIONS = {
     "user.invite.manager":          {"Founder", "Admin"},
     "user.invite.employee":         {"Founder", "Admin"},
     "user.invite.intern":           {"Founder", "Admin"},
-    "user.delete":                  {"Founder"},
+    "user.delete":                  {"Founder", "Admin"},
     "user.edit_others":             {"Founder", "Admin", "Manager"},
     "user.edit_self":               {"Founder", "Admin", "Manager", "Employee", "Intern"},
 
@@ -87,8 +87,8 @@ ACTIONS = {
     "activity.view_all":            {"Founder", "Admin"},
     "activity.view_team":           {"Manager"},
 
-    "vault.view":                   {"Founder"},
-    "vault.manage":                 {"Founder"},
+    "vault.view":                   {"Founder", "Admin", "Manager", "Employee", "Intern"},
+    "vault.manage":                 {"Founder", "Admin"},
 
     "finance.view":                 {"Founder"},
     "finance.manage":               {"Founder"},

@@ -24,6 +24,7 @@ const EMPTY_FORM = { title: "", type: "Grant", description: "", organisation: ""
 // Fields the PATCH endpoint accepts; Employees (assignees) may only send the last three.
 const EDIT_FIELDS = ["title", "type", "description", "organisation", "deadline", "value_lakhs", "link", "assignee_id", "status", "notes", "documents"];
 const EMPLOYEE_FIELDS = ["status", "notes", "documents"];
+const UNASSIGNED = "none";
 
 // Server row -> controlled form values (never null in inputs); documents are edited one link per line.
 function toForm(o) {
@@ -62,6 +63,7 @@ export default function OpportunityHub() {
   const [form, setForm] = useState(EMPTY_FORM);
   const [submitting, setSubmitting] = useState(false);
   const [actionLoadingId, setActionLoadingId] = useState(null);
+  const [highlightId, setHighlightId] = useState(null);
 
   async function load({ background = false } = {}) {
     try {
@@ -94,6 +96,34 @@ export default function OpportunityHub() {
       }, { replace: true });
     }
   }, [searchParams, setSearchParams, canCreate]);
+
+  // ?opp=<id> (notification / email links) opens that opportunity and highlights its card.
+  useEffect(() => {
+    const oppId = searchParams.get("opp");
+    if (!oppId) return;
+    (async () => {
+      try {
+        const { data } = await api.get(`/opportunities/${oppId}`);
+        setTypeFilter("all"); setStatusFilter("all"); setQ("");
+        setHighlightId(data.id);
+        if (data.can_edit !== false) edit(data);
+      } catch (e) {
+        toast.error(formatApiError(e) || "Could not open this opportunity.");
+      } finally {
+        // Remove the param (also on failure) so it is not retried on every URL change.
+        setSearchParams(params => { params.delete("opp"); return params; }, { replace: true });
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, setSearchParams]);
+
+  // Scroll the highlighted card into view once it is rendered; the highlight fades after a few seconds.
+  useEffect(() => {
+    if (!highlightId || !rows.some(r => r.id === highlightId)) return undefined;
+    document.getElementById(`opp-${highlightId}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const t = setTimeout(() => setHighlightId(null), 4000);
+    return () => clearTimeout(t);
+  }, [highlightId, rows]);
 
   // Managers may only assign within their own department (the server enforces the same rule).
   const assignees = useMemo(
@@ -202,7 +232,7 @@ export default function OpportunityHub() {
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {filtered.map(o => (
-            <Card key={o.id} className="border-border hover-lift">
+            <Card key={o.id} id={`opp-${o.id}`} className={`border-border hover-lift ${highlightId === o.id ? "ring-2 ring-primary" : ""}`}>
               <CardHeader className="pb-2">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
@@ -224,7 +254,7 @@ export default function OpportunityHub() {
                     {o.assignee_name ? (
                       <><Avatar className="h-6 w-6"><AvatarImage src={o.assignee_photo || undefined} /><AvatarFallback className="text-[9px] bg-wavygo-100 text-wavygo-800">{initials(o.assignee_name)}</AvatarFallback></Avatar>
                         <span className="text-[12px]">{o.assignee_name}</span></>
-                    ) : !canAssign ? (
+                    ) : !canAssign || o.can_edit === false ? (
                       <span className="text-[12px] text-muted-foreground">Unassigned</span>
                     ) : (
                       <Select value="" onValueChange={(v) => assign(o.id, v)} disabled={actionLoadingId === `assign-${o.id}`}>
@@ -243,7 +273,7 @@ export default function OpportunityHub() {
                         <ExternalLink className="h-3.5 w-3.5" />
                       </button>
                     )}
-                    <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => edit(o)}>{role === "Employee" ? "Update" : "Edit"}</Button>
+                    {o.can_edit !== false && <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={() => edit(o)}>{role === "Employee" ? "Update" : "Edit"}</Button>}
                     {canDelete && (
                       <Button size="icon" variant="ghost" className="h-7 w-7 text-destructive" onClick={() => del(o.id)} disabled={actionLoadingId === `del-${o.id}`}>
                         {actionLoadingId === `del-${o.id}` ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
@@ -251,7 +281,7 @@ export default function OpportunityHub() {
                     )}
                   </div>
                 </div>
-                <div className="flex flex-wrap gap-1 pt-1">
+                {o.can_edit !== false && <div className="flex flex-wrap gap-1 pt-1">
                   {STATUSES.filter(s => s !== o.status).map(s => {
                     const isStatusLoading = actionLoadingId === `status-${o.id}-${s}`;
                     return (
@@ -261,7 +291,7 @@ export default function OpportunityHub() {
                       </Button>
                     );
                   })}
-                </div>
+                </div>}
               </CardContent>
             </Card>
           ))}
@@ -303,9 +333,12 @@ export default function OpportunityHub() {
               </div>
               <div>
                 <Label>Assignee</Label>
-                <Select value={form.assignee_id} onValueChange={(v) => setForm(s => ({ ...s, assignee_id: v }))} disabled={fieldsLocked || !canAssign || submitting}>
+                <Select value={form.assignee_id || UNASSIGNED} onValueChange={(v) => setForm(s => ({ ...s, assignee_id: v === UNASSIGNED ? "" : v }))} disabled={fieldsLocked || !canAssign || submitting}>
                   <SelectTrigger><SelectValue placeholder="Optional" /></SelectTrigger>
-                  <SelectContent>{assignees.map(u => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}</SelectContent>
+                  <SelectContent>
+                    <SelectItem value={UNASSIGNED}>Unassigned</SelectItem>
+                    {assignees.map(u => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}
+                  </SelectContent>
                 </Select>
               </div>
             </div>

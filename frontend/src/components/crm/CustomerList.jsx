@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ArrowDown, ArrowUp, BookmarkPlus, ChevronLeft, ChevronRight, Loader2, Search, Users, X } from "lucide-react";
+import { ArrowDown, ArrowUp, BookmarkPlus, ChevronLeft, ChevronRight, Loader2, Plus, Search, Users, X } from "lucide-react";
 import { EmptyState, StatusPill } from "@/components/module/ModulePrimitives";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
@@ -44,7 +44,7 @@ function FilterSelect({ value, onChange, placeholder, options, testid, className
   );
 }
 
-export default function CustomerList({ meta, segments, filters, setFilters, onOpenCustomer, onSaveSegment, canEdit, paused }) {
+export default function CustomerList({ meta, segments, filters, setFilters, onOpenCustomer, onSaveSegment, onAddCustomer, canEdit, paused, refreshKey }) {
   const [search, setSearch] = useState(filters.q);
   const [minLtv, setMinLtv] = useState(filters.min_ltv);
   const [minBookings, setMinBookings] = useState(filters.min_bookings);
@@ -71,6 +71,10 @@ export default function CustomerList({ meta, segments, filters, setFilters, onOp
 
   const params = { ...Object.fromEntries(Object.entries(filters).filter(([, v]) => v)), sort: sort.key, order: sort.order, page, page_size: PAGE_SIZE };
   const { data, error, loading, reload } = useResource("/crm/customers", params, { paused });
+  // A customer added / edited / deleted elsewhere on the page refreshes the list in place.
+  useEffect(() => { if (refreshKey) reload({ background: true }); }, [refreshKey, reload]);
+  // A delete (or live refresh) can shrink the list below the current page: fall back to the last page.
+  useEffect(() => { if (data && page > data.pages) setPage(data.pages); }, [data, page]);
 
   const set = (key) => (value) => setFilters((f) => ({ ...f, [key]: value }));
   const active = Object.entries(filters).some(([, v]) => v);
@@ -153,7 +157,12 @@ export default function CustomerList({ meta, segments, filters, setFilters, onOp
         <RowSkeletons rows={8} />
       ) : data.total === 0 ? (
         <EmptyState icon={Users} title={active ? "No customers match these filters" : "No customers yet"}
-                    description={active ? "Try widening the filters." : "Customers added in Marketplace appear here."} />
+                    description={active ? "Try widening the filters." : "Add your first customer, or they appear here when created in Marketplace."}
+                    action={!active && canEdit && onAddCustomer && (
+                      <Button size="sm" className="gap-1.5" onClick={onAddCustomer} data-testid="crm-add-customer-empty">
+                        <Plus className="h-4 w-4" /> Add customer
+                      </Button>
+                    )} />
       ) : (
         <>
           <Card className={cn("border-border overflow-hidden transition-opacity", loading && "opacity-60")}>

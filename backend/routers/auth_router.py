@@ -29,6 +29,7 @@ from auth_utils import (
     get_current_user,
     require_roles,
     is_deactivated,
+    session_id_from_request,
     DEACTIVATED_DETAIL,
     REFRESH_DAYS,
     REFRESH_DAYS_SHORT,
@@ -358,6 +359,7 @@ async def refresh(payload: RefreshRequest):
 
 @router.post("/logout")
 async def logout(
+    request: Request,
     payload: Optional[LogoutRequest] = None,
     current: UserPublic = Depends(get_current_user),
 ):
@@ -406,6 +408,15 @@ async def logout(
                 {"refresh_token_id": data["jti"], "user_id": current.id},
                 {"$set": {"revoked": True, "revoked_at": now.isoformat()}},
             )
+
+    # The access token's own session too: after a refresh the client's refresh token may have
+    # rotated past the one it sent, but the session id in the access token stays the same.
+    sid = session_id_from_request(request)
+    if sid and ObjectId.is_valid(sid):
+        await db.sessions.update_one(
+            {"_id": ObjectId(sid), "user_id": current.id, "revoked": {"$ne": True}},
+            {"$set": {"revoked": True, "revoked_at": now.isoformat()}},
+        )
 
     # --------------------------------------------------------
     # 3. Mark user offline

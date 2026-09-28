@@ -46,10 +46,11 @@ function requestFor(view, date, filters, page = 1) {
   }
   if (view === "week") return ["/calendar/week", { ...params, date: toDateParam(date), week_start: "monday" }];
   if (view === "day") return ["/calendar/day", { ...params, date: toDateParam(date) }];
-  // Agenda from today starts "now", so finished events drop off while running ones stay.
+  // Agenda starts at local midnight of the chosen day, so meetings earlier today
+  // (already finished or in progress) still appear under "Today".
   return ["/calendar/agenda", {
     ...params,
-    start: isTodayDate(date) ? undefined : toDateParam(date),
+    start: toDateParam(date),
     days: AGENDA_DAYS, page, page_size: AGENDA_PAGE_SIZE,
   }];
 }
@@ -136,12 +137,15 @@ export default function CalendarPage() {
 
   const loadMore = async () => {
     const [url, params] = requestFor("agenda", date, filters, data.page + 1);
+    // A view / date / filter change while this page loads starts a new request; drop this page then.
+    const id = requestId.current;
     setLoadingMore(true);
     try {
       const { data: next } = await api.get(url, { params });
+      if (id !== requestId.current) return;
       setData((prev) => ({ ...next, items: [...prev.items, ...next.items] }));
     } catch (e) {
-      toast.error(formatApiError(e));
+      if (id === requestId.current) toast.error(formatApiError(e));
     } finally {
       setLoadingMore(false);
     }

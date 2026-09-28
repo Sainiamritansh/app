@@ -7,6 +7,7 @@ Runs against an isolated server and throwaway database (see local_harness.py).
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -288,10 +289,12 @@ def test_agenda_includes_in_progress_and_skips_cancelled(api, users):
     assert later["id"] not in _ids(body["items"])
 
 
-def test_agenda_defaults_to_now(api, users):
+def test_agenda_defaults_to_local_midnight_today(api, users):
     body = _get(api, users["founder"], "/agenda").json()
     start = datetime.fromisoformat(body["range"]["start"])
-    assert abs((datetime.now(timezone.utc) - start).total_seconds()) < 60
+    ist = ZoneInfo("Asia/Kolkata")
+    midnight = datetime.combine(datetime.now(ist).date(), datetime.min.time(), ist)
+    assert start == midnight
 
 
 # ------------------------- participants -------------------------

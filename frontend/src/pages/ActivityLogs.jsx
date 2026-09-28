@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ export default function ActivityLogs() {
   const [modules, setModules] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const reqRef = useRef(0);
 
   // Module filtering happens server-side (?module=) so the 200-row limit applies per module.
   const load = useCallback(({ background = false } = {}) => {
@@ -26,9 +27,11 @@ export default function ActivityLogs() {
       setError(null);
     }
     const params = { limit: 200, ...(module !== ALL ? { module } : {}) };
+    // Only the latest request may update the list (a slow earlier module's reply must not win).
+    const req = ++reqRef.current;
     api.get("/activity", { params })
-      .then(({ data }) => setLogs(data))
-      .catch((e) => { if (!background) setError(e?.response?.data?.detail || "Could not load activity logs."); })
+      .then(({ data }) => { if (req === reqRef.current) setLogs(data); })
+      .catch((e) => { if (!background && req === reqRef.current) setError(e?.response?.data?.detail || "Could not load activity logs."); })
       .finally(() => { if (!background) setLoading(false); });
   }, [module]);
 
@@ -66,7 +69,7 @@ export default function ActivityLogs() {
           <div className="p-16 text-center" data-testid="activity-error">
             <AlertTriangle className="h-8 w-8 mx-auto text-destructive" />
             <div className="mt-3 text-sm text-muted-foreground">{String(error)}</div>
-            <Button variant="outline" size="sm" onClick={load} className="mt-4 h-8 text-xs">Retry</Button>
+            <Button variant="outline" size="sm" onClick={() => load()} className="mt-4 h-8 text-xs">Retry</Button>
           </div>
         ) : loading && logs.length === 0 ? (
           <div className="p-16 text-center text-sm text-muted-foreground">Loading…</div>

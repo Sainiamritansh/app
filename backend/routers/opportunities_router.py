@@ -103,6 +103,22 @@ async def _check_manager_write(db, doc, ids):
             raise HTTPException(403, "This opportunity belongs to another department")
 
 
+async def _can_write(db, doc, current: UserPublic, ids, creator_is_manager: dict) -> bool:
+    """Non-raising mirror of the write rules (for the `can_edit` flag on reads). Employees only ever
+    see their own opportunities, which they may update (status / notes / documents)."""
+    if current.role != "Manager":
+        return True
+    if not _unassigned(doc):
+        return doc["assignee_id"] in ids
+    creator = doc.get("created_by")
+    if creator and creator not in ids and ObjectId.is_valid(creator):
+        if creator not in creator_is_manager:
+            u = await db.users.find_one({"_id": ObjectId(creator)}, {"role": 1})
+            creator_is_manager[creator] = bool(u and u.get("role") == "Manager")
+        return not creator_is_manager[creator]
+    return True
+
+
 async def _check_assignee(db, current: UserPublic, assignee_id: str, ids=None):
     """The assignee must be an existing user; Managers may only assign within their department."""
     if not ObjectId.is_valid(assignee_id) or not await db.users.find_one({"_id": ObjectId(assignee_id)}, {"_id": 1}):
@@ -157,8 +173,11 @@ async def list_opps(status: str | None = None, type: str | None = None,
         {"$limit": limit},
         {"$project": {"_no_deadline": 0}},
     ]).to_list(limit)
+    ids = await _manager_ids(db, current) if current.role == "Manager" else None
+    cache: dict = {}
     for d in docs:
         await _enrich(db, d)
+        d["can_edit"] = await _can_write(db, d, current, ids, cache)
     return serialize_many(docs)
 
 
@@ -174,6 +193,9 @@ async def create_opp(payload: OpportunityIn,
     doc["assignee_id"] = doc.get("assignee_id") or None
     if doc["assignee_id"]:
         await _check_assignee(db, current, doc["assignee_id"])
+        # Same rule as POST /{id}/assign: an assigned opportunity is no longer "open".
+        if doc.get("status") == "open":
+            doc["status"] = "assigned"
     doc["created_at"] = utc_iso()
     doc["updated_at"] = utc_iso()
     doc["created_by"] = current.id
@@ -183,7 +205,7 @@ async def create_opp(payload: OpportunityIn,
     await log_activity(db, current, "Logged opportunity", "Opportunity Hub", target=doc["title"])
     if doc.get("assignee_id") and doc["assignee_id"] != current.id:
         await notify(db, doc["assignee_id"], "Opportunity assigned",
-                     f"{current.name} assigned you: {doc['title']}", kind="info", link="/opportunity-hub")
+                     f"{current.name} assigned you: {doc['title']}", kind="info", link=f"/opportunity-hub?opp={doc['_id']}")
     if doc.get("assignee_id"):
         await notify_assignment_by_email(
             db=db,
@@ -237,6 +259,8 @@ async def get_opp(opp_id: str, current: UserPublic = Depends(get_current_user)):
     db = get_db()
     doc = await _load_opp(db, opp_id, current)
     await _enrich(db, doc)
+    ids = await _manager_ids(db, current) if current.role == "Manager" else None
+    doc["can_edit"] = await _can_write(db, doc, current, ids, {})
     return serialize(doc)
 
 
@@ -264,6 +288,12 @@ async def update_opp(opp_id: str, payload: OpportunityPatch,
         elif changes["assignee_id"]:
             await _check_assignee(db, current, changes["assignee_id"], ids)
     new_assignee = changes.get("assignee_id")
+    # Same rule as POST /{id}/assign: an assigned opportunity is no longer "open";
+    # clearing the assignee puts an "assigned" one back in the open pool.
+    if new_assignee and changes.get("status", existing.get("status")) == "open":
+        changes["status"] = "assigned"
+    elif "assignee_id" in changes and not new_assignee             and changes.get("status", existing.get("status")) == "assigned":
+        changes["status"] = "open"
     changes["updated_at"] = utc_iso()
     res = await db.opportunities.update_one({"_id": oid(opp_id)}, {"$set": changes})
     if res.matched_count == 0:
@@ -272,7 +302,7 @@ async def update_opp(opp_id: str, payload: OpportunityPatch,
     await _enrich(db, doc)
     if new_assignee and new_assignee != current.id:
         await notify(db, new_assignee, "Opportunity assigned",
-                     f"{current.name} assigned you: {doc['title']}", kind="info", link="/opportunity-hub")
+                     f"{current.name} assigned you: {doc['title']}", kind="info", link=f"/opportunity-hub?opp={opp_id}")
     if new_assignee:
         await notify_assignment_by_email(
             db=db,
@@ -304,7 +334,10 @@ async def assign_opp(opp_id: str, payload: OpportunityAssign,
         ids = await _manager_ids(db, current)
         await _check_manager_write(db, existing, ids)
     await _check_assignee(db, current, payload.assignee_id, ids)
-    await db.opportunities.update_one({"_id": oid(opp_id)}, {"$set": {"assignee_id": payload.assignee_id, "status": "assigned", "updated_at": utc_iso()}})
+    upd = {"assignee_id": payload.assignee_id, "updated_at": utc_iso()}
+    if existing.get("status") in (None, "open"):
+        upd["status"] = "assigned"  # never downgrade in_progress / won / lost / closed
+    await db.opportunities.update_one({"_id": oid(opp_id)}, {"$set": upd})
     doc = await db.opportunities.find_one({"_id": oid(opp_id)})
     await _enrich(db, doc)
     await log_activity(db, current, "Assigned opportunity", "Opportunity Hub",
@@ -312,7 +345,7 @@ async def assign_opp(opp_id: str, payload: OpportunityAssign,
     changed = payload.assignee_id != existing.get("assignee_id")
     if changed and payload.assignee_id != current.id:
         await notify(db, payload.assignee_id, "Opportunity assigned",
-                     f"{current.name} assigned you: {doc['title']}", kind="info", link="/opportunity-hub")
+                     f"{current.name} assigned you: {doc['title']}", kind="info", link=f"/opportunity-hub?opp={opp_id}")
     if changed:
         await notify_assignment_by_email(
             db=db,

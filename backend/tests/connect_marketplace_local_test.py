@@ -59,8 +59,17 @@ def test_dm_cannot_be_joined(api, users):
     assert call(api, users["employee2"], "GET", f"/connect/channels/{dm_id}/messages").status_code == 403
 
 
+def _legacy_channel(test_db, creator):
+    """A pre-existing public channel (created before channels became members-only)."""
+    return str(test_db.channels.insert_one({
+        "name": f"legacy-{_uid()}", "kind": "channel", "description": None, "members": [creator["id"]],
+        "created_by": creator["id"], "created_at": "2025-01-01T00:00:00+00:00",
+        "last_message_at": "2025-01-01T00:00:00+00:00",
+    }).inserted_id)
+
+
 def test_public_channel_join_is_allowed_and_logged(api, users, test_db):
-    ch = _channel(api, users["founder"], kind="channel")
+    ch = {"id": _legacy_channel(test_db, users["founder"])}
     r = call(api, users["intern"], "POST", f"/connect/channels/{ch['id']}/join")
     assert r.status_code == 200
     doc = test_db.channels.find_one({"_id": ObjectId(ch["id"])})
@@ -117,14 +126,102 @@ def test_add_members_permissions(api, users, test_db):
     assert call(api, users["intern"], "GET", f"/connect/channels/{group['id']}/messages").status_code == 200
 
 
-def test_add_members_only_for_groups(api, users):
-    ch = _channel(api, users["founder"], kind="channel")
-    r = call(api, users["founder"], "POST", f"/connect/channels/{ch['id']}/members",
-             json={"member_ids": [users["employee"]["id"]]})
-    assert r.status_code == 400
+def test_add_members_only_for_groups(api, users, test_db):
+    legacy = _legacy_channel(test_db, users["founder"])
+    ann = _channel(api, users["founder"], kind="announcement")
+    for cid in (legacy, ann["id"]):
+        r = call(api, users["founder"], "POST", f"/connect/channels/{cid}/members",
+                 json={"member_ids": [users["employee"]["id"]]})
+        assert r.status_code == 400
     r = call(api, users["founder"], "POST", f"/connect/channels/{ObjectId()}/members",
              json={"member_ids": [users["employee"]["id"]]})
     assert r.status_code == 404
+
+
+def test_new_channel_is_members_only(api, users):
+    ch = _channel(api, users["manager"], kind="channel", members=[users["employee"]["id"]])
+    assert ch["members_only"] is True and ch["admins"] == [users["manager"]["id"]] and ch["can_manage"] is True
+    outsider = users["intern"]
+    assert _listed(api, outsider, ch["id"]) is None
+    assert call(api, outsider, "GET", f"/connect/channels/{ch['id']}/messages").status_code == 403
+    assert call(api, outsider, "POST", f"/connect/channels/{ch['id']}/messages", json={"body": "hi"}).status_code == 403
+    assert call(api, outsider, "POST", f"/connect/channels/{ch['id']}/join").status_code == 403
+    assert call(api, outsider, "GET", f"/connect/channels/{ch['id']}/members").status_code == 403
+    # Founder is not an implicit reader of private conversations
+    assert call(api, users["founder"], "GET", f"/connect/channels/{ch['id']}/messages").status_code == 403
+    _post(api, users["employee"], ch["id"], "member can post")
+    assert _listed(api, users["employee"], ch["id"])["can_manage"] is False
+
+
+def test_legacy_public_channel_stays_open(api, users, test_db):
+    cid = _legacy_channel(test_db, users["founder"])
+    listed = _listed(api, users["intern"], cid)
+    assert listed is not None and listed["members_only"] is False
+    _post(api, users["intern"], cid, "still open")
+
+
+def test_create_channel_with_departments(api, users):
+    r = call(api, users["founder"], "GET", "/connect/departments")
+    assert r.status_code == 200
+    assert {"Tech", "Sales"} <= {d["name"] for d in r.json()}
+    assert call(api, users["employee"], "GET", "/connect/departments").status_code == 403
+    ch = _channel(api, users["founder"], kind="channel", departments=["tech"], members=[users["employee2"]["id"]])
+    assert set(ch["members"]) >= {users["founder"]["id"], users["manager"]["id"], users["employee"]["id"],
+                                  users["intern"]["id"], users["employee2"]["id"]}
+    assert ch["members"][0] == users["founder"]["id"]
+    r = call(api, users["founder"], "POST", "/connect/channels",
+             json={"name": "nobody", "kind": "channel", "departments": ["No Such Dept"]})
+    assert r.status_code == 422
+
+
+def test_add_department_and_list_members(api, users):
+    ch = _channel(api, users["manager"], kind="group")
+    r = call(api, users["manager"], "POST", f"/connect/channels/{ch['id']}/members", json={"departments": ["Sales"]})
+    assert r.status_code == 200, r.text
+    assert users["employee2"]["id"] in r.json()["members"]
+    r = call(api, users["employee2"], "GET", f"/connect/channels/{ch['id']}/members")
+    assert r.status_code == 200
+    members = r.json()
+    assert members[0]["id"] == users["manager"]["id"] and members[0]["is_admin"] and members[0]["is_creator"]
+    assert {m["id"] for m in members} == {users["manager"]["id"], users["employee2"]["id"]}
+
+
+def test_remove_and_leave_members(api, users, test_db):
+    mgr, emp, emp2 = users["manager"], users["employee"], users["employee2"]
+    ch = _channel(api, mgr, kind="channel", members=[emp["id"], emp2["id"]])
+    path = f"/connect/channels/{ch['id']}/members"
+    # plain members cannot remove others
+    assert call(api, emp, "DELETE", f"{path}/{emp2['id']}").status_code == 403
+    # admin removes a member -> they lose access and are notified
+    r = call(api, mgr, "DELETE", f"{path}/{emp2['id']}")
+    assert r.status_code == 200, r.text
+    assert emp2["id"] not in r.json()["members"]
+    assert call(api, emp2, "GET", f"/connect/channels/{ch['id']}/messages").status_code == 403
+    assert test_db.notifications.find_one({"user_id": emp2["id"], "title": "Removed from channel"})
+    assert call(api, mgr, "DELETE", f"{path}/{emp2['id']}").status_code == 404
+    # Admin can remove the creator; the remaining member is promoted so the channel keeps an admin
+    r = call(api, users["admin"], "DELETE", f"{path}/{mgr['id']}")
+    assert r.status_code == 200
+    assert r.json()["admins"] == [emp["id"]]
+    # a member can leave
+    assert call(api, emp, "DELETE", f"{path}/{emp['id']}").status_code == 200
+    assert call(api, emp, "GET", f"/connect/channels/{ch['id']}/messages").status_code == 403
+
+
+def test_department_group_membership_rules(api, users, test_db):
+    gid = str(test_db.channels.insert_one({
+        "name": "Tech Group", "kind": "group", "department": "Tech", "description": None,
+        "members": [users["manager"]["id"], users["employee"]["id"]], "created_by": "system",
+        "created_at": "2025-01-01T00:00:00+00:00", "last_message_at": "2025-01-01T00:00:00+00:00",
+    }).inserted_id)
+    path = f"/connect/channels/{gid}/members"
+    # scoped to the department: outsiders cannot read it
+    assert call(api, users["employee2"], "GET", f"/connect/channels/{gid}/messages").status_code == 403
+    # members (even Managers) cannot manage or leave it; Founder/Admin can
+    assert call(api, users["manager"], "POST", path, json={"member_ids": [users["employee2"]["id"]]}).status_code == 403
+    assert call(api, users["employee"], "DELETE", f"{path}/{users['employee']['id']}").status_code == 400
+    assert call(api, users["founder"], "POST", path, json={"member_ids": [users["employee2"]["id"]]}).status_code == 200
+    assert call(api, users["founder"], "DELETE", f"{path}/{users['employee2']['id']}").status_code == 200
 
 
 # ------------------------- Connect: unread -------------------------

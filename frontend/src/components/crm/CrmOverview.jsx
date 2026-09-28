@@ -1,6 +1,8 @@
-import { Users, Repeat, Wallet, CalendarClock } from "lucide-react";
+import { useEffect } from "react";
+import { Users, Repeat, Wallet, CalendarClock, Plus } from "lucide-react";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip } from "recharts";
 import { StatCard, EmptyState } from "@/components/module/ModulePrimitives";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AXIS_TICK, CHART_TOOLTIP, inr, relativeDays, useResource } from "./crmShared";
@@ -11,8 +13,9 @@ function monthLabel(key) {
   return new Date(y, m - 1, 1).toLocaleString("en-IN", { month: "short", year: "2-digit" });
 }
 
-export default function CrmOverview({ onOpenCustomer, onPickStage }) {
+export default function CrmOverview({ onOpenCustomer, onPickStage, onAddCustomer, refreshKey }) {
   const { data, error, loading, reload } = useResource("/crm/overview");
+  useEffect(() => { if (refreshKey) reload({ background: true }); }, [refreshKey, reload]);
 
   if (error) return <ErrorBlock title="Couldn't load the CRM overview" error={error} onRetry={reload} />;
   if (loading && !data) {
@@ -27,7 +30,13 @@ export default function CrmOverview({ onOpenCustomer, onPickStage }) {
   }
   const t = data.totals;
   if (t.customers === 0) {
-    return <EmptyState icon={Users} title="No customers yet" description="Customers added in Marketplace appear here with their full booking history." />;
+    return (
+      <EmptyState icon={Users} title="No customers yet"
+                  description="Add a customer here, or create them in Marketplace — they appear with their full booking history."
+                  action={onAddCustomer && (
+                    <Button size="sm" className="gap-1.5" onClick={onAddCustomer}><Plus className="h-4 w-4" /> Add customer</Button>
+                  )} />
+    );
   }
   const months = data.new_customers.map((m) => ({ ...m, label: monthLabel(m.month) }));
 

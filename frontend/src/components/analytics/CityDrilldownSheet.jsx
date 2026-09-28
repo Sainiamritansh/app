@@ -24,7 +24,7 @@ function Metric({ label, value, sub }) {
 const TH = "text-[11px] uppercase tracking-[0.1em]";
 
 export default function CityDrilldownSheet({ city, range, onOpenChange, canExport }) {
-  const params = { from: range.from, to: range.to };
+  const params = { days: range.days, from: range.from, to: range.to };
   const { data, loading, error, reload } = useAnalyticsData(
     city ? `/analytics/marketplace/cities/${encodeURIComponent(city)}` : null, params, !!city,
   );

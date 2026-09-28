@@ -36,10 +36,11 @@ export default function Marketing() {
     setDialog({ open: true, campaign: null });
   }, [meta]);
 
-  // ?create=campaign (Quick Create) opens the new-campaign dialog once.
+  // ?create=campaign (Quick Create) opens the new-campaign dialog once per request (re-armed once the param is gone).
   const handledCreate = useRef(false);
   useEffect(() => {
-    if (searchParams.get("create") !== "campaign" || handledCreate.current) return;
+    if (searchParams.get("create") !== "campaign") { handledCreate.current = false; return; }
+    if (handledCreate.current) return;
     handledCreate.current = true;
     setSearchParams((p) => { p.delete("create"); return p; }, { replace: true });
     if (canManage) setDialog({ open: true, campaign: null });

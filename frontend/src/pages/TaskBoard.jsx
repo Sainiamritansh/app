@@ -353,9 +353,11 @@ useEffect(() => {
       setEditMode(false);
       setLinkInput(data.link || "");
       setDetailOpen(true);
-
-      // Remove task_id from the URL after opening.
-      // This prevents the dialog from reopening unnecessarily.
+    } catch (error) {
+      console.error("Failed to open notification task:", error);
+      toast.error(formatApiError(error) || "Could not open this task.");
+    } finally {
+      // Remove task_id from the URL (also on failure) so it is not retried on every URL change.
       setSearchParams(
         (params) => {
           params.delete("task_id");
@@ -363,9 +365,6 @@ useEffect(() => {
         },
         { replace: true }
       );
-    } catch (error) {
-      console.error("Failed to open notification task:", error);
-      toast.error("Could not open this task.");
     }
   }
 
@@ -985,7 +984,7 @@ useEffect(() => {
                 <div className="grid grid-cols-2 gap-4">
                   <div>
                     <div className="text-[11px] uppercase tracking-[0.12em] text-muted-foreground">Status</div>
-                    <Select value={activeTask.status} onValueChange={(v) => setStatus(activeTask.id, v).then(() => openDetail({ ...activeTask, status: v }))} disabled={actionLoadingId === `status-${activeTask.id}`}>
+                    <Select value={activeTask.status} onValueChange={(v) => setStatus(activeTask.id, v).then(() => refreshActive(activeTask.id)).catch(() => {})} disabled={actionLoadingId === `status-${activeTask.id}`}>
                       <SelectTrigger className="mt-1.5"><SelectValue /></SelectTrigger>
                       <SelectContent>{STATUS_ORDER.map(s => <SelectItem key={s} value={s}>{STATUS_LABEL[s]}</SelectItem>)}</SelectContent>
                     </Select>

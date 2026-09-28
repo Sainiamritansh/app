@@ -24,7 +24,7 @@ from models_part2 import (
 from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
 from permissions import can
 from email_utils import send_invitation_email, send_password_reset_email, email_configured
-from dept_groups import sync_employee_department_group, add_member_to_department_channel, get_or_create_department_channel
+from dept_groups import sync_employee_department_group, add_member_to_department_channel, get_or_create_department_channel, rename_department_channel
 
 router = APIRouter(prefix="/employees", tags=["employees"])
 
@@ -111,7 +111,7 @@ async def _dept_ids(db, department):
     return [
         str(u["_id"])
         async for u in db.users.find(
-            {"department": department},
+            {"department": _dept_match(department)},
             {"_id": 1},
         )
     ]
@@ -369,7 +369,7 @@ async def list_invitations(
     q = {}
     if current.role == "Manager":
         # Managers see their department's invitations, without the secret tokens.
-        q["department"] = current.department or {"$in": []}
+        q["department"] = _dept_match(current.department)
 
     docs = await db.invitations.find(q).sort(
         "created_at",
@@ -665,6 +665,12 @@ async def reset_employee_password(employee_id: str,
             }
         },
     )
+    # Sign the teammate out everywhere, like the self-service reset: old sessions must not outlive the password
+    if str(target["_id"]) != current.id:
+        await db.sessions.update_many(
+            {"user_id": str(target["_id"]), "revoked": {"$ne": True}},
+            {"$set": {"revoked": True, "revoked_at": utc_iso()}},
+        )
     await log_activity(db, current, "Reset password", "Employees", target=target["name"])
     await notify(db, str(target["_id"]), "Your password was reset",
                  f"{current.name} reset your password. Please sign in with the new password and update it if allowed.",
@@ -772,12 +778,10 @@ async def toggle_employee_status(
     )
 
     if not is_active:
-        await db.sessions.delete_many(
-            {
-                "user_id": str(
-                    target["_id"]
-                )
-            }
+        # Revoke (not delete) so access tokens naming these sessions stay dead after a later reactivation
+        await db.sessions.update_many(
+            {"user_id": str(target["_id"]), "revoked": {"$ne": True}},
+            {"$set": {"revoked": True, "revoked_at": utc_iso()}},
         )
 
     action_verb = (
@@ -1101,7 +1105,9 @@ async def update_department(
     await db.departments.update_one({"_id": dept["_id"]}, {"$set": changes})
     if "name" in changes and changes["name"] != dept["name"]:
         await db.users.update_many({"department": _dept_match(dept["name"])}, {"$set": {"department": changes["name"]}})
-        await get_or_create_department_channel(db, changes["name"])
+        # Rename the department's Connect group (members and history stay) instead of starting an empty one
+        await rename_department_channel(db, dept["name"], changes["name"],
+                                        member_ids=await _dept_ids(db, changes["name"]))
     await log_activity(db, current, "Updated department", "Employees", target=changes.get("name", dept["name"]),
                        meta={"fields": sorted(k for k in changes if k != "updated_at")})
     return serialize(await db.departments.find_one({"_id": dept["_id"]}))
@@ -1294,7 +1300,7 @@ async def _leave_approvers(db, employee: dict) -> list[str]:
     """Founder/Admin plus Managers of the employee's own department (never the employee)."""
     scopes = [{"role": {"$in": ["Founder", "Admin"]}}]
     if employee.get("department"):
-        scopes.append({"role": "Manager", "department": employee["department"]})
+        scopes.append({"role": "Manager", "department": _dept_match(employee["department"])})
     docs = await db.users.find(
         {**REAL_USERS, "$or": scopes, "status": {"$ne": "deactivated"}, "_id": {"$ne": employee["_id"]}},
         {"_id": 1},

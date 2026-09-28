@@ -8,7 +8,7 @@ import { inr } from "./crmShared";
 import { ErrorBlock, RowSkeletons } from "./StateBlocks";
 import { describeFilters } from "./SegmentDialog";
 
-export default function SegmentsPanel({ segments, error, reload, canEdit, onCreate, onEdit, onView }) {
+export default function SegmentsPanel({ segments, error, reload, canEdit, onCreate, onEdit, onView, onDeleted }) {
   const [busy, setBusy] = useState(null);
 
   async function remove(s) {
@@ -17,6 +17,7 @@ export default function SegmentsPanel({ segments, error, reload, canEdit, onCrea
     try {
       await api.delete(`/crm/segments/${s.id}`);
       toast.success("Segment deleted");
+      onDeleted?.(s);
       reload();
     } catch (e) {
       toast.error(formatApiError(e));

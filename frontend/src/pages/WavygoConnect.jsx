@@ -11,7 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, UserPlus } from "lucide-react";
+import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, UserPlus, UserMinus, LogOut, Crown } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -76,6 +76,27 @@ function MemberPicker({ users, selected, onChange, exclude = NO_IDS }) {
   );
 }
 
+/* Checkbox list of departments (from /connect/departments); picking one adds all its current members. */
+function DepartmentPicker({ departments, selected, onChange }) {
+  if (departments.length === 0) return null;
+  const toggle = (name) => onChange(selected.includes(name) ? selected.filter(x => x !== name) : [...selected, name]);
+  return (
+    <div>
+      <Label>Whole departments{selected.length > 0 && <span className="text-muted-foreground font-normal"> · {selected.length} selected</span>}</Label>
+      <div className="mt-1 max-h-[140px] overflow-y-auto scrollbar-thin rounded-md border border-border divide-y divide-border" data-testid="connect-department-picker">
+        {departments.map(d => (
+          <label key={d.name} className="flex items-center gap-3 px-3 py-2 hover:bg-muted/70 cursor-pointer">
+            <Checkbox checked={selected.includes(d.name)} onCheckedChange={() => toggle(d.name)} />
+            <Building2 className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="flex-1 text-[13px] font-medium truncate">{d.name}</span>
+            <span className="text-[11px] text-muted-foreground">{d.member_count} {d.member_count === 1 ? "person" : "people"}</span>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function WavygoConnect() {
   const { user } = useAuth();
   const { can } = usePermission();
@@ -90,9 +111,13 @@ export default function WavygoConnect() {
   const [createOpen, setCreateOpen] = useState(false);
   const [dmOpen, setDmOpen] = useState(false);
   const [dmSearch, setDmSearch] = useState("");
-  const [form, setForm] = useState({ name: "", kind: "channel", description: "", members: [] });
+  const [form, setForm] = useState({ name: "", kind: "channel", description: "", members: [], departments: [] });
+  const [departments, setDepartments] = useState([]);
   const [addOpen, setAddOpen] = useState(false);
   const [addSel, setAddSel] = useState([]);
+  const [addDepts, setAddDepts] = useState([]);
+  const [membersOpen, setMembersOpen] = useState(false);
+  const [members, setMembers] = useState([]);
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);   // a create / add-members request is in flight
   const sendingRef = useRef(false);          // blocks double sends (Enter pressed twice)
@@ -122,7 +147,8 @@ export default function WavygoConnect() {
       // the open channel is marked read as messages arrive, so never badge it
       setChannels(data.map(c => (c.id === openId ? { ...c, unread: 0 } : c)));
       if (selectId) selectChannel(selectId);
-      else setActiveId(prev => prev || data[0]?.id || null);
+      // keep the open channel only while it is still visible (e.g. not after being removed from it)
+      else setActiveId(prev => (prev && data.some(c => c.id === prev) ? prev : data[0]?.id || null));
     } catch (e) { if (!silent) toast.error(formatApiError(e)); }
   }
 
@@ -148,8 +174,26 @@ export default function WavygoConnect() {
     }
   }, [dmOpen]);
 
+  async function loadDepartments() {
+    if (!canCreateChannel) return;
+    try {
+      const { data } = await api.get("/connect/departments");
+      setDepartments(data || []);
+    } catch { /* department picking is optional; individual members still work */ }
+  }
+
+  async function loadMembers(id) {
+    try {
+      const { data } = await api.get(`/connect/channels/${id}/members`);
+      if (id === activeIdRef.current) setMembers(data || []);
+    } catch (e) { toast.error(formatApiError(e)); }
+  }
+
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { if (createOpen || addOpen) loadUsers(); }, [createOpen, addOpen]);
+  useEffect(() => { if (createOpen || addOpen) { loadUsers(); loadDepartments(); } }, [createOpen, addOpen]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { setMembers([]); if (membersOpen && activeId) loadMembers(activeId); }, [membersOpen, activeId]);
 
   function markRead(id) {
     api.post(`/connect/channels/${id}/read`).catch(() => { /* retried on the next change */ });
@@ -196,22 +240,46 @@ export default function WavygoConnect() {
     if (!form.name.trim() || busy) return;
     setBusy(true);
     try {
-      const members = form.kind === "group" ? form.members : [];
-      const { data } = await api.post("/connect/channels", { name: form.name.trim(), kind: form.kind, description: form.description.trim(), members });
+      const pick = form.kind !== "announcement";
+      const { data } = await api.post("/connect/channels", {
+        name: form.name.trim(), kind: form.kind, description: form.description.trim(),
+        members: pick ? form.members : [], departments: pick ? form.departments : [],
+      });
       toast.success(`${KIND_LABEL[form.kind] || "Channel"} created`);
-      setCreateOpen(false); setForm({ name: "", kind: "channel", description: "", members: [] });
+      setCreateOpen(false); setForm({ name: "", kind: "channel", description: "", members: [], departments: [] });
       loadChannels(data.id);
     } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
   }
 
   async function addMembers() {
-    if (!activeId || addSel.length === 0 || busy) return;
+    if (!activeId || (addSel.length === 0 && addDepts.length === 0) || busy) return;
     setBusy(true);
     try {
-      await api.post(`/connect/channels/${activeId}/members`, { member_ids: addSel });
-      toast.success(`${addSel.length} member${addSel.length > 1 ? "s" : ""} added`);
-      setAddOpen(false); setAddSel([]);
+      const before = active?.members?.length || 0;
+      const { data } = await api.post(`/connect/channels/${activeId}/members`, { member_ids: addSel, departments: addDepts });
+      const n = (data.members?.length || 0) - before;
+      toast.success(n > 0 ? `${n} member${n > 1 ? "s" : ""} added` : "Everyone selected is already a member");
+      setAddOpen(false); setAddSel([]); setAddDepts([]);
       loadChannels();
+      if (membersOpen) loadMembers(activeId);
+    } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
+  }
+
+  async function removeMember(member) {
+    if (!activeId || busy) return;
+    const leaving = member.id === user?.id;
+    if (!window.confirm(leaving ? `Leave ${active?.name}?` : `Remove ${member.name} from ${active?.name}?`)) return;
+    setBusy(true);
+    try {
+      await api.delete(`/connect/channels/${activeId}/members/${member.id}`);
+      if (leaving) {
+        toast.success(`You left ${active?.name}`);
+        setMembersOpen(false); setActiveId(null);
+        loadChannels();
+      } else {
+        toast.success(`${member.name} removed`);
+        loadMembers(activeId); loadChannels();
+      }
     } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
   }
 
@@ -235,8 +303,11 @@ export default function WavygoConnect() {
   }
 
   const active = channels.find(c => c.id === activeId);
-  const canAddMembers = active?.kind === "group" &&
-    (active.created_by === user?.id || user?.role === "Founder" || user?.role === "Admin");
+  const canAddMembers = Boolean(active?.can_manage);
+  const isPrivate = Boolean(active?.members_only) && active?.kind !== "dm" && active?.kind !== "announcement";
+  const isOrgAdmin = user?.role === "Founder" || user?.role === "Admin";
+  const canLeave = isPrivate && (!active?.department || isOrgAdmin);
+  const canRemove = (m) => canAddMembers && m.id !== user?.id && (!m.is_creator || isOrgAdmin);
 
   const grouped = useMemo(() => {
     const g = { announcement: [], channel: [], group: [], dm: [] };
@@ -431,13 +502,18 @@ export default function WavygoConnect() {
                     <div className="flex-1">
                       <div className="font-display text-[15px] font-semibold flex items-center gap-2">
                         {active.name}
-                        {active.kind === "group" && <Badge variant="secondary" className="text-[10px]"><Lock className="h-2.5 w-2.5 mr-1" />Private</Badge>}
+                        {isPrivate && <Badge variant="secondary" className="text-[10px]"><Lock className="h-2.5 w-2.5 mr-1" />{active.department ? "Department" : "Private"}</Badge>}
                         {active.kind === "announcement" && <Badge className="bg-info/10 text-info hover:bg-info/10 text-[10px]">Announcement</Badge>}
                       </div>
                       {active.description && <div className="text-[11.5px] text-muted-foreground">{active.description}</div>}
                     </div>
+                    {isPrivate && (
+                      <Button variant="ghost" size="sm" onClick={() => setMembersOpen(true)} data-testid="connect-members-btn">
+                        <Users2 className="h-4 w-4 mr-1.5" /> {active.member_count ?? active.members?.length ?? 0}
+                      </Button>
+                    )}
                     {canAddMembers && (
-                      <Button variant="outline" size="sm" onClick={() => { setAddSel([]); setAddOpen(true); }} data-testid="connect-add-members-btn">
+                      <Button variant="outline" size="sm" onClick={() => { setAddSel([]); setAddDepts([]); setAddOpen(true); }} data-testid="connect-add-members-btn">
                         <UserPlus className="h-4 w-4 mr-1.5" /> Add members
                       </Button>
                     )}
@@ -482,7 +558,7 @@ export default function WavygoConnect() {
       {/* New channel dialog */}
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle className="font-display">New channel</DialogTitle><DialogDescription>Channels are visible to everyone. Groups are private.</DialogDescription></DialogHeader>
+          <DialogHeader><DialogTitle className="font-display">New channel</DialogTitle><DialogDescription>Only the people and departments you add can see, read and post in channels and groups. Announcements reach everyone.</DialogDescription></DialogHeader>
           <div className="space-y-3">
             <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm(s => ({ ...s, name: e.target.value }))} placeholder="e.g. patna-ops" /></div>
             <div>
@@ -490,15 +566,19 @@ export default function WavygoConnect() {
               <Select value={form.kind} onValueChange={(v) => setForm(s => ({ ...s, kind: v }))}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="channel">Channel — public</SelectItem>
-                  <SelectItem value="group">Group — private</SelectItem>
+                  <SelectItem value="channel">Channel — members only</SelectItem>
+                  <SelectItem value="group">Group — members only</SelectItem>
                   {canCreateAnnouncement && <SelectItem value="announcement">Announcement — broadcast</SelectItem>}
                 </SelectContent>
               </Select>
             </div>
             <div><Label>Description</Label><Textarea rows={2} value={form.description} onChange={(e) => setForm(s => ({ ...s, description: e.target.value }))} /></div>
-            {form.kind === "group" && (
-              <MemberPicker users={users} selected={form.members} onChange={(members) => setForm(s => ({ ...s, members }))} />
+            {form.kind !== "announcement" && (
+              <>
+                <DepartmentPicker departments={departments} selected={form.departments} onChange={(departments) => setForm(s => ({ ...s, departments }))} />
+                <MemberPicker users={users} selected={form.members} onChange={(members) => setForm(s => ({ ...s, members }))} />
+                <p className="text-[11.5px] text-muted-foreground">You are added as the admin. Departments add everyone currently in them.</p>
+              </>
             )}
           </div>
           <DialogFooter><Button variant="outline" onClick={() => setCreateOpen(false)}>Cancel</Button><Button onClick={createChannel} disabled={!form.name.trim() || busy} data-testid="connect-create-submit">Create</Button></DialogFooter>
@@ -512,10 +592,63 @@ export default function WavygoConnect() {
             <DialogTitle className="font-display">Add members</DialogTitle>
             <DialogDescription>{active ? `Add people to ${active.name}.` : ""}</DialogDescription>
           </DialogHeader>
-          <MemberPicker users={users} selected={addSel} onChange={setAddSel} exclude={active?.members || NO_IDS} />
+          <div className="space-y-3">
+            <DepartmentPicker departments={departments} selected={addDepts} onChange={setAddDepts} />
+            <MemberPicker users={users} selected={addSel} onChange={setAddSel} exclude={active?.members || NO_IDS} />
+          </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button>
-            <Button onClick={addMembers} disabled={addSel.length === 0 || busy} data-testid="connect-add-members-submit">Add</Button>
+            <Button onClick={addMembers} disabled={(addSel.length === 0 && addDepts.length === 0) || busy} data-testid="connect-add-members-submit">Add</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Channel members dialog */}
+      <Dialog open={membersOpen} onOpenChange={setMembersOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="font-display">Members</DialogTitle>
+            <DialogDescription>
+              {active ? `${members.length || active.member_count || 0} people can see and post in ${active.name}.` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <ul className="max-h-[360px] overflow-y-auto scrollbar-thin divide-y divide-border rounded-md border border-border" data-testid="connect-members-list">
+            {members.map(m => (
+              <li key={m.id} className="flex items-center gap-3 px-3 py-2">
+                <Avatar className="h-8 w-8">
+                  <AvatarImage src={m.photo || undefined} />
+                  <AvatarFallback className="text-[10px] bg-wavygo-100 text-wavygo-800">{initials(m.name)}</AvatarFallback>
+                </Avatar>
+                <div className="flex-1 min-w-0">
+                  <div className="text-[13px] font-medium truncate flex items-center gap-1.5">
+                    {m.name}{m.id === user?.id && <span className="text-muted-foreground font-normal">(you)</span>}
+                    {m.is_admin && (
+                      <Badge variant="secondary" className="text-[9.5px] px-1.5 py-0 h-4 font-normal"><Crown className="h-2.5 w-2.5 mr-1" />Admin</Badge>
+                    )}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground truncate">{m.designation || m.role}{m.department ? ` · ${m.department}` : ""}</div>
+                </div>
+                {canRemove(m) && (
+                  <Button variant="ghost" size="sm" className="h-7 px-2 text-muted-foreground hover:text-destructive" disabled={busy}
+                          onClick={() => removeMember(m)} aria-label={`Remove ${m.name}`} data-testid="connect-remove-member-btn">
+                    <UserMinus className="h-4 w-4" />
+                  </Button>
+                )}
+              </li>
+            ))}
+          </ul>
+          <DialogFooter className="sm:justify-between gap-2">
+            {canLeave ? (
+              <Button variant="outline" className="text-destructive" disabled={busy}
+                      onClick={() => removeMember({ id: user?.id, name: user?.name })} data-testid="connect-leave-btn">
+                <LogOut className="h-4 w-4 mr-1.5" /> Leave
+              </Button>
+            ) : <span />}
+            {canAddMembers && (
+              <Button onClick={() => { setMembersOpen(false); setAddSel([]); setAddDepts([]); setAddOpen(true); }}>
+                <UserPlus className="h-4 w-4 mr-1.5" /> Add members
+              </Button>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

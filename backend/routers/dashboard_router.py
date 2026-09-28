@@ -28,6 +28,7 @@ from routers.calendar_router import _visibility_filter, _as_utc
 from routers.notifications_router import _serialize as _serialize_notification
 from routers.tasks_router import _task_filter_for
 from routers.opportunities_router import _scope_filter as _opportunity_scope
+from routers.employees_router import _dept_ids
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -147,15 +148,24 @@ async def _due_tasks(docs: list[dict], today: date, name_for) -> tuple[list[dict
 
 
 async def _upcoming_events(db, current: UserPublic, now: datetime, today: date) -> list[dict]:
-    """Next 5 non-cancelled calendar events the caller is allowed to see."""
-    q = {"start_time": {"$gte": now}, "status": {"$ne": "cancelled"}}
+    """Next 5 non-cancelled calendar events the caller is allowed to see, including ones in progress."""
+    q = {"$or": [{"end_time": {"$gt": now}}, {"start_time": {"$gte": now}}], "status": {"$ne": "cancelled"}}
     visibility = _visibility_filter(current)
     if visibility:
         q = {"$and": [q, visibility]}
     docs = await db.calendar_events.find(q).sort([("start_time", 1), ("_id", 1)]).to_list(5)
+
+    def when(e: dict) -> str:
+        if _as_utc(e["start_time"]) < now:
+            # Already started (possibly on an earlier day): label by what is happening now
+            if e.get("all_day", False):
+                return "Today, All day"
+            return f"Now, until {_format_when(e['end_time'], False, today)}"
+        return _format_when(e["start_time"], e.get("all_day", False), today)
+
     return [{
         "id": str(e["_id"]), "title": e["title"],
-        "when": _format_when(e["start_time"], e.get("all_day", False), today),
+        "when": when(e),
         "start_time": _as_utc(e["start_time"]).isoformat(),
         "category": e.get("category"), "link": f"/calendar?event={e['_id']}",
     } for e in docs]
@@ -203,8 +213,10 @@ async def _personal_stats(db, current: UserPublic):
 
     opportunities = []
     if current.role == "Employee":
-        opp_docs = await db.opportunities.find({"assignee_id": uid}).sort("deadline", 1).to_list(10)
+        opp_docs = await db.opportunities.find(
+            {"assignee_id": uid, "status": {"$nin": CLOSED_OPPORTUNITY_STATUSES}}).sort("deadline", 1).to_list(10)
         opportunities = [_opportunity_card(o) for o in opp_docs[:3]]
+    pipeline_count, pipeline_lakhs = await _open_pipeline(db, {"assignee_id": uid}) if current.role == "Employee" else (0, 0)
 
     return {
         "kpis": kpis,
@@ -216,6 +228,7 @@ async def _personal_stats(db, current: UserPublic):
         "tasks_due_count": tasks_due_count,
         "upcoming_events": await _upcoming_events(db, current, now, today),
         "opportunities": opportunities,
+        "pipeline": {"count": pipeline_count, "value_lakhs": round(pipeline_lakhs, 2)},
         "recent_notifications": await _recent_notifications(db, current),
         "company_health": None,
         "system_status": None,
@@ -343,13 +356,19 @@ def _scoped(query: dict, scope: dict | None) -> dict:
     return {"$and": [query, scope]} if scope else query
 
 
-async def _team_kpis(db, open_tasks: int, overdue: int, opp_scope: dict | None = None) -> list[dict]:
-    """KPIs for roles without Marketplace access — work, pipeline and people."""
+async def _open_pipeline(db, opp_scope: dict | None = None) -> tuple[int, float]:
+    """(count, total value in lakhs) of every open opportunity in the caller's scope."""
     open_opps = _scoped({"status": {"$nin": CLOSED_OPPORTUNITY_STATUSES}}, opp_scope)
     pipe = [{"$match": open_opps}, {"$group": {"_id": None, "n": {"$sum": 1}, "value": {"$sum": {"$ifNull": ["$value_lakhs", 0]}}}}]
     r = await db.opportunities.aggregate(pipe).to_list(1)
-    opp_count, pipeline_lakhs = (r[0]["n"], r[0]["value"]) if r else (0, 0)
-    pending_leave = await db.leave_requests.count_documents({"status": "pending"})
+    return (r[0]["n"], r[0]["value"]) if r else (0, 0)
+
+
+async def _team_kpis(db, open_tasks: int, overdue: int, opp_scope: dict | None = None,
+                     leave_q: dict | None = None) -> list[dict]:
+    """KPIs for roles without Marketplace access — work, pipeline and people."""
+    opp_count, pipeline_lakhs = await _open_pipeline(db, opp_scope)
+    pending_leave = await db.leave_requests.count_documents(leave_q or {"status": "pending"})
     return [
         {"key": "open_tasks",         "label": "Open Tasks",         "value": open_tasks,             "delta": None, "compare": None, "format": "number"},
         {"key": "overdue_tasks",      "label": "Overdue Tasks",      "value": overdue,                "delta": None, "compare": None, "format": "number"},
@@ -369,7 +388,7 @@ def _signal(label: str, good: int, total: int) -> dict | None:
     return {"label": label, "value": value, "status": status}
 
 
-async def _company_health(db, open_tasks: int, overdue: int, marketplace: bool) -> dict:
+async def _company_health(db, open_tasks: int, overdue: int, marketplace: bool, leave_q: dict | None = None) -> dict:
     # Each signal is a percentage of real records in a good state; a signal with no
     # records is omitted, and the score is the mean of the signals present:
     #   Operations = open tasks not overdue / open tasks
@@ -377,7 +396,7 @@ async def _company_health(db, open_tasks: int, overdue: int, marketplace: bool) 
     #   Compliance = customers + vendors KYC-approved / customers + vendors     (marketplace)
     #   Support    = tickets resolved or closed / all tickets                    (marketplace)
     signals = [_signal("Operations", open_tasks - overdue, open_tasks)]
-    pending_leave = await db.leave_requests.count_documents({"status": "pending"})
+    pending_leave = await db.leave_requests.count_documents(leave_q or {"status": "pending"})
     flags = {"kyc_pending": None, "open_tickets": None, "pending_leave": pending_leave}
     if marketplace:
         fleet = await db.vehicles.count_documents({"status": {"$ne": "retired"}})
@@ -462,19 +481,24 @@ async def stats(current: UserPublic = Depends(get_current_user)):
     overdue = sum(1 for t in open_task_docs if (d := _parse_due(t.get("due_date"))) and d < today)
 
     opp_docs = await db.opportunities.find(_scoped({"status": {"$nin": CLOSED_OPPORTUNITY_STATUSES}}, opp_scope)).sort("deadline", 1).to_list(3)
+    # Pending leave follows the Employees module: a Manager counts their department only.
+    leave_q = {"status": "pending"}
+    if current.role == "Manager":
+        leave_q["employee_id"] = {"$in": await _dept_ids(db, current.department)}
 
     out = {
         "tasks_today": tasks_today,
         "tasks_due_count": tasks_due_count,
         "upcoming_events": await _upcoming_events(db, current, now, today),
         "opportunities": [_opportunity_card(o) for o in opp_docs],
+        "pipeline": dict(zip(("count", "value_lakhs"), await _open_pipeline(db, opp_scope))),
         "recent_notifications": await _recent_notifications(db, current),
-        "company_health": await _company_health(db, open_tasks, overdue, marketplace),
+        "company_health": await _company_health(db, open_tasks, overdue, marketplace, leave_q),
     }
     if marketplace:
         out = {**await _marketplace_section(db, w), **out}
     else:
-        out = {"kpis": await _team_kpis(db, open_tasks, overdue, opp_scope), **out}
+        out = {"kpis": await _team_kpis(db, open_tasks, overdue, opp_scope, leave_q), **out}
     out["system_status"] = await _system_status(db, started)
     return out
 

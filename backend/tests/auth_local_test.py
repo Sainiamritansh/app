@@ -205,6 +205,19 @@ def test_change_password_revokes_other_sessions(api, users, test_db):
     assert _login(api, u, password="Changed@2026").status_code == 200
 
 
+def test_logout_revokes_access_token_session_after_rotation(api, users, test_db):
+    # The client refreshed (rotating its refresh token) and then logs out sending the stale one:
+    # the session named by the access token is still revoked.
+    u = _new_user(test_db)
+    a = _login(api, u).json()
+    rotated = call(api, None, "POST", "/auth/refresh", json={"refresh_token": a["refresh_token"]}).json()
+    r = call(api, None, "POST", "/auth/logout", **_bearer(rotated["access_token"]),
+             json={"refresh_token": a["refresh_token"]})
+    assert r.status_code == 200, r.text
+    assert call(api, None, "POST", "/auth/refresh", json={"refresh_token": rotated["refresh_token"]}).status_code == 401
+    assert call(api, None, "GET", "/auth/me", **_bearer(rotated["access_token"])).status_code == 401
+
+
 def test_change_password_rejects_over_72_bytes(api, users, test_db):
     u = _new_user(test_db, role="Manager")
     a = _login(api, u).json()

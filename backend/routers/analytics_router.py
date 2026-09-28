@@ -7,8 +7,10 @@ Empty data yields zeros / empty lists, never illustrative values.
 
 Conventions
 - Ranges are company-local (Asia/Kolkata) calendar days: `from` and `to` are
-  inclusive YYYY-MM-DD dates (default: the last 30 days). The comparison period is
-  the equally long window immediately before `from`.
+  inclusive YYYY-MM-DD dates (default: the last 30 days). Alternatively `days`
+  (1, 3, 7, 30 or 90) selects a rolling window ending today and overrides from/to.
+  The comparison period is the equally long window immediately before `from`.
+- Time series are hourly for a 1-day range, daily up to ~3 months, then weekly/monthly.
 - Revenue counts confirmed, active and completed bookings; a booking belongs to the
   period its `created_at` falls in. Timestamps may be ISO strings or BSON dates.
 - Utilisation = booked vehicle-days / available vehicle-days in the range. A vehicle is
@@ -51,6 +53,8 @@ OPEN_OPP_STATUSES = ["open", "assigned", "in_progress"]
 OPP_STAGES = ["open", "assigned", "in_progress", "won", "lost", "closed"]
 ATTENDED = {"present": 1.0, "wfh": 1.0, "half_day": 0.5}
 MAX_RANGE_DAYS = 3 * 366
+ALLOWED_DAYS = (1, 3, 7, 30, 90)
+DEFAULT_DAYS = 30
 COHORT_OFFSETS = 11
 MAX_COHORTS = 12
 DAY_MS = 86_400_000
@@ -88,6 +92,14 @@ class Range:
 
 def _today() -> date:
     return datetime.now(IST).date()
+
+
+def days_range(days: int) -> Range:
+    """Rolling window of `days` IST calendar days ending today (inclusive)."""
+    if days not in ALLOWED_DAYS:
+        raise ValueError(f"days must be one of {', '.join(map(str, ALLOWED_DAYS))}")
+    d_to = _today()
+    return Range(d_to - timedelta(days=days - 1), d_to)
 
 
 def parse_range(from_: str | None, to: str | None) -> Range:
@@ -139,6 +151,13 @@ def _day_key(field: str = "$_ts") -> dict:
     return {"$dateToString": {"date": field, "format": "%Y-%m-%d", "timezone": TZ}}
 
 
+def _bucket_key(g: str, field: str = "$_ts") -> dict:
+    """Group key for a series: IST hour (YYYY-MM-DDTHH) for hourly buckets, else IST day."""
+    if g == "hour":
+        return {"$dateToString": {"date": field, "format": "%Y-%m-%dT%H", "timezone": TZ}}
+    return _day_key(field)
+
+
 def _delta(cur: float, prev: float):
     if not prev:
         return None
@@ -159,12 +178,15 @@ async def _agg(db, coll: str, pipeline: list, n: int | None = None) -> list:
 
 # ------------------------- bucketing -------------------------
 
-def granularity_for(r: Range, requested: str | None = None, minimum: str = "day") -> str:
-    order = ["day", "week", "month"]
+def granularity_for(r: Range, requested: str | None = None, minimum: str = "hour") -> str:
+    """Hourly for a single day, daily up to ~3 months, then weekly / monthly."""
+    order = ["hour", "day", "week", "month"]
     if requested in order:
         g = requested
     else:
-        g = "day" if r.days <= 45 else "week" if r.days <= 190 else "month"
+        g = "hour" if r.days == 1 else "day" if r.days <= 92 else "week" if r.days <= 190 else "month"
+    if g == "hour" and r.days > 3:
+        g = "day"  # keep hourly series bounded (≤ 72 points)
     return order[max(order.index(g), order.index(minimum))]
 
 
@@ -191,6 +213,15 @@ def _label(d: date, g: str) -> str:
 
 
 def buckets(r: Range, g: str) -> list[dict]:
+    if g == "hour":
+        out = []
+        for i in range(r.days):
+            d = r.d_from + timedelta(days=i)
+            for h in range(24):
+                key = f"{d.isoformat()}T{h:02d}"
+                label = f"{h:02d}:00" if r.days == 1 else f"{d.day} {d.strftime('%b')} {h:02d}:00"
+                out.append({"key": key, "label": label, "start": f"{key}:00"})
+        return out
     out, cur = [], _bucket_start(r.d_from, g)
     while cur <= r.d_to:
         out.append({"key": cur.isoformat(), "label": _label(cur, g), "start": max(cur, r.d_from).isoformat()})
@@ -199,7 +230,7 @@ def buckets(r: Range, g: str) -> list[dict]:
 
 
 def fold_days(r: Range, g: str, daily: dict[str, dict], fields: list[str]) -> list[dict]:
-    """Fold {YYYY-MM-DD: {field: n}} into zero-filled buckets."""
+    """Fold {YYYY-MM-DD: {field: n}} (or {YYYY-MM-DDTHH: ...} when hourly) into zero-filled buckets."""
     series = buckets(r, g)
     index = {b["key"]: b for b in series}
     for b in series:
@@ -207,7 +238,7 @@ def fold_days(r: Range, g: str, daily: dict[str, dict], fields: list[str]) -> li
             b[f] = 0
     for day, vals in daily.items():
         try:
-            key = _bucket_start(date.fromisoformat(day), g).isoformat()
+            key = day if g == "hour" else _bucket_start(date.fromisoformat(day), g).isoformat()
         except (TypeError, ValueError):
             continue
         b = index.get(key)
@@ -386,7 +417,7 @@ async def market_summary(db, r: Range, city: str | None) -> dict:
 async def market_trend(db, r: Range, city: str | None, granularity: str | None = None) -> dict:
     g = granularity_for(r, granularity)
     rows = await _agg(db, "bookings", _created_in("created_at", r.d_from, r.d_to, _city_filter(city)) + [
-        {"$group": {"_id": _day_key(), "bookings": {"$sum": 1},
+        {"$group": {"_id": _bucket_key(g), "bookings": {"$sum": 1},
                     "paid": {"$sum": {"$cond": [{"$in": ["$status", REVENUE_STATUSES]}, 1, 0]}},
                     "revenue": {"$sum": {"$cond": [{"$in": ["$status", REVENUE_STATUSES]}, AMOUNT, 0]}},
                     "cancelled": {"$sum": {"$cond": [{"$eq": ["$status", "cancelled"]}, 1, 0]}}}},
@@ -598,16 +629,16 @@ def _scope_match(scope: OpsScope, field: str = "assignee_id") -> dict:
 
 
 async def ops_tasks(db, r: Range, scope: OpsScope) -> dict:
-    g = granularity_for(r, None, minimum="week")
+    g = granularity_for(r)
     created = await _agg(db, "tasks", _created_in("created_at", r.d_from, r.d_to, _scope_match(scope)) + [
-        {"$group": {"_id": _day_key(), "created": {"$sum": 1}}},
+        {"$group": {"_id": _bucket_key(g), "created": {"$sum": 1}}},
     ])
     done_pipe = [
         {"$match": {"status": "completed", **_scope_match(scope)}},
         {"$addFields": {"_ts": {"$ifNull": [_ts("completed_at"), _ts("updated_at")]}, "_c": _ts("created_at")}},
         {"$match": {"_ts": {"$gte": r.start, "$lt": r.end}}},
         {"$facet": {
-            "daily": [{"$group": {"_id": _day_key(), "completed": {"$sum": 1}}}],
+            "daily": [{"$group": {"_id": _bucket_key(g), "completed": {"$sum": 1}}}],
             "cycle": [{"$match": {"_c": {"$ne": None}}},
                       {"$project": {"ms": {"$max": [0, {"$subtract": ["$_ts", "$_c"]}]}}},
                       {"$group": {"_id": None, "avg": {"$avg": "$ms"}, "n": {"$sum": 1}}}],
@@ -734,7 +765,7 @@ async def ops_leave(db, r: Range, scope: OpsScope) -> dict:
 
 
 async def ops_calendar(db, r: Range, scope: OpsScope) -> dict:
-    g = granularity_for(r, None, minimum="week")
+    g = granularity_for(r)
     match: dict = {"status": {"$ne": "cancelled"}}
     if scope.user_ids is not None:
         ors = [{"organizer_id": {"$in": scope.user_ids}}, {"participant_ids": {"$in": scope.user_ids}}]
@@ -746,7 +777,7 @@ async def ops_calendar(db, r: Range, scope: OpsScope) -> dict:
         {"$addFields": {"_ts": _ts("start_time")}},
         {"$match": {"_ts": {"$gte": r.start, "$lt": r.end}}},
         {"$facet": {
-            "daily": [{"$group": {"_id": _day_key(), "events": {"$sum": 1}}}],
+            "daily": [{"$group": {"_id": _bucket_key(g), "events": {"$sum": 1}}}],
             "category": [{"$group": {"_id": "$category", "events": {"$sum": 1}}}, {"$sort": {"events": -1}}],
         }},
     ], 1)
@@ -783,12 +814,21 @@ async def ensure_indexes(db):
 
 # ============================ ENDPOINTS ============================
 
-def _rng(from_: str | None, to: str | None) -> Range:
+def _rng(from_: str | None, to: str | None, days: int | None = None) -> Range:
+    """`days` (1/3/7/30/90, rolling window ending today) wins over explicit from/to.
+    With neither, the default is the last DEFAULT_DAYS days."""
+    if days is not None:
+        if days not in ALLOWED_DAYS:
+            raise HTTPException(422, f"days must be one of {', '.join(map(str, ALLOWED_DAYS))}")
+        return days_range(days)
+    if not from_ and not to:
+        return days_range(DEFAULT_DAYS)
     return parse_range(from_, to)
 
 
 FromQ = Query(None, alias="from", description="Inclusive start date, YYYY-MM-DD (IST)")
 ToQ = Query(None, description="Inclusive end date, YYYY-MM-DD (IST)")
+DaysQ = Query(None, description="Rolling window ending today (IST): one of 1, 3, 7, 30, 90. Overrides from/to.")
 
 
 @router.get("/meta")
@@ -817,68 +857,68 @@ async def meta(current: UserPublic = Depends(analytics_user)):
 
 
 @router.get("/marketplace/summary")
-async def marketplace_summary(from_: str | None = FromQ, to: str | None = ToQ, city: str | None = None,
+async def marketplace_summary(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, city: str | None = None,
                               current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_summary(get_db(), _rng(from_, to), city or None)
+    return await market_summary(get_db(), _rng(from_, to, days), city or None)
 
 
 @router.get("/marketplace/trend")
-async def marketplace_trend(from_: str | None = FromQ, to: str | None = ToQ, city: str | None = None,
-                            granularity: str | None = Query(None, pattern="^(auto|day|week|month)$"),
+async def marketplace_trend(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, city: str | None = None,
+                            granularity: str | None = Query(None, pattern="^(auto|hour|day|week|month)$"),
                             current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_trend(get_db(), _rng(from_, to), city or None, granularity)
+    return await market_trend(get_db(), _rng(from_, to, days), city or None, granularity)
 
 
 @router.get("/marketplace/cohorts")
-async def marketplace_cohorts(from_: str | None = FromQ, to: str | None = ToQ, city: str | None = None,
+async def marketplace_cohorts(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, city: str | None = None,
                               current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_cohorts(get_db(), _rng(from_, to), city or None)
+    return await market_cohorts(get_db(), _rng(from_, to, days), city or None)
 
 
 @router.get("/marketplace/cities")
-async def marketplace_cities(from_: str | None = FromQ, to: str | None = ToQ,
+async def marketplace_cities(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ,
                              current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_cities(get_db(), _rng(from_, to))
+    return await market_cities(get_db(), _rng(from_, to, days))
 
 
 @router.get("/marketplace/cities/{city}")
-async def marketplace_city(city: str, from_: str | None = FromQ, to: str | None = ToQ,
-                           granularity: str | None = Query(None, pattern="^(auto|day|week|month)$"),
+async def marketplace_city(city: str, from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ,
+                           granularity: str | None = Query(None, pattern="^(auto|hour|day|week|month)$"),
                            current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_city_detail(get_db(), _rng(from_, to), city, granularity)
+    return await market_city_detail(get_db(), _rng(from_, to, days), city, granularity)
 
 
 @router.get("/marketplace/fleet")
-async def marketplace_fleet(from_: str | None = FromQ, to: str | None = ToQ, city: str | None = None,
+async def marketplace_fleet(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, city: str | None = None,
                             current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_fleet(get_db(), _rng(from_, to), city or None)
+    return await market_fleet(get_db(), _rng(from_, to, days), city or None)
 
 
 @router.get("/marketplace/funnel")
-async def marketplace_funnel(from_: str | None = FromQ, to: str | None = ToQ, city: str | None = None,
+async def marketplace_funnel(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, city: str | None = None,
                              current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_funnel(get_db(), _rng(from_, to), city or None)
+    return await market_funnel(get_db(), _rng(from_, to, days), city or None)
 
 
 @router.get("/marketplace/heatmap")
-async def marketplace_heatmap(from_: str | None = FromQ, to: str | None = ToQ, city: str | None = None,
+async def marketplace_heatmap(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, city: str | None = None,
                               current: UserPublic = Depends(analytics_user)):
     _require_marketplace(current)
-    return await market_heatmap(get_db(), _rng(from_, to), city or None)
+    return await market_heatmap(get_db(), _rng(from_, to, days), city or None)
 
 
 @router.get("/operations")
-async def operations_overview(from_: str | None = FromQ, to: str | None = ToQ, department: str | None = None,
+async def operations_overview(from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ, department: str | None = None,
                               current: UserPublic = Depends(analytics_user)):
     db = get_db()
-    return await operations(db, _rng(from_, to), await ops_scope(db, current, department))
+    return await operations(db, _rng(from_, to, days), await ops_scope(db, current, department))
 
 
 # ------------------------- CSV export -------------------------
@@ -958,7 +998,7 @@ OPERATIONS_DATASETS = {"tasks", "overdue", "pipeline", "attendance", "leave", "c
 
 
 @router.get("/export/{dataset}")
-async def export_csv(dataset: str, from_: str | None = FromQ, to: str | None = ToQ,
+async def export_csv(dataset: str, from_: str | None = FromQ, to: str | None = ToQ, days: int | None = DaysQ,
                      city: str | None = None, department: str | None = None,
                      current: UserPublic = Depends(analytics_user)):
     if not can(current.role, "analytics.export"):
@@ -968,7 +1008,7 @@ async def export_csv(dataset: str, from_: str | None = FromQ, to: str | None = T
     if dataset in MARKETPLACE_DATASETS:
         _require_marketplace(current)
     db = get_db()
-    r = _rng(from_, to)
+    r = _rng(from_, to, days)
     cols, rows = await _export_rows(db, dataset, r, city or None, lambda: ops_scope(db, current, department))
     buf = io.StringIO()
     w = csv.writer(buf, lineterminator="\n")

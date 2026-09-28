@@ -14,7 +14,7 @@ import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import {
   inr, formatDate, todayIST, monthLabel, useFinanceResource, LoadError, TableSkeleton, MonthSelect,
-  FinanceStatus, downloadCsv, TH,
+  FinanceStatus, downloadCsv, TH, VendorSelect,
 } from "@/components/finance/financeShared";
 import InvoicePrint, { InvoiceDocument } from "@/components/finance/InvoicePrint";
 
@@ -317,6 +317,7 @@ export default function InvoicesTab({ canManage }) {
   const [month, setMonth] = useState("");
   const [qInput, setQInput] = useState("");
   const [q, setQ] = useState("");
+  const [vendorId, setVendorId] = useState("");
   const [page, setPage] = useState(0);
   const [genOpen, setGenOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
@@ -328,9 +329,10 @@ export default function InvoicesTab({ canManage }) {
   const [issuing, setIssuing] = useState(null);
 
   useEffect(() => { const t = setTimeout(() => setQ(qInput.trim()), 300); return () => clearTimeout(t); }, [qInput]);
-  useEffect(() => { setPage(0); }, [status, month, q]);
+  useEffect(() => { setPage(0); }, [status, month, q, vendorId]);
 
-  const filters = { ...(status ? { status } : {}), ...(month ? { month } : {}), ...(q ? { q } : {}) };
+  const filters = { ...(status ? { status } : {}), ...(month ? { month } : {}), ...(q ? { q } : {}), ...(vendorId ? { vendor_id: vendorId } : {}) };
+  const mpVendors = useFinanceResource("/finance/vendors/marketplace-options");
   const { data, error, loading, reload } = useFinanceResource("/finance/invoices", { ...filters, limit: PAGE, skip: page * PAGE });
   const donePrint = useCallback(() => setPrinting(null), []);
 
@@ -374,6 +376,7 @@ export default function InvoicesTab({ canManage }) {
             </SelectContent>
           </Select>
           <MonthSelect value={month} onChange={setMonth} allowAll testid="finance-invoice-month" />
+          <VendorSelect vendors={mpVendors.data} value={vendorId} onChange={setVendorId} allLabel="All fleet vendors" testid="finance-invoice-vendor" />
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" size="sm" className="h-9" onClick={exportCsv} disabled={exporting} data-testid="finance-invoice-export">
@@ -408,7 +411,7 @@ export default function InvoicesTab({ canManage }) {
         <Card className="border-border">
           {!data ? <TableSkeleton /> : data.items.length === 0 ? (
             <EmptyState icon={FileText} title={filtered ? "No invoices match these filters" : "No invoices yet"}
-                        description={filtered ? "Try another status, month or search." : "Generate invoices for confirmed, active or completed bookings."}
+                        description={filtered ? "Try another status, month, vendor or search." : "Generate invoices for confirmed, active or completed bookings."}
                         action={!filtered && canManage ? <Button size="sm" onClick={() => setGenOpen(true)}><Plus className="h-4 w-4 mr-1.5" />New invoice</Button> : null} />
           ) : (
             <Table>

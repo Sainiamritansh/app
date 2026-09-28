@@ -53,7 +53,7 @@ function Section({ title, children }) {
 }
 
 export default function OperationsTab({ range, department, canExport }) {
-  const params = { from: range.from, to: range.to, ...(department ? { department } : {}) };
+  const params = { days: range.days, from: range.from, to: range.to, ...(department ? { department } : {}) };
   const { data, loading, error, reload } = useAnalyticsData("/analytics/operations", params);
   const exp = (dataset) => <ExportButton dataset={dataset} params={params} canExport={canExport} />;
 
@@ -96,7 +96,7 @@ export default function OperationsTab({ range, department, canExport }) {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <ChartCard
           className="lg:col-span-2" testId="analytics-tasks-throughput"
-          title="Task throughput" description={`Created vs completed per ${t?.granularity || "week"} · by assignee`}
+          title="Task throughput" description={`Created vs completed per ${t?.granularity || "day"} · by assignee`}
           actions={exp("tasks")} loading={loading && !data}
           empty={noTasks} emptyIcon={ClipboardList} emptyTitle="No task activity in this range"
         >
@@ -195,7 +195,7 @@ export default function OperationsTab({ range, department, canExport }) {
       </div>
 
       <ChartCard
-        title="Calendar load" description={`Events scheduled per ${c?.granularity || "week"} · cancelled excluded`}
+        title="Calendar load" description={`Events scheduled per ${c?.granularity || "day"} · cancelled excluded`}
         actions={exp("calendar")} loading={loading && !data}
         empty={!c?.total} emptyIcon={CalendarDays} emptyTitle="No events in this range"
       >

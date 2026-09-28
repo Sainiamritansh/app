@@ -1,7 +1,8 @@
 from __future__ import annotations
+import re
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from bson import ObjectId
 from db import get_db
 from auth_utils import get_current_user, require_roles
@@ -11,12 +12,38 @@ from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, not
 
 router = APIRouter(prefix="/connect", tags=["connect"])
 
-# Anyone can see and join these kinds; every other kind (group, dm, ...) is members-only.
+# Legacy kinds anyone can see and join. Channels created from now on carry `members_only: True`
+# and behave like private groups (WhatsApp-style): only members list, read and post.
+# Announcements stay company-wide broadcasts; groups and DMs have always been members-only.
 PUBLIC_KINDS = ("channel", "announcement")
+# Kinds whose membership is picked by the creator and managed by the channel's admins.
+MEMBER_KINDS = ("channel", "group")
+MANAGER_ROLES = ("Founder", "Admin")
+ACTIVE_USER = {"status": {"$ne": "deactivated"}, "is_active": {"$ne": False}}
+KIND_NAME = {"channel": "channel", "group": "group", "announcement": "announcement channel"}
+
+
+def _dedupe_names(names: list[str]) -> list[str]:
+    seen, out = set(), []
+    for n in names:
+        n = (n or "").strip()
+        if n and n.lower() not in seen:
+            seen.add(n.lower())
+            out.append(n)
+    return out
 
 
 class MembersIn(BaseModel):
-    member_ids: List[str] = Field(min_length=1)
+    """Individual employees and/or whole departments (snapshot of their current active members)."""
+    member_ids: List[str] = Field(default_factory=list)
+    departments: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _not_empty(self):
+        self.departments = _dedupe_names(self.departments)
+        if not self.member_ids and not self.departments:
+            raise ValueError("Pick at least one member or department")
+        return self
 
 
 class ChannelCreate(ChannelIn):
@@ -24,6 +51,7 @@ class ChannelCreate(ChannelIn):
     model_config = ConfigDict(str_strip_whitespace=True)
     name: str = Field(min_length=1, max_length=80)
     description: Optional[str] = Field(default=None, max_length=500)
+    departments: List[str] = Field(default_factory=list)
 
 
 class MessageCreate(MessageIn):
@@ -32,8 +60,32 @@ class MessageCreate(MessageIn):
     body: str = Field(min_length=1, max_length=4000)
 
 
+def _is_public(ch: dict) -> bool:
+    """Visible to / joinable by everyone: announcements and legacy channels without a member list."""
+    return ch.get("kind") in PUBLIC_KINDS and not ch.get("members_only")
+
+
 def _can_view(ch: dict, user_id: str) -> bool:
-    return ch.get("kind") in PUBLIC_KINDS or user_id in ch.get("members", [])
+    return _is_public(ch) or user_id in ch.get("members", [])
+
+
+def _channel_admins(ch: dict) -> list[str]:
+    """Admins of a members-only channel/group. Legacy docs without `admins` fall back to the creator."""
+    admins = ch.get("admins")
+    if admins is None:
+        admins = [ch["created_by"]] if ch.get("created_by") and ch["created_by"] != "system" else []
+    return admins
+
+
+def _can_manage(ch: dict, current: UserPublic) -> bool:
+    """Who may add/remove members. Department groups follow the org chart, so only Founder/Admin."""
+    if ch.get("kind") not in MEMBER_KINDS or _is_public(ch):
+        return False
+    if current.role in MANAGER_ROLES:
+        return True
+    if ch.get("department"):
+        return False
+    return current.id in _channel_admins(ch)
 
 
 async def _visible_channel(db, channel_id: str, current: UserPublic) -> dict:
@@ -52,13 +104,27 @@ async def _validate_member_ids(db, ids: list[str]) -> list[str]:
         return []
     if not all(ObjectId.is_valid(i) for i in ids):
         raise HTTPException(422, "Invalid member id")
-    found = await db.users.count_documents({
-        "_id": {"$in": [ObjectId(i) for i in ids]},
-        "status": {"$ne": "deactivated"}, "is_active": {"$ne": False},
-    })
+    found = await db.users.count_documents({"_id": {"$in": [ObjectId(i) for i in ids]}, **ACTIVE_USER})
     if found != len(ids):
         raise HTTPException(422, "One or more members do not exist")
     return ids
+
+
+async def _department_member_ids(db, departments: list[str]) -> list[str]:
+    """Active users currently in each named department (case-insensitive). 422 for an empty/unknown one."""
+    out: list[str] = []
+    for name in _dedupe_names(departments):
+        rx = {"$regex": f"^\\s*{re.escape(name)}\\s*$", "$options": "i"}
+        docs = await db.users.find({"department": rx, **ACTIVE_USER}, {"_id": 1}).to_list(1000)
+        if not docs:
+            raise HTTPException(422, f"Department '{name}' has no active members")
+        out.extend(str(d["_id"]) for d in docs)
+    return list(dict.fromkeys(out))
+
+
+async def _resolve_members(db, member_ids: list[str], departments: list[str]) -> list[str]:
+    ids = await _validate_member_ids(db, member_ids)
+    return list(dict.fromkeys([*ids, *await _department_member_ids(db, departments)]))
 
 
 async def _unread_counts(db, channels: list[dict], current_id: str) -> dict[str, int]:
@@ -78,11 +144,17 @@ async def _unread_counts(db, channels: list[dict], current_id: str) -> dict[str,
     return {r["_id"]: r["n"] for r in await db.messages.aggregate(pipe).to_list(len(ids))}
 
 
-async def _channel_meta(db, doc, current_id: str, unread: int | None = None):
+async def _channel_meta(db, doc, current: UserPublic, unread: int | None = None):
+    current_id = current.id
     if unread is None:
         unread = (await _unread_counts(db, [doc], current_id)).get(str(doc["_id"]), 0)
     doc["last_message_at"] = doc.get("last_message_at")
     doc["unread"] = unread
+    doc["members_only"] = not _is_public(doc)
+    doc["member_count"] = len(doc.get("members", []))
+    if doc.get("kind") in MEMBER_KINDS:
+        doc["admins"] = _channel_admins(doc)
+        doc["can_manage"] = _can_manage(doc, current)
     # For DMs, resolve peer name
     if doc.get("kind") == "dm":
         peer_id = next((m for m in doc.get("members", []) if m != current_id), None)
@@ -102,13 +174,27 @@ async def list_channels(kind: str | None = None, current: UserPublic = Depends(g
     q = {}
     if kind:
         q["kind"] = kind
-    # visible: public channels + those the user belongs to
-    q["$or"] = [{"kind": {"$in": ["channel", "announcement"]}}, {"members": current.id}]
+    # visible: public (legacy / announcement) channels + those the user belongs to
+    q["$or"] = [{"kind": {"$in": list(PUBLIC_KINDS)}, "members_only": {"$ne": True}}, {"members": current.id}]
     docs = await db.channels.find(q).sort("last_message_at", -1).to_list(200)
     unread = await _unread_counts(db, docs, current.id)
     for d in docs:
-        await _channel_meta(db, d, current.id, unread.get(str(d["_id"]), 0))
+        await _channel_meta(db, d, current, unread.get(str(d["_id"]), 0))
     return serialize_many(docs)
+
+
+@router.get("/departments")
+async def list_departments(current: UserPublic = Depends(require_roles("Founder", "Admin", "Manager"))):
+    """Departments with their active headcount, for picking whole departments as channel members."""
+    db = get_db()
+    pipe = [
+        {"$match": {"department": {"$type": "string", "$ne": ""}, **ACTIVE_USER}},
+        {"$group": {"_id": {"$toLower": {"$trim": {"input": "$department"}}},
+                    "name": {"$first": {"$trim": {"input": "$department"}}}, "member_count": {"$sum": 1}}},
+        {"$sort": {"name": 1}},
+    ]
+    return [{"name": r["name"], "member_count": r["member_count"]}
+            for r in await db.users.aggregate(pipe).to_list(500) if r["name"]]
 
 
 @router.post("/channels", status_code=201)
@@ -119,47 +205,119 @@ async def create_channel(payload: ChannelCreate,
         raise HTTPException(403, "Only Founder or Admin can create announcement channels")
     if payload.kind == "dm":
         raise HTTPException(400, "Use /connect/dm/{peer_id} to start a direct message")
-    doc = payload.model_dump()
+    doc = payload.model_dump(exclude={"departments"})
     doc["description"] = doc.get("description") or None
-    added = [m for m in await _validate_member_ids(db, doc["members"]) if m != current.id]
+    resolved = await _resolve_members(db, doc["members"], payload.departments)
+    added = [m for m in resolved if m != current.id]
     doc["members"] = [current.id, *added]
     doc["created_by"] = current.id
+    if doc["kind"] in MEMBER_KINDS:
+        doc["members_only"] = True
+        doc["admins"] = [current.id]
     doc["created_at"] = utc_iso()
     doc["last_message_at"] = utc_iso()
     res = await db.channels.insert_one(doc)
     doc["_id"] = res.inserted_id
-    await _channel_meta(db, doc, current.id)
+    await _channel_meta(db, doc, current)
     await log_activity(db, current, f"Created {doc['kind']}", "WavyGo Connect", target=doc["name"],
-                       meta={"members": len(doc["members"])})
-    if doc["kind"] not in PUBLIC_KINDS:
+                       meta={"members": len(doc["members"]), "departments": _dedupe_names(payload.departments)})
+    if doc.get("members_only"):
+        label = KIND_NAME.get(doc["kind"], "group")
         for uid in added:
-            await notify(db, uid, "Added to group", f"{current.name} added you to {doc['name']}.",
+            await notify(db, uid, f"Added to {label}", f"{current.name} added you to {doc['name']}.",
                          kind="info", link="/wavygo-connect")
     return serialize(doc)
 
 
+@router.get("/channels/{channel_id}/members")
+async def list_members(channel_id: str, current: UserPublic = Depends(get_current_user)):
+    """Member profiles of a channel the caller can see, admins first."""
+    db = get_db()
+    ch = await _visible_channel(db, channel_id, current)
+    ids = [m for m in ch.get("members", []) if ObjectId.is_valid(m)]
+    admins = set(_channel_admins(ch)) if ch.get("kind") in MEMBER_KINDS else set()
+    proj = {"name": 1, "email": 1, "role": 1, "photo": 1, "online": 1, "designation": 1, "department": 1,
+            "status": 1, "is_active": 1}
+    docs = await db.users.find({"_id": {"$in": [ObjectId(i) for i in ids]}}, proj).to_list(len(ids) or 1)
+    out = []
+    for d in docs:
+        uid = str(d["_id"])
+        out.append({
+            "id": uid, "name": d.get("name"), "email": d.get("email"), "role": d.get("role"),
+            "photo": d.get("photo"), "online": d.get("online", False), "designation": d.get("designation"),
+            "department": d.get("department"), "is_admin": uid in admins,
+            "is_creator": uid == ch.get("created_by"),
+            "active": d.get("status") != "deactivated" and d.get("is_active") is not False,
+        })
+    out.sort(key=lambda m: (not m["is_admin"], (m["name"] or "").lower()))
+    return out
+
+
 @router.post("/channels/{channel_id}/members")
 async def add_members(channel_id: str, payload: MembersIn, current: UserPublic = Depends(get_current_user)):
-    """Add members to a private group. Allowed for the group's creator, Founder and Admin."""
+    """Add employees and/or whole departments to a members-only channel or group.
+    Allowed for the channel's admins (creator), Founder and Admin."""
     db = get_db()
     ch = await db.channels.find_one({"_id": oid(channel_id)})
     if not ch:
         raise HTTPException(404, "Channel not found")
-    if ch["kind"] in PUBLIC_KINDS or ch["kind"] == "dm":
-        raise HTTPException(400, "Members can only be added to groups")
-    if ch.get("created_by") != current.id and current.role not in ("Founder", "Admin"):
-        raise HTTPException(403, "Only the group creator, Founder or Admin can add members")
+    if ch["kind"] not in MEMBER_KINDS or _is_public(ch):
+        raise HTTPException(400, "Members can only be added to private channels and groups")
+    if not _can_manage(ch, current):
+        raise HTTPException(403, "Only the channel's admins, Founder or Admin can add members")
     existing = set(ch.get("members", []))
-    added = [m for m in await _validate_member_ids(db, payload.member_ids) if m not in existing]
+    resolved = await _resolve_members(db, payload.member_ids, payload.departments)
+    added = [m for m in resolved if m not in existing]
     if added:
         await db.channels.update_one({"_id": ch["_id"]}, {"$addToSet": {"members": {"$each": added}}})
         await log_activity(db, current, "Added group members", "WavyGo Connect", target=ch["name"],
-                           meta={"added": added})
+                           meta={"added": added, "departments": payload.departments})
+        label = KIND_NAME.get(ch["kind"], "group")
         for uid in added:
-            await notify(db, uid, "Added to group", f"{current.name} added you to {ch['name']}.",
+            await notify(db, uid, f"Added to {label}", f"{current.name} added you to {ch['name']}.",
                          kind="info", link="/wavygo-connect")
     doc = await db.channels.find_one({"_id": ch["_id"]})
-    await _channel_meta(db, doc, current.id)
+    await _channel_meta(db, doc, current)
+    return serialize(doc)
+
+
+@router.delete("/channels/{channel_id}/members/{user_id}")
+async def remove_member(channel_id: str, user_id: str, current: UserPublic = Depends(get_current_user)):
+    """Remove a member (channel admins / Founder / Admin), or leave (any member removing themselves).
+    Channel admins cannot remove the creator; only Founder/Admin can. Department-group membership
+    follows the employee's department, so members cannot leave those themselves."""
+    db = get_db()
+    ch = await db.channels.find_one({"_id": oid(channel_id)})
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    if ch["kind"] not in MEMBER_KINDS or _is_public(ch):
+        raise HTTPException(400, "Members can only be removed from private channels and groups")
+    members = ch.get("members", [])
+    leaving = user_id == current.id
+    if leaving:
+        if current.id not in members:
+            raise HTTPException(403, "Not a member")
+        if ch.get("department") and current.role not in MANAGER_ROLES:
+            raise HTTPException(400, "Department group membership follows your department")
+    else:
+        if not _can_manage(ch, current):
+            raise HTTPException(403, "Only the channel's admins, Founder or Admin can remove members")
+        if user_id == ch.get("created_by") and current.role not in MANAGER_ROLES:
+            raise HTTPException(403, "The channel creator can only be removed by Founder or Admin")
+        if user_id not in members:
+            raise HTTPException(404, "Not a member of this channel")
+    remaining = [m for m in members if m != user_id]
+    admins = [a for a in _channel_admins(ch) if a != user_id]
+    if not admins and remaining and not ch.get("department"):
+        admins = [remaining[0]]  # never leave a group without an admin
+    await db.channels.update_one({"_id": ch["_id"]}, {"$set": {"members": remaining, "admins": admins}})
+    await log_activity(db, current, "Left group" if leaving else "Removed group member", "WavyGo Connect",
+                       target=ch["name"], meta={"user_id": user_id})
+    if not leaving:
+        await notify(db, user_id, f"Removed from {KIND_NAME.get(ch['kind'], 'group')}",
+                     f"{current.name} removed you from {ch['name']}.", kind="info", link="/wavygo-connect")
+    doc = await db.channels.find_one({"_id": ch["_id"]})
+    await _channel_meta(db, doc, current)
     return serialize(doc)
 
 
@@ -255,7 +413,7 @@ async def open_dm(peer_id: str, current: UserPublic = Depends(get_current_user))
         "members": {"$all": [current.id, peer_id], "$size": 2},
     })
     if existing:
-        await _channel_meta(db, existing, current.id)
+        await _channel_meta(db, existing, current)
         return serialize(existing)
     doc = {
         "name": peer["name"],
@@ -268,7 +426,7 @@ async def open_dm(peer_id: str, current: UserPublic = Depends(get_current_user))
     }
     res = await db.channels.insert_one(doc)
     doc["_id"] = res.inserted_id
-    await _channel_meta(db, doc, current.id)
+    await _channel_meta(db, doc, current)
     return serialize(doc)
 
 
@@ -313,7 +471,7 @@ async def join_channel(channel_id: str, current: UserPublic = Depends(get_curren
     ch = await db.channels.find_one({"_id": oid(channel_id)})
     if not ch:
         raise HTTPException(404, "Channel not found")
-    if ch["kind"] not in PUBLIC_KINDS:
+    if not _is_public(ch):
         raise HTTPException(403, "Private groups and direct messages cannot be joined")
     if current.id not in ch.get("members", []):
         await db.channels.update_one({"_id": oid(channel_id)}, {"$addToSet": {"members": current.id}})

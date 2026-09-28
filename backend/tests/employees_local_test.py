@@ -372,6 +372,23 @@ def test_update_department_head_description_and_rename(api, users, test_db):
     assert call(api, users["admin"], "PATCH", f"/employees/departments/{dept_id}", json={"bogus": 1}).status_code == 422
 
 
+def test_department_rename_renames_its_connect_group(api, users, test_db):
+    from bson import ObjectId as _Oid
+    marker = uuid.uuid4().hex[:6]
+    old, new = f"Grp{marker}", f"GrpNew{marker}"
+    dept_id = str(test_db.departments.insert_one({"name": old}).inserted_id)
+    emp = users["employee2"]["id"]
+    test_db.users.update_one({"_id": _Oid(emp)}, {"$set": {"department": old}})
+    ch_id = test_db.channels.insert_one({"name": f"{old} Group", "kind": "group", "department": old,
+                                         "members": ["legacy-member"]}).inserted_id
+    r = call(api, users["founder"], "PATCH", f"/employees/departments/{dept_id}", json={"name": new})
+    assert r.status_code == 200, r.text
+    groups = list(test_db.channels.find({"kind": "group", "department": {"$in": [old, new]}}))
+    assert [g["_id"] for g in groups] == [ch_id]  # same channel, no empty duplicate
+    assert groups[0]["department"] == new and groups[0]["name"] == f"{new} Group"
+    assert {"legacy-member", emp} <= set(groups[0]["members"])
+
+
 def test_presence_marks_active_users_online(api, users, test_db):
     from bson import ObjectId as _Oid
     test_db.users.update_one({"_id": _Oid(users["intern"]["id"])}, {"$set": {"online": False}, "$unset": {"last_seen": ""}})

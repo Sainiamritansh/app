@@ -22,15 +22,40 @@ export function useOwnerOptions(action, open = true) {
   return useMemo(() => people.filter((p) => can(p.role, action)), [people, action]);
 }
 
-/** Create (customerId) or edit (followup) a CRM follow-up. */
+/** Customers matching a search, for picking who a new follow-up is with. */
+function useCustomerOptions(q, enabled) {
+  const [items, setItems] = useState([]);
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const controller = new AbortController();
+    const id = setTimeout(() => {
+      api.get("/crm/customers", { params: { q: q.trim() || undefined, sort: "name", order: "asc", page_size: 50 }, signal: controller.signal })
+        .then(({ data }) => setItems(data.items))
+        .catch(() => { if (!controller.signal.aborted) setItems([]); });
+    }, 250);
+    return () => { clearTimeout(id); controller.abort(); };
+  }, [q, enabled]);
+  return items;
+}
+
+/** Create (customerId, or pick a customer when none is given) or edit (followup) a CRM follow-up. */
 export default function FollowupDialog({ open, onOpenChange, customerId, customerName, followup, onSaved }) {
   const { user } = useAuth();
   const owners = useOwnerOptions("crm.view", open);
   const [form, setForm] = useState({ title: "", due_date: todayLocal(1), owner_id: "", notes: "" });
   const [saving, setSaving] = useState(false);
+  const pickCustomer = open && !followup && !customerId;
+  const [customerQ, setCustomerQ] = useState("");
+  const [picked, setPicked] = useState(null);
+  const found = useCustomerOptions(customerQ, pickCustomer);
+  // Keep the chosen customer selectable even when a new search no longer lists it.
+  const customerOptions = picked && !found.some((c) => c.id === picked.id) ? [picked, ...found] : found;
+  const pickedId = picked?.id || "";
 
   useEffect(() => {
     if (!open) return;
+    setCustomerQ("");
+    setPicked(null);
     setForm(followup
       ? { title: followup.title, due_date: followup.due_date, owner_id: followup.owner_id, notes: followup.notes || "" }
       : { title: "", due_date: todayLocal(1), owner_id: user?.id || "", notes: "" });
@@ -40,6 +65,8 @@ export default function FollowupDialog({ open, onOpenChange, customerId, custome
 
   async function submit(e) {
     e.preventDefault();
+    const targetId = customerId || pickedId;
+    if (!followup && !targetId) return toast.error("Pick the customer this follow-up is with");
     if (!form.title.trim()) return toast.error("Give the follow-up a title");
     if (!form.due_date) return toast.error("Pick a due date");
     setSaving(true);
@@ -47,7 +74,7 @@ export default function FollowupDialog({ open, onOpenChange, customerId, custome
       const body = { title: form.title.trim(), due_date: form.due_date, owner_id: form.owner_id || null, notes: form.notes.trim() || null };
       const { data } = followup
         ? await api.patch(`/crm/followups/${followup.id}`, body)
-        : await api.post(`/crm/customers/${customerId}/followups`, body);
+        : await api.post(`/crm/customers/${targetId}/followups`, body);
       toast.success(followup ? "Follow-up updated" : "Follow-up scheduled");
       onSaved?.(data);
       onOpenChange(false);
@@ -69,6 +96,20 @@ export default function FollowupDialog({ open, onOpenChange, customerId, custome
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3 py-4">
+            {pickCustomer && (
+              <div className="space-y-1.5">
+                <Label htmlFor="fu-customer-q">Customer</Label>
+                <Input id="fu-customer-q" value={customerQ} onChange={(e) => setCustomerQ(e.target.value)}
+                       placeholder="Search name, email or phone…" className="h-9" data-testid="crm-followup-customer-search" />
+                <Select value={pickedId || undefined} onValueChange={(id) => setPicked(customerOptions.find((c) => c.id === id) || null)}>
+                  <SelectTrigger data-testid="crm-followup-customer"><SelectValue placeholder="Select a customer" /></SelectTrigger>
+                  <SelectContent>
+                    {customerOptions.length === 0 && <div className="px-2 py-1.5 text-[12.5px] text-muted-foreground">No customers found</div>}
+                    {customerOptions.map((c) => <SelectItem key={c.id} value={c.id}>{c.name}{c.city ? ` · ${c.city}` : ""}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="fu-title">What needs to happen</Label>
               <Input id="fu-title" value={form.title} onChange={set("title")} maxLength={200} placeholder="e.g. Call about monthly plan renewal" data-testid="crm-followup-title" />
