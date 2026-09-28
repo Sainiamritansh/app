@@ -232,12 +232,19 @@ Endpoints: `/api/employees` (list, invite, invitations, resend/revoke, accept-in
 Endpoints: `/api/connect/channels` (list, create), `/departments`, `/channels/{id}/members` (list, add, `DELETE …/{user_id}` to remove or leave), `/channels/{id}/admins/{user_id}` (`POST` promote, `DELETE` demote), `POST /channels/{id}/members-only`, `/manage/channels` (Founder/Admin), `/dm-users`, `/users`, `/dm/{peer_id}`, `/channels/{id}/messages`, `/join`, `/read`.
 
 ### Calendar
-- Month, week, day and agenda views; participants; visibility (everyone, department, private); reminders delivered as notifications.
+- Month, week, day and agenda views; participants; visibility (everyone, department, private); reminders delivered as notifications and email.
+- **Drag and drop**: in week / day view, drag across empty slots to create an event for that range, drag an event to move it (across days in week view) or drag its bottom edge to resize; snaps to 15 minutes, Esc cancels. In month view, drag an event onto another day (time and length kept). Moves save immediately with an **Undo** toast. Only the organiser, Founder and Admin can drag an event.
+- **RSVP**: invitees reply Going / Maybe / Can't go; the organiser is notified. Event details show a reply summary and each person's answer; the agenda flags events that still need your reply. Moving an event resets replies and tells invitees ("Event rescheduled").
+- **Availability**: the event form shows a free/busy timeline for the organiser and invitees on the chosen day, lists clashes and offers the next slot in working hours (09:00–18:00, up to a week ahead) when everyone is free. Private events of others show only as "Busy"; declined invitations don't count.
+- **Event form**: duration presets (15m–2h), duplicate an event, Ctrl+Enter to save.
+- **Event details**: "Join meeting now" from 10 minutes before start, countdown, copy link, download `.ics` (Google / Outlook / Apple), duplicate.
+- **Sidebar**: "Up next for you" (next events with countdown and replies owed), mini calendar with dots on busy days, category and "only my events" / "show cancelled" filters.
+- **Search** across title, location and description (`/` focuses the box). Keyboard: `T` today, `←`/`→` previous/next, `M` `W` `D` `A` switch view, `N` new event.
 - The agenda starts at local midnight, so meetings earlier today are still listed; events that have ended are faded.
 - Editing an event re-arms its reminder only when the start time or reminder offset actually changed (fixing a title doesn't resend the reminder).
 - Deep links: `?event=<id>`, `?view=`, `?date=`, `?create=1`.
 
-Endpoints: `/api/calendar/events` (CRUD, date range, participant filter, sorting, pagination), `/events/{id}`, `/month`, `/week`, `/day`, `/agenda`, `/invitees`.
+Endpoints: `/api/calendar/events` (CRUD, date range, participant filter, `q` search, sorting, pagination), `/events/{id}`, `/events/{id}/rsvp`, `/availability` (free/busy), `/month`, `/week`, `/day`, `/agenda`, `/invitees`.
 
 ### Company Vault
 - Company documents in folders with tags, versions (upload new, download, restore), inline preview, expiry dates and reminders at 30 days, 7 days and on expiry, sent once per stage to every Founder and Admin plus the document's owner. Files up to 25 MB, stored in MongoDB GridFS.
@@ -307,7 +314,9 @@ Endpoints: `/api/ai/status`, `/conversations` (CRUD), `POST /conversations/{id}/
 
 - In-app notifications are created for assignments, calendar reminders and invitations, channel membership changes, leave decisions, documents shared with you, vault expiry reminders, Marketplace alerts (Founder only) and finance actions. Each carries a link that opens the exact item.
 - Deep links used by notifications and emails: `/task-board?task_id=<id>`, `/opportunity-hub?opp=<id>`, `/calendar?event=<id>`, `/company-vault?doc=<id>`, `/crm?customer=<id>`, `/marketing?campaign=<id>`.
-- Emails (Brevo): invitations, password reset links, and task / opportunity assignment emails with a deep link. No email is sent for self-assignment. Without `BREVO_API_KEY`, emails are skipped and the app shows invite links to copy.
+- Emails (Brevo): invitations, password resets and reset links, task / opportunity assignments, and calendar emails (invitation, reminder, reschedule, cancellation), each with a deep link. No email is sent for self-assignment. Without `BREVO_API_KEY`, emails are skipped and the app shows invite links to copy.
+- All user-supplied text (names, titles, roles) is HTML-escaped in emails, and only `http(s)` meeting links are rendered.
+- Set `FRONTEND_URL` to your live site: invitation, assignment and calendar emails use it for links (password-reset links fall back to the requesting site).
 
 ---
 
@@ -337,7 +346,7 @@ All routes are under `/api`. Full, always-current reference: `/docs`.
 | Employees | `/api/employees` | directory, invitations, status, attendance + check-in/out, leave, performance, departments |
 | Opportunities | `/api/opportunities` | CRUD, assign / unassign, status, stats |
 | Connect | `/api/connect` | channels, departments, members (add / remove / leave), admins, members-only conversion, manage-all list, DMs, messages, read state |
-| Calendar | `/api/calendar` | events CRUD, month / week / day / agenda, invitees |
+| Calendar | `/api/calendar` | events CRUD, month / week / day / agenda, search, RSVP, availability (free/busy), invitees |
 | Notifications | `/api/notifications` | list, unread count, mark read |
 | Activity | `/api/activity` | audit log, modules |
 | Settings | `/api/settings` | company profile, roles |
@@ -358,7 +367,7 @@ cd backend
 ```
 
 - `pytest.ini` runs tests in parallel with `pytest-xdist` (`-n 2 --dist loadscope`); use `-n 0` to run serially.
-- `tests/*_local_test.py` are self-contained: each module starts its own API server on a free port against a throwaway database on the MongoDB at `MONGO_URL` (default `mongodb://127.0.0.1:27017`), and deletes it afterwards. See [`tests/local_harness.py`](backend/tests/local_harness.py). Suites: auth, password reset, dashboard, employees, tasks and opportunities, Connect and Marketplace, calendar, vault, finance, CRM and marketing, analytics, AI.
+- `tests/*_local_test.py` are self-contained: each module starts its own API server on a free port against a throwaway database on the MongoDB at `MONGO_URL` (default `mongodb://127.0.0.1:27017`), and deletes it afterwards. The spawned server runs with `BREVO_API_KEY` blanked, so tests never send real email (email tests mock the Brevo call). See [`tests/local_harness.py`](backend/tests/local_harness.py). Suites: auth, password reset, dashboard, employees, tasks and opportunities, Connect and Marketplace, calendar, vault, finance, CRM and marketing, analytics, AI.
 - `tests/backend_test.py`, `backend_part2_test.py` and `rbac_test.py` are end-to-end suites against a running deployment. They are skipped unless `WAVYGO_E2E_URL`, `FOUNDER_EMAIL` and `FOUNDER_PASSWORD` are set (the Founder login on that deployment). Other role accounts come from `E2E_ADMIN_EMAIL`, `E2E_MANAGER_EMAIL`, `E2E_EMPLOYEE_EMAIL`, `E2E_INTERN_EMAIL` (default `<role>@wavygo.in`) with password `E2E_PASSWORD` (default `FOUNDER_PASSWORD`); see [`tests/e2e_accounts.py`](backend/tests/e2e_accounts.py). Don't point them at production data.
 - CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the backend suites against a MongoDB 7 service and verifies the frontend build with `npm ci`.
 
@@ -406,6 +415,12 @@ Frontend routes: `/login`, `/accept-invite`, `/reset-password`, `/dashboard`, `/
 ---
 
 ## Changelog
+
+### 2026-09-29: calendar redesign and calendar email
+
+- **Calendar**: drag to create / move / resize (week, day) and move across days (month) with undo; RSVP (Going / Maybe / Can't go) with organiser notifications; free/busy availability with clash detection and "next free slot"; search; "Up next" sidebar; duration presets, duplicate, `.ics` export, join button and countdown; week numbers and busy-day dots. New endpoints `POST /api/calendar/events/{id}/rsvp` and `GET /api/calendar/availability`, plus `q` on every list/view endpoint.
+- **Email**: calendar invitation, reminder, reschedule and cancellation emails; invitation, password and assignment emails now HTML-escape user-supplied text (closes an HTML/link injection via task titles and names).
+- **Testing**: the local test harness no longer sends real email; new tests for RSVP, availability, search and email escaping.
 
 ### 2026-09-29: per-vendor finance, channel admins, gap fixes
 
