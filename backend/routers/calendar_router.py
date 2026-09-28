@@ -30,6 +30,7 @@ from auth_utils import get_current_user
 from models import UserPublic
 from models_part2 import CalendarEventIn, CalendarEventPatch, CalendarRsvpIn, EventCategory
 from hub_utils import serialize, utc_iso, log_activity, notify
+from email_utils import send_calendar_email
 from permissions import can
 
 router = APIRouter(prefix="/calendar", tags=["calendar"])
@@ -317,6 +318,50 @@ def _event_link(event: dict) -> str:
     return f"/calendar?event={event['_id']}"
 
 
+# Emails go out on worker threads (the Brevo client is blocking); keep references until they finish.
+_email_tasks: set = set()
+
+
+def _email_when(doc: dict) -> str:
+    zone = ZoneInfo(DEFAULT_TZ)
+    start = _as_utc(doc["start_time"]).astimezone(zone)
+    if doc.get("all_day"):
+        last = (_as_utc(doc["end_time"]) - timedelta(microseconds=1)).astimezone(zone)
+        if last.date() <= start.date():
+            return start.strftime("%a %d %b %Y · All day")
+        return f"{start.strftime('%a %d %b')} – {last.strftime('%a %d %b %Y')} · All day"
+    end = _as_utc(doc["end_time"]).astimezone(zone)
+    tail = end.strftime("%I:%M %p") if end.date() == start.date() else end.strftime("%d %b, %I:%M %p")
+    return f"{start.strftime('%a %d %b %Y, %I:%M %p')} – {tail} IST"
+
+
+async def _email_many(db, user_ids, kind: str, doc: dict, actor: str = "", when_phrase: str = "starts soon") -> None:
+    """Email active users about an event without holding up the request."""
+    ids = [ObjectId(u) for u in dict.fromkeys(user_ids) if u and ObjectId.is_valid(u)]
+    if not ids:
+        return
+    query = {"_id": {"$in": ids}, "status": {"$ne": "deactivated"}, "is_active": {"$ne": False}}
+    async for u in db.users.find(query, {"email": 1, "name": 1}):
+        email = (u.get("email") or "").strip()
+        if not email:
+            continue
+        task = asyncio.create_task(asyncio.to_thread(
+            send_calendar_email,
+            recipient_email=email,
+            recipient_name=u.get("name") or "",
+            kind=kind,
+            title=doc["title"],
+            when=_email_when(doc),
+            actor=actor,
+            location=doc.get("location"),
+            meeting_link=doc.get("meeting_link"),
+            event_id=str(doc["_id"]),
+            when_phrase=when_phrase,
+        ))
+        _email_tasks.add(task)
+        task.add_done_callback(_email_tasks.discard)
+
+
 async def _notify_many(db, user_ids, title: str, body: str, link: str = "/calendar") -> None:
     for uid in user_ids:
         await notify(db, uid, title, body, kind="info", link=link)
@@ -361,6 +406,7 @@ async def send_due_reminders(db, now: Optional[datetime] = None) -> int:
         recipients = [uid for uid in dict.fromkeys([doc.get("organizer_id"), *doc.get("participant_ids", [])]) if uid]
         await _notify_many(db, recipients, "Event reminder", f"{doc['title']} {when} · {_when(doc['start_time'])}",
                            link=_event_link(doc))
+        await _email_many(db, recipients, "reminder", doc, when_phrase=when)
         sent += 1
 
 
@@ -400,11 +446,14 @@ async def create_event(payload: CalendarEventIn, current: UserPublic = Depends(g
     doc["_id"] = res.inserted_id
 
     await log_activity(db, current, "Scheduled event", "Calendar", target=doc["title"])
+    invitees = [p for p in doc["participant_ids"] if p != current.id]
     await _notify_many(
-        db, [p for p in doc["participant_ids"] if p != current.id], "Event invitation",
+        db, invitees, "Event invitation",
         f"{current.name} invited you to {doc['title']} on {_when(doc['start_time'])}",
         link=_event_link(doc),
     )
+    if doc["status"] != "cancelled":
+        await _email_many(db, invitees, "invite", doc, actor=current.name)
     return (await _serialize_events(db, [doc]))[0]
 
 
@@ -464,14 +513,18 @@ async def update_event(event_id: str, payload: CalendarEventPatch, current: User
     await _notify_many(db, added, "Event invitation",
                        f"{current.name} invited you to {doc['title']} on {_when(doc['start_time'])}",
                        link=_event_link(doc))
+    if doc.get("status") != "cancelled":
+        await _email_many(db, added, "invite", doc, actor=current.name)
     others = [p for p in doc.get("participant_ids", []) if p != current.id and p not in added]
     if updates.get("status") == "cancelled" and existing.get("status") != "cancelled":
         await _notify_many(db, others, "Event cancelled", f"{current.name} cancelled {doc['title']}",
                            link=_event_link(doc))
+        await _email_many(db, others, "cancelled", doc, actor=current.name)
     elif rescheduled and doc.get("status") != "cancelled":
         await _notify_many(db, others, "Event rescheduled",
                            f"{current.name} moved {doc['title']} to {_when(doc['start_time'])}",
                            link=_event_link(doc))
+        await _email_many(db, others, "rescheduled", doc, actor=current.name)
     return (await _serialize_events(db, [doc]))[0]
 
 
