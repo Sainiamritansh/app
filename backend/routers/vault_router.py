@@ -9,9 +9,10 @@ appends a new version that points at the same stored file (no byte copy), so
 deletes de-duplicate file ids before removing them.
 
 Expiry: `expires_on` is a calendar date (YYYY-MM-DD) compared against "today" in
-VAULT_TZ (default Asia/Kolkata). `send_expiry_reminders(db)` notifies every
-Founder once at 30 days, once at 7 days and once when expired; the stages already
-sent are tracked in `reminders_sent` and reset whenever the expiry date changes.
+VAULT_TZ (default Asia/Kolkata). `send_expiry_reminders(db)` notifies every active
+Founder and Admin plus the document's owner (each person once) at 30 days, at 7 days and
+when expired; the stages already sent are tracked in `reminders_sent` and reset whenever the
+expiry date changes.
 
 Access control: every folder and document carries `access` ({mode: everyone|restricted,
 roles, departments, user_ids}) plus a derived `access_keys` list ("*", "role:<Role>",
@@ -442,6 +443,20 @@ async def _notify_founders(db, title: str, body: str, link: str, kind: str = "in
     return sent
 
 
+async def _notify_expiry(db, doc: dict, title: str, body: str, kind: str) -> int:
+    """Expiry reminder for one document: every active Founder/Admin plus its owner, each notified once."""
+    active = {"status": {"$ne": "deactivated"}, "is_active": {"$ne": False}}
+    ids: list[str] = [str(u["_id"]) async for u in db.users.find(
+        {"role": {"$in": sorted(VAULT_ADMIN_ROLES)}, **active}, {"_id": 1})]
+    owner = doc.get("uploaded_by")
+    if owner and owner not in ids and ObjectId.is_valid(owner) and \
+            await db.users.count_documents({"_id": ObjectId(owner), **active}, limit=1):
+        ids.append(owner)
+    for uid in dict.fromkeys(ids):
+        await notify(db, uid, title, body, kind=kind, link=_doc_link(doc["_id"]))
+    return len(set(ids))
+
+
 def _doc_link(doc_id) -> str:
     return f"{LINK}?doc={doc_id}"
 
@@ -495,14 +510,15 @@ def _stage_for(days: int) -> Optional[str]:
 
 
 async def send_expiry_reminders(db) -> int:
-    """Notify Founders about documents 30 days / 7 days from expiry and expired ones.
+    """Notify Founders, Admins and each document's owner about documents 30 days / 7 days from expiry
+    and expired ones.
     Each stage is sent at most once per expiry date. Returns notifications sent."""
     today = _today()
     horizon = (today + timedelta(days=EXPIRY_WINDOW_DAYS)).isoformat()
     sent = 0
     cursor = db.vault_documents.find(
         {"expires_on": {"$ne": None, "$lte": horizon}, "reminders_sent": {"$ne": "expired"}},
-        {"title": 1, "expires_on": 1, "reminders_sent": 1},
+        {"title": 1, "expires_on": 1, "reminders_sent": 1, "uploaded_by": 1},
     )
     async for doc in cursor:
         days = (date.fromisoformat(doc["expires_on"]) - today).days
@@ -525,7 +541,7 @@ async def send_expiry_reminders(db) -> int:
             title = "Document expiring soon"
             body = f"“{doc['title']}” expires on {exp} ({days} day{'s' if days != 1 else ''} left)."
             kind = "warning"
-        sent += await _notify_founders(db, title, body, _doc_link(doc["_id"]), kind=kind)
+        sent += await _notify_expiry(db, doc, title, body, kind)
     return sent
 
 
@@ -547,6 +563,18 @@ def _folder_out(f: dict, current: UserPublic, counts: Optional[dict] = None) -> 
             "created_at": f.get("created_at"), "created_by": f.get("created_by"),
             "access": _access_out(f), "access_legacy": "access_keys" not in f,
             "can_edit": _can_edit(f, "created_by", current)}
+
+
+FOLDER_TAKEN = "A folder with this name already exists"
+NAME_UNAVAILABLE = "This folder name is not available. Please choose another"
+
+
+def _folder_taken(current: UserPublic, conflict: Optional[dict] = None) -> HTTPException:
+    """409 for a duplicate folder name. Names are unique vault-wide, including folders the caller can't
+    see, so only people who can see the clashing folder (Founder/Admin see all) get the explicit message.
+    Today only Founder/Admin hold vault.manage, so they always get it; the neutral text is a safeguard."""
+    visible = _is_vault_admin(current) or (conflict is not None and _can_see_folder(conflict, current))
+    return HTTPException(409, FOLDER_TAKEN if visible else NAME_UNAVAILABLE)
 
 
 def _folder_name_clean(name: str) -> str:
@@ -580,13 +608,14 @@ async def create_folder(body: FolderIn, current: UserPublic = Depends(get_curren
     name = _folder_name_clean(body.name)
     access = await _clean_access(db, body.access)
     # Explicit check; the unique index from ensure_indexes() is the race-proof backstop.
-    if await db.vault_folders.find_one({"name_lower": name.lower()}, {"_id": 1}):
-        raise HTTPException(409, "A folder with this name already exists")
+    conflict = await db.vault_folders.find_one({"name_lower": name.lower()}, {"created_by": 1, "access_keys": 1})
+    if conflict:
+        raise _folder_taken(current, conflict)
     doc = {"name": name, "name_lower": name.lower(), "created_by": current.id, "created_at": utc_iso(), **access}
     try:
         res = await db.vault_folders.insert_one(doc)
     except DuplicateKeyError:
-        raise HTTPException(409, "A folder with this name already exists")
+        raise _folder_taken(current)
     doc["_id"] = res.inserted_id
     await log_activity(db, current, "Created vault folder", MODULE, target=name,
                        meta={"access": access["access"]["mode"]})
@@ -612,8 +641,10 @@ async def update_folder(folder_id: str, body: FolderPatch, current: UserPublic =
     old_name = folder["name"]
     if fields.get("name") is not None:
         name = _folder_name_clean(body.name)
-        if await db.vault_folders.find_one({"name_lower": name.lower(), "_id": {"$ne": folder["_id"]}}, {"_id": 1}):
-            raise HTTPException(409, "A folder with this name already exists")
+        conflict = await db.vault_folders.find_one({"name_lower": name.lower(), "_id": {"$ne": folder["_id"]}},
+                                                   {"created_by": 1, "access_keys": 1})
+        if conflict:
+            raise _folder_taken(current, conflict)
         if name != old_name:
             updates.update(name=name, name_lower=name.lower())
     if "access" in fields:
@@ -623,7 +654,7 @@ async def update_folder(folder_id: str, body: FolderPatch, current: UserPublic =
             folder = await db.vault_folders.find_one_and_update(
                 {"_id": folder["_id"]}, {"$set": updates}, return_document=ReturnDocument.AFTER)
         except DuplicateKeyError:
-            raise HTTPException(409, "A folder with this name already exists")
+            raise _folder_taken(current)
         if not folder:
             raise HTTPException(404, "Folder not found")
         if "name" in updates:

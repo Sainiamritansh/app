@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   Building2, Plus, Search, Loader2, Pencil, Trash2, Receipt, Mail, Phone, MapPin, User, Link2, IndianRupee,
-  Clock, AlertTriangle, Users, ArrowRight, History,
+  Clock, AlertTriangle, Users, ArrowRight, History, FileText, ArrowUp, ArrowDown, ArrowUpDown,
 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -12,6 +13,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription } from "@/components/ui/sheet";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
   AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -24,6 +26,7 @@ import {
   categoryLabel, BillStatus,
 } from "@/components/finance/financeShared";
 import { BillDialog, PayBillDialog } from "@/components/finance/BillsTab";
+import VendorStatementPanel from "@/components/finance/VendorStatement";
 
 const EMPTY = {
   name: "", contact_person: "", email: "", phone: "", tax_id: "", category: "other", address: "", notes: "",
@@ -233,58 +236,98 @@ function VendorDetail({ vendorId, version, onClose, canManage, vendors, onEdit, 
               )}
             </div>
 
-            <div>
-              <div className="flex items-center gap-2 mb-2">
-                <History className="h-4 w-4 text-muted-foreground" />
-                <div className="font-display text-[15px] font-semibold">Transaction history</div>
-              </div>
-              {v.history.length === 0 ? (
-                <div className="text-[13px] text-muted-foreground border border-dashed border-border rounded-lg p-6 text-center">No bills or payouts yet.</div>
-              ) : (
-                <div className="rounded-lg border border-border overflow-hidden">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead className={TH}>Date</TableHead>
-                        <TableHead className={TH}>Details</TableHead>
-                        <TableHead className={`${TH} text-right`}>Amount</TableHead>
-                        <TableHead className={TH}>Status</TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {v.history.map((h) => (
-                        <TableRow key={`${h.type}-${h.id}`} data-testid="finance-vendor-history-row">
-                          <TableCell className="whitespace-nowrap text-[12.5px]">{formatDate(h.date)}</TableCell>
-                          <TableCell className="text-[12.5px] min-w-[150px]">
-                            <div className="text-foreground">{h.description}</div>
-                            <div className="text-[11px] text-muted-foreground">
-                              {h.type === "payout" ? "Booking payout" : "Bill"}{h.reference ? ` · ${h.reference}` : ""}
-                              {h.due_date && h.status === "pending" ? ` · due ${formatDate(h.due_date)}` : ""}
-                            </div>
-                          </TableCell>
-                          <TableCell className="text-right whitespace-nowrap text-[12.5px] font-medium">{inr(h.amount)}</TableCell>
-                          <TableCell>
-                            <BillStatus status={h.status} overdue={h.overdue} />
-                            {canManage && h.type === "bill" && h.status === "pending" && (
-                              <button type="button" className="block text-[11px] text-success hover:underline mt-0.5"
-                                      onClick={() => setPaying({ id: h.id, vendor_name: v.name, total: h.amount, bill_number: h.reference, bill_date: h.date })}>
-                                Mark paid
-                              </button>
-                            )}
-                          </TableCell>
+            <Tabs defaultValue="history" className="w-full">
+              <TabsList className="mb-3">
+                <TabsTrigger value="history" data-testid="finance-vendor-tab-history"><History className="h-3.5 w-3.5 mr-1.5" />Transaction history</TabsTrigger>
+                <TabsTrigger value="statement" data-testid="finance-vendor-tab-statement"><FileText className="h-3.5 w-3.5 mr-1.5" />Statement</TabsTrigger>
+              </TabsList>
+              <TabsContent value="history" className="mt-0">
+                {v.history.length === 0 ? (
+                  <div className="text-[13px] text-muted-foreground border border-dashed border-border rounded-lg p-6 text-center">No bills or payouts yet.</div>
+                ) : (
+                  <div className="rounded-lg border border-border overflow-hidden">
+                    <Table>
+                      <TableHeader>
+                        <TableRow>
+                          <TableHead className={TH}>Date</TableHead>
+                          <TableHead className={TH}>Details</TableHead>
+                          <TableHead className={`${TH} text-right`}>Amount</TableHead>
+                          <TableHead className={TH}>Status</TableHead>
                         </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              )}
-            </div>
+                      </TableHeader>
+                      <TableBody>
+                        {v.history.map((h) => (
+                          <TableRow key={`${h.type}-${h.id}`} data-testid="finance-vendor-history-row">
+                            <TableCell className="whitespace-nowrap text-[12.5px]">{formatDate(h.date)}</TableCell>
+                            <TableCell className="text-[12.5px] min-w-[150px]">
+                              <div className="text-foreground">{h.description}</div>
+                              <div className="text-[11px] text-muted-foreground">
+                                {h.type === "payout" ? "Booking payout" : "Bill"}{h.reference ? ` · ${h.reference}` : ""}
+                                {h.due_date && h.status === "pending" ? ` · due ${formatDate(h.due_date)}` : ""}
+                              </div>
+                            </TableCell>
+                            <TableCell className="text-right whitespace-nowrap text-[12.5px] font-medium">{inr(h.amount)}</TableCell>
+                            <TableCell>
+                              <BillStatus status={h.status} overdue={h.overdue} />
+                              {canManage && h.type === "bill" && h.status === "pending" && (
+                                <button type="button" className="block text-[11px] text-success hover:underline mt-0.5"
+                                        onClick={() => setPaying({ id: h.id, vendor_name: v.name, total: h.amount, bill_number: h.reference, bill_date: h.date })}>
+                                  Mark paid
+                                </button>
+                              )}
+                            </TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                )}
+              </TabsContent>
+              <TabsContent value="statement" className="mt-0">
+                <VendorStatementPanel vendorId={v.id} version={version} />
+              </TabsContent>
+            </Tabs>
           </div>
         )}
         <BillDialog open={billOpen} onOpenChange={setBillOpen} defaultVendorId={v?.id} vendors={vendors} onDone={changed} />
         <PayBillDialog bill={paying} onClose={() => setPaying(null)} onDone={changed} />
       </SheetContent>
     </Sheet>
+  );
+}
+
+/* -------- Sortable list -------- */
+const SORT_VALUE = {
+  name: (v) => (v.name || "").toLowerCase(),
+  total_spent: (v) => v.total_spent || 0,
+  outstanding: (v) => v.outstanding || 0,
+  overdue: (v) => v.overdue || 0,
+  bills_count: (v) => v.bills_count || 0,
+  last_bill_date: (v) => v.last_bill_date || "",
+};
+
+function sortVendors(items, { key, dir }) {
+  const get = SORT_VALUE[key] || SORT_VALUE.name;
+  const sign = dir === "asc" ? 1 : -1;
+  return [...items].sort((a, b) => {
+    const x = get(a), y = get(b);
+    if (x < y) return -sign;
+    if (x > y) return sign;
+    return SORT_VALUE.name(a).localeCompare(SORT_VALUE.name(b));
+  });
+}
+
+function SortHead({ label, column, sort, onSort, right }) {
+  const active = sort.key === column;
+  const Icon = !active ? ArrowUpDown : sort.dir === "asc" ? ArrowUp : ArrowDown;
+  return (
+    <TableHead className={`${TH} ${right ? "text-right" : ""}`}
+               aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+      <button type="button" onClick={() => onSort(column)} data-testid={`finance-vendor-sort-${column}`}
+              className={`inline-flex items-center gap-1 uppercase tracking-[0.1em] hover:text-foreground ${active ? "text-foreground" : ""} ${right ? "flex-row-reverse" : ""}`}>
+        {label}<Icon className={`h-3 w-3 ${active ? "" : "opacity-40"}`} />
+      </button>
+    </TableHead>
   );
 }
 
@@ -295,7 +338,11 @@ export default function VendorsTab({ canManage, onViewBills }) {
   const [status, setStatus] = useState("");
   const [category, setCategory] = useState("");
   const [editing, setEditing] = useState(null); // null closed, {} new, vendor edit
-  const [detailId, setDetailId] = useState(null);
+  // The open vendor panel lives in the URL (?tab=vendors&vendor=<id>) so it can be deep-linked.
+  const [params, setParams] = useSearchParams();
+  const detailId = params.get("vendor");
+  const setDetailId = (id) => setParams((p) => { if (id) p.set("vendor", id); else p.delete("vendor"); return p; }, { replace: true });
+  const [sort, setSort] = useState({ key: "name", dir: "asc" });
   const [toDelete, setToDelete] = useState(null);
   const [deleting, setDeleting] = useState(false);
   const [version, setVersion] = useState(0);
@@ -316,6 +363,11 @@ export default function VendorsTab({ canManage, onViewBills }) {
       setToDelete(null); reloadAll();
     } catch (e) { toast.error(formatApiError(e)); } finally { setDeleting(false); }
   }
+
+  const onSort = (key) => setSort((s) => (s.key === key
+    ? { key, dir: s.dir === "asc" ? "desc" : "asc" }
+    : { key, dir: key === "name" ? "asc" : "desc" }));
+  const rows = useMemo(() => (data ? sortVendors(data.items, sort) : []), [data, sort]);
 
   const t = all.data?.totals;
   const filtered = Object.keys(filters).length > 0;
@@ -372,15 +424,18 @@ export default function VendorsTab({ canManage, onViewBills }) {
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead className={TH}>Vendor</TableHead>
+                  <SortHead label="Vendor" column="name" sort={sort} onSort={onSort} />
                   <TableHead className={TH}>Category</TableHead>
-                  <TableHead className={`${TH} text-right`}>Total spent</TableHead>
-                  <TableHead className={`${TH} text-right`}>Outstanding</TableHead>
+                  <SortHead label="Total spent" column="total_spent" sort={sort} onSort={onSort} right />
+                  <SortHead label="Outstanding" column="outstanding" sort={sort} onSort={onSort} right />
+                  <SortHead label="Overdue" column="overdue" sort={sort} onSort={onSort} right />
+                  <SortHead label="Bills" column="bills_count" sort={sort} onSort={onSort} right />
+                  <SortHead label="Last bill" column="last_bill_date" sort={sort} onSort={onSort} />
                   <TableHead className={TH}>Status</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {data.items.map((v) => (
+                {rows.map((v) => (
                   <TableRow key={v.id} className="hover:bg-muted/40 cursor-pointer" onClick={() => setDetailId(v.id)} data-testid="finance-vendor-row">
                     <TableCell className="min-w-[170px]">
                       <div className="font-medium text-foreground">{v.name}</div>
@@ -394,12 +449,17 @@ export default function VendorsTab({ canManage, onViewBills }) {
                     </TableCell>
                     <TableCell className="text-right whitespace-nowrap">
                       {inr(v.total_spent)}
-                      <div className="text-[11px] text-muted-foreground">{v.bills_count} bill(s){v.payouts_count ? ` · ${v.payouts_count} payout(s)` : ""}</div>
+                      {v.payouts_count > 0 && <div className="text-[11px] text-muted-foreground">incl. {v.payouts_count} payout(s)</div>}
                     </TableCell>
                     <TableCell className="text-right whitespace-nowrap font-medium">
                       {inr(v.outstanding)}
-                      {v.overdue > 0 && <div className="text-[11px] text-destructive font-normal">{inr(v.overdue)} overdue</div>}
+                      {v.pending_bills > 0 && <div className="text-[11px] text-muted-foreground font-normal">{v.pending_bills} pending bill(s)</div>}
                     </TableCell>
+                    <TableCell className={`text-right whitespace-nowrap ${v.overdue > 0 ? "text-destructive font-medium" : "text-muted-foreground"}`}>
+                      {inr(v.overdue)}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{(v.bills_count || 0).toLocaleString("en-IN")}</TableCell>
+                    <TableCell className="whitespace-nowrap text-[13px]">{formatDate(v.last_bill_date)}</TableCell>
                     <TableCell><StatusPill status={v.status} /></TableCell>
                   </TableRow>
                 ))}
@@ -413,7 +473,7 @@ export default function VendorsTab({ canManage, onViewBills }) {
                     onDone={reloadAll} />
       <VendorDetail vendorId={detailId} version={version} onClose={() => setDetailId(null)} canManage={canManage} vendors={all.data?.items}
                     onEdit={(v) => setEditing(v)} onDelete={(v) => setToDelete(v)} onChanged={reloadAll}
-                    onViewBills={(id) => { setDetailId(null); onViewBills?.(id); }} />
+                    onViewBills={(id) => onViewBills?.(id)} />
       <AlertDialog open={!!toDelete} onOpenChange={(o) => !o && !deleting && setToDelete(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>

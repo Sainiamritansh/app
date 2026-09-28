@@ -11,7 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, UserPlus, UserMinus, LogOut, Crown } from "lucide-react";
+import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, ShieldPlus, ShieldMinus, UserPlus, UserMinus, LogOut, Crown, Settings2 } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -118,6 +118,17 @@ export default function WavygoConnect() {
   const [addDepts, setAddDepts] = useState([]);
   const [membersOpen, setMembersOpen] = useState(false);
   const [members, setMembers] = useState([]);
+  // Channel whose members are shown / managed: the open channel, or (Founder/Admin) any row from
+  // "Manage channels", including channels they are not in. Membership only, never messages.
+  const [target, setTarget] = useState(null);
+  const [addExclude, setAddExclude] = useState(NO_IDS);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [manageRows, setManageRows] = useState([]);
+  const [manageQ, setManageQ] = useState("");
+  const [fromManage, setFromManage] = useState(false);  // reopen "Manage channels" when the members dialog closes
+  const [convertRow, setConvertRow] = useState(null);
+  const [convertDepts, setConvertDepts] = useState([]);
+  const targetIdRef = useRef(null);
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState(false);   // a create / add-members request is in flight
   const sendingRef = useRef(false);          // blocks double sends (Enter pressed twice)
@@ -185,15 +196,54 @@ export default function WavygoConnect() {
   async function loadMembers(id) {
     try {
       const { data } = await api.get(`/connect/channels/${id}/members`);
-      if (id === activeIdRef.current) setMembers(data || []);
+      if (id === targetIdRef.current) setMembers(data || []);
+    } catch (e) { toast.error(formatApiError(e)); }
+  }
+
+  async function loadManageRows() {
+    try {
+      const { data } = await api.get("/connect/manage/channels");
+      setManageRows(data || []);
     } catch (e) { toast.error(formatApiError(e)); }
   }
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { if (createOpen || addOpen) { loadUsers(); loadDepartments(); } }, [createOpen, addOpen]);
+  useEffect(() => { if (createOpen || addOpen || convertRow) { loadUsers(); loadDepartments(); } }, [createOpen, addOpen, convertRow]);
+
+  const targetId = target?.id || null;
+  useEffect(() => {
+    targetIdRef.current = targetId;
+    setMembers([]);
+    if (membersOpen && targetId) loadMembers(targetId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [membersOpen, targetId]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { setMembers([]); if (membersOpen && activeId) loadMembers(activeId); }, [membersOpen, activeId]);
+  useEffect(() => { if (manageOpen) { setManageQ(""); loadManageRows(); } }, [manageOpen]);
+
+  function openMembers(ch, viaManage = false) {
+    setTarget(ch); setFromManage(viaManage);
+    if (viaManage) setManageOpen(false);
+    setMembersOpen(true);
+  }
+  function onMembersOpenChange(open) {
+    setMembersOpen(open);
+    if (!open && fromManage) { setFromManage(false); setManageOpen(true); }
+  }
+  function onAddOpenChange(open) {
+    setAddOpen(open);
+    if (!open && fromManage) { setFromManage(false); setManageOpen(true); }
+  }
+  function openAdd(ch, exclude) {
+    setTarget(ch); setAddExclude(exclude || NO_IDS);
+    setAddSel([]); setAddDepts([]); setAddOpen(true);
+  }
+  // A membership change returns the updated channel: refresh the target and the lists that show it.
+  function afterMembershipChange(data) {
+    if (data) setTarget(t => (t && t.id === data.id ? { ...t, ...data } : t));
+    loadChannels(null, true);
+    if (fromManage || manageOpen) loadManageRows();
+  }
 
   function markRead(id) {
     api.post(`/connect/channels/${id}/read`).catch(() => { /* retried on the next change */ });
@@ -252,34 +302,62 @@ export default function WavygoConnect() {
   }
 
   async function addMembers() {
-    if (!activeId || (addSel.length === 0 && addDepts.length === 0) || busy) return;
+    if (!target || (addSel.length === 0 && addDepts.length === 0) || busy) return;
     setBusy(true);
     try {
-      const before = active?.members?.length || 0;
-      const { data } = await api.post(`/connect/channels/${activeId}/members`, { member_ids: addSel, departments: addDepts });
-      const n = (data.members?.length || 0) - before;
+      const before = target.member_count ?? target.members?.length ?? 0;
+      const { data } = await api.post(`/connect/channels/${target.id}/members`, { member_ids: addSel, departments: addDepts });
+      const n = (data.member_count ?? data.members?.length ?? 0) - before;
       toast.success(n > 0 ? `${n} member${n > 1 ? "s" : ""} added` : "Everyone selected is already a member");
-      setAddOpen(false); setAddSel([]); setAddDepts([]);
-      loadChannels();
-      if (membersOpen) loadMembers(activeId);
+      onAddOpenChange(false); setAddSel([]); setAddDepts([]);
+      afterMembershipChange(data);
+      if (membersOpen) loadMembers(target.id);
     } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
   }
 
   async function removeMember(member) {
-    if (!activeId || busy) return;
+    if (!target || busy) return;
     const leaving = member.id === user?.id;
-    if (!window.confirm(leaving ? `Leave ${active?.name}?` : `Remove ${member.name} from ${active?.name}?`)) return;
+    if (!window.confirm(leaving ? `Leave ${target.name}?` : `Remove ${member.name} from ${target.name}?`)) return;
     setBusy(true);
     try {
-      await api.delete(`/connect/channels/${activeId}/members/${member.id}`);
+      const { data } = await api.delete(`/connect/channels/${target.id}/members/${member.id}`);
       if (leaving) {
-        toast.success(`You left ${active?.name}`);
-        setMembersOpen(false); setActiveId(null);
-        loadChannels();
+        toast.success(`You left ${target.name}`);
+        onMembersOpenChange(false);
+        if (target.id === activeId) setActiveId(null);
+        afterMembershipChange(data);
       } else {
         toast.success(`${member.name} removed`);
-        loadMembers(activeId); loadChannels();
+        loadMembers(target.id); afterMembershipChange(data);
       }
+    } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
+  }
+
+  async function setAdmin(member, makeAdmin) {
+    if (!target || busy) return;
+    if (!makeAdmin && member.id === user?.id && !window.confirm(`Step down as admin of ${target.name}?`)) return;
+    setBusy(true);
+    try {
+      const url = `/connect/channels/${target.id}/admins/${member.id}`;
+      const { data } = makeAdmin ? await api.post(url) : await api.delete(url);
+      toast.success(makeAdmin ? `${member.name} is now an admin` : `${member.name} is no longer an admin`);
+      loadMembers(target.id); afterMembershipChange(data);
+    } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
+  }
+
+  function closeConvert() {
+    setConvertRow(null); setManageOpen(true);  // back to the list it was opened from
+  }
+
+  async function convertToMembersOnly() {
+    if (!convertRow || busy) return;
+    setBusy(true);
+    try {
+      await api.post(`/connect/channels/${convertRow.id}/members-only`, { departments: convertDepts });
+      toast.success(`${convertRow.name} is now members-only`);
+      closeConvert(); setConvertDepts([]);
+      loadChannels(null, true);  // reopening "Manage channels" reloads its rows
     } catch (e) { toast.error(formatApiError(e)); } finally { setBusy(false); }
   }
 
@@ -306,8 +384,20 @@ export default function WavygoConnect() {
   const canAddMembers = Boolean(active?.can_manage);
   const isPrivate = Boolean(active?.members_only) && active?.kind !== "dm" && active?.kind !== "announcement";
   const isOrgAdmin = user?.role === "Founder" || user?.role === "Admin";
-  const canLeave = isPrivate && (!active?.department || isOrgAdmin);
-  const canRemove = (m) => canAddMembers && m.id !== user?.id && (!m.is_creator || isOrgAdmin);
+  // Members dialog rules (mirror the API): target is the channel being managed.
+  const targetManage = Boolean(target?.can_manage);
+  const adminCount = members.filter(m => m.is_admin).length;
+  const canLeave = members.some(m => m.id === user?.id) && (!target?.department || isOrgAdmin);
+  const canRemove = (m) => targetManage && m.id !== user?.id && (!m.is_creator || isOrgAdmin);
+  const canPromote = (m) => targetManage && !m.is_admin && m.active !== false;
+  // never demote the last admin (department groups have none by default); creator only by Founder/Admin
+  const canDemote = (m) => targetManage && m.is_admin && (!m.is_creator || isOrgAdmin)
+    && (adminCount > 1 || Boolean(target?.department));
+
+  const manageList = useMemo(() => {
+    const t = manageQ.trim().toLowerCase();
+    return manageRows.filter(r => !t || [r.name, r.description, r.department, r.kind].some(v => (v || "").toLowerCase().includes(t)));
+  }, [manageRows, manageQ]);
 
   const grouped = useMemo(() => {
     const g = { announcement: [], channel: [], group: [], dm: [] };
@@ -414,6 +504,9 @@ export default function WavygoConnect() {
         description="Internal channels, announcements, groups and direct messages — all your team communication in one place."
         actions={
           <>
+            {isOrgAdmin && (
+              <Button variant="outline" onClick={() => setManageOpen(true)} data-testid="connect-manage-btn"><Settings2 className="h-4 w-4 mr-1.5" /> Manage channels</Button>
+            )}
             <Button variant="outline" onClick={() => setDmOpen(true)}><MessagesSquare className="h-4 w-4 mr-1.5" /> New DM</Button>
             {canCreateChannel && (
               <Button onClick={() => setCreateOpen(true)} data-testid="connect-create-btn"><Plus className="h-4 w-4 mr-1.5" /> New channel</Button>
@@ -508,12 +601,12 @@ export default function WavygoConnect() {
                       {active.description && <div className="text-[11.5px] text-muted-foreground">{active.description}</div>}
                     </div>
                     {isPrivate && (
-                      <Button variant="ghost" size="sm" onClick={() => setMembersOpen(true)} data-testid="connect-members-btn">
+                      <Button variant="ghost" size="sm" onClick={() => openMembers(active)} data-testid="connect-members-btn">
                         <Users2 className="h-4 w-4 mr-1.5" /> {active.member_count ?? active.members?.length ?? 0}
                       </Button>
                     )}
                     {canAddMembers && (
-                      <Button variant="outline" size="sm" onClick={() => { setAddSel([]); setAddDepts([]); setAddOpen(true); }} data-testid="connect-add-members-btn">
+                      <Button variant="outline" size="sm" onClick={() => openAdd(active, active.members)} data-testid="connect-add-members-btn">
                         <UserPlus className="h-4 w-4 mr-1.5" /> Add members
                       </Button>
                     )}
@@ -586,30 +679,31 @@ export default function WavygoConnect() {
       </Dialog>
 
       {/* Add group members dialog */}
-      <Dialog open={addOpen} onOpenChange={setAddOpen}>
+      <Dialog open={addOpen} onOpenChange={onAddOpenChange}>
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle className="font-display">Add members</DialogTitle>
-            <DialogDescription>{active ? `Add people to ${active.name}.` : ""}</DialogDescription>
+            <DialogDescription>{target ? `Add people to ${target.name}.` : ""}</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <DepartmentPicker departments={departments} selected={addDepts} onChange={setAddDepts} />
-            <MemberPicker users={users} selected={addSel} onChange={setAddSel} exclude={active?.members || NO_IDS} />
+            <MemberPicker users={users} selected={addSel} onChange={setAddSel} exclude={addExclude} />
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAddOpen(false)}>Cancel</Button>
+            <Button variant="outline" onClick={() => onAddOpenChange(false)}>Cancel</Button>
             <Button onClick={addMembers} disabled={(addSel.length === 0 && addDepts.length === 0) || busy} data-testid="connect-add-members-submit">Add</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
       {/* Channel members dialog */}
-      <Dialog open={membersOpen} onOpenChange={setMembersOpen}>
+      <Dialog open={membersOpen} onOpenChange={onMembersOpenChange}>
         <DialogContent className="max-w-md">
           <DialogHeader>
             <DialogTitle className="font-display">Members</DialogTitle>
             <DialogDescription>
-              {active ? `${members.length || active.member_count || 0} people can see and post in ${active.name}.` : ""}
+              {target ? `${members.length || target.member_count || 0} people can see and post in ${target.name}.` : ""}
+              {target && fromManage && !members.some(m => m.id === user?.id) && " You manage membership only; messages stay private to members."}
             </DialogDescription>
           </DialogHeader>
           <ul className="max-h-[360px] overflow-y-auto scrollbar-thin divide-y divide-border rounded-md border border-border" data-testid="connect-members-list">
@@ -628,6 +722,18 @@ export default function WavygoConnect() {
                   </div>
                   <div className="text-[11px] text-muted-foreground truncate">{m.designation || m.role}{m.department ? ` · ${m.department}` : ""}</div>
                 </div>
+                {canPromote(m) && (
+                  <Button variant="ghost" size="sm" className="h-7 px-2 text-muted-foreground hover:text-primary" disabled={busy}
+                          onClick={() => setAdmin(m, true)} aria-label={`Make ${m.name} an admin`} title="Make admin" data-testid="connect-promote-admin-btn">
+                    <ShieldPlus className="h-4 w-4" />
+                  </Button>
+                )}
+                {canDemote(m) && (
+                  <Button variant="ghost" size="sm" className="h-7 px-2 text-muted-foreground hover:text-amber-600" disabled={busy}
+                          onClick={() => setAdmin(m, false)} aria-label={`Remove ${m.name} as admin`} title="Remove as admin" data-testid="connect-demote-admin-btn">
+                    <ShieldMinus className="h-4 w-4" />
+                  </Button>
+                )}
                 {canRemove(m) && (
                   <Button variant="ghost" size="sm" className="h-7 px-2 text-muted-foreground hover:text-destructive" disabled={busy}
                           onClick={() => removeMember(m)} aria-label={`Remove ${m.name}`} data-testid="connect-remove-member-btn">
@@ -644,11 +750,82 @@ export default function WavygoConnect() {
                 <LogOut className="h-4 w-4 mr-1.5" /> Leave
               </Button>
             ) : <span />}
-            {canAddMembers && (
-              <Button onClick={() => { setMembersOpen(false); setAddSel([]); setAddDepts([]); setAddOpen(true); }}>
+            {targetManage && (
+              <Button onClick={() => { setMembersOpen(false); openAdd(target, members.map(m => m.id)); }}>
                 <UserPlus className="h-4 w-4 mr-1.5" /> Add members
               </Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Manage all channels (Founder / Admin): membership metadata only, no message content */}
+      <Dialog open={manageOpen} onOpenChange={setManageOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="font-display">Manage channels</DialogTitle>
+            <DialogDescription>Every channel and group, including ones you're not in. You can manage members and admins; messages stay visible to members only.</DialogDescription>
+          </DialogHeader>
+          <div className="relative">
+            <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
+            <Input placeholder="Search channels…" value={manageQ} onChange={(e) => setManageQ(e.target.value)} className="h-8 pl-8 text-[13px]" />
+          </div>
+          <ul className="max-h-[400px] overflow-y-auto scrollbar-thin divide-y divide-border rounded-md border border-border" data-testid="connect-manage-list">
+            {manageList.length === 0 ? (
+              <li className="text-center py-6 text-sm text-muted-foreground">No channels found.</li>
+            ) : manageList.map(r => {
+              const Icon = KIND_ICON[r.kind] || Hash;
+              return (
+                <li key={r.id} className="flex items-center gap-3 px-3 py-2">
+                  <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-medium truncate flex items-center gap-1.5">
+                      <span className="truncate">{r.name}</span>
+                      {r.kind === "announcement" ? (
+                        <Badge className="bg-info/10 text-info hover:bg-info/10 text-[9.5px] px-1.5 py-0 h-4 font-normal">Announcement</Badge>
+                      ) : r.members_only ? (
+                        <Badge variant="secondary" className="text-[9.5px] px-1.5 py-0 h-4 font-normal"><Lock className="h-2.5 w-2.5 mr-1" />{r.department ? "Department" : "Private"}</Badge>
+                      ) : (
+                        <Badge variant="outline" className="text-[9.5px] px-1.5 py-0 h-4 font-normal">Public</Badge>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-muted-foreground truncate">
+                      {r.kind === "announcement" ? "Everyone" : `${r.member_count} member${r.member_count === 1 ? "" : "s"}`}
+                      {r.is_member ? " · you're a member" : ""}
+                    </div>
+                  </div>
+                  {r.can_convert && (
+                    <Button variant="outline" size="sm" className="h-7 px-2 text-[12px]" disabled={busy}
+                            onClick={() => { setConvertDepts([]); setManageOpen(false); setConvertRow(r); }} data-testid="connect-convert-btn">
+                      <Lock className="h-3.5 w-3.5 mr-1" /> Make members-only
+                    </Button>
+                  )}
+                  {r.members_only && r.kind !== "announcement" && (
+                    <Button variant="ghost" size="sm" className="h-7 px-2 text-[12px]" onClick={() => openMembers(r, true)} data-testid="connect-manage-members-btn">
+                      <Users2 className="h-3.5 w-3.5 mr-1" /> Members
+                    </Button>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </DialogContent>
+      </Dialog>
+
+      {/* Convert a legacy public channel to members-only (Founder / Admin) */}
+      <Dialog open={Boolean(convertRow)} onOpenChange={(open) => { if (!open) closeConvert(); }}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="font-display">Make members-only</DialogTitle>
+            <DialogDescription>
+              {convertRow ? `${convertRow.name} will stop being visible to everyone. Its ${convertRow.member_count} current member${convertRow.member_count === 1 ? "" : "s"} and its creator keep access; the creator (or you, if it has none) becomes its admin.` : ""}
+            </DialogDescription>
+          </DialogHeader>
+          <DepartmentPicker departments={departments} selected={convertDepts} onChange={setConvertDepts} />
+          <p className="text-[11.5px] text-muted-foreground">Optionally add whole departments. People who aren't members lose access to the channel and its history.</p>
+          <DialogFooter>
+            <Button variant="outline" onClick={closeConvert}>Cancel</Button>
+            <Button onClick={convertToMembersOnly} disabled={busy} data-testid="connect-convert-submit"><Lock className="h-4 w-4 mr-1.5" /> Make members-only</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

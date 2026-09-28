@@ -19,7 +19,7 @@ B = {}  # booking key -> id
 @pytest.fixture(scope="module", autouse=True)
 def seed(test_db, users):
     for c in ("bookings", "vendors", "customers", "cities", "invoices", "payouts", "payout_items",
-              "finance_settings", "finance_counters"):
+              "finance_settings", "finance_counters", "finance_vendors", "vendor_bills"):
         test_db[c].delete_many({})
     test_db.cities.insert_one({"name": "Patna", "state": "Bihar", "status": "active"})
     va = str(test_db.vendors.insert_one({"name": "Vendor A", "city": "Patna"}).inserted_id)
@@ -246,3 +246,117 @@ def test_overview_and_audit(api, users, test_db):
     assert {"Generated invoice", "Voided invoice", "Marked invoice paid", "Created payout batch",
             "Marked vendor payout paid", "Updated finance settings", "Exported finance statement"} <= actions
     assert test_db.notifications.count_documents({"link": "/finance"}) >= 4
+
+
+# ------------------------------------------------------------------ vendor bills in statements, per-vendor statements
+
+V = {}  # finance vendor key -> id
+
+
+def _day(offset):
+    return (datetime.now(timezone(timedelta(hours=5, minutes=30))).date() + timedelta(days=offset)).isoformat()
+
+
+def _bill(api, users, vendor, bill_date, amount, gst=0, **extra):
+    r = F(api, users, "POST", "/bills", json={"vendor_id": V[vendor], "bill_date": bill_date, "description": "Service",
+                                              "amount": amount, "gst_amount": gst, **extra})
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _pay(api, users, bill, paid_on):
+    r = F(api, users, "POST", f"/bills/{bill['id']}/pay", json={"method": "bank_transfer", "paid_on": paid_on})
+    assert r.status_code == 200, r.text
+
+
+def test_vendor_bills_in_monthly_statement(api, users):
+    for key, body in {"ravi": {"name": "Ravi Motors", "category": "maintenance"},
+                      "cloud": {"name": "CloudHost", "category": "software"},
+                      "fleet": {"name": "Vendor A Fleet", "category": "fleet_partner",
+                                "marketplace_vendor_id": B["vendor_a"]}}.items():
+        r = F(api, users, "POST", "/vendors", json=body)
+        assert r.status_code == 201, r.text
+        V[key] = r.json()["id"]
+    V["june"] = _bill(api, users, "ravi", "2026-06-10", 1000, bill_number="RM-1")
+    _pay(api, users, V["june"], "2026-07-02")
+    V["july"] = _bill(api, users, "ravi", "2026-07-05", 2000, 360, bill_number="RM-2")
+    gone = _bill(api, users, "ravi", "2026-07-20", 500)
+    assert F(api, users, "POST", f"/bills/{gone['id']}/cancel", json={"reason": "Duplicate entry"}).status_code == 200
+    _pay(api, users, _bill(api, users, "cloud", "2026-07-15", 1000, 180), "2026-07-16")
+
+    st = F(api, users, "GET", "/statements", params={"month": "2026-07"}).json()
+    s = st["summary"]
+    assert s["gross_revenue"] == 4770                       # existing fields untouched
+    assert (s["bills_recorded"], s["bills_recorded_amount"]) == (2, 3540)   # cancelled excluded
+    assert (s["bills_paid"], s["bills_paid_amount"]) == (2, 2180)           # June bill paid in July counts
+    assert s["net_after_bills"] == round(s["platform_commission"] - 2180, 2)
+    by_vendor = {r["vendor_name"]: r for r in st["vendor_bills"]["by_vendor"]}
+    assert (by_vendor["Ravi Motors"]["recorded"], by_vendor["Ravi Motors"]["paid"],
+            by_vendor["Ravi Motors"]["pending"]) == (2360, 1000, 2360)
+    assert (by_vendor["CloudHost"]["recorded"], by_vendor["CloudHost"]["paid"]) == (1180, 1180)
+    by_cat = {r["category"]: r for r in st["vendor_bills"]["by_category"]}
+    assert set(by_cat) == {"maintenance", "software"} and by_cat["software"]["paid_count"] == 1
+    assert st["trailing_totals"]["bills_paid_amount"] == 2180
+    jun = F(api, users, "GET", "/statements", params={"month": "2026-06"}).json()["summary"]
+    assert (jun["bills_recorded"], jun["bills_recorded_amount"], jun["bills_paid"]) == (1, 1000, 0)
+
+    r = F(api, users, "GET", "/statements/export", params={"month": "2026-07"})
+    rows = list(csv.reader(io.StringIO(r.content.decode("utf-8-sig"))))
+    assert rows[0][0] == "Month" and "Net (commission - paid vendor bills)" in rows[0]
+    jul = next(x for x in rows if x[0] == "2026-07")
+    assert float(jul[1]) == 4770 and float(jul[rows[0].index("Vendor bills paid amount")]) == 2180
+    firsts = [x[0] for x in rows if x]
+    assert any(f.startswith("Vendor bills by vendor") for f in firsts) and "Ravi Motors" in firsts
+    assert "software" in firsts
+
+
+def test_vendor_statement(api, users):
+    st = F(api, users, "GET", f"/vendors/{V['ravi']}/statement", params={"month": "2026-07"}).json()
+    assert (st["from"], st["to"], st["label"]) == ("2026-07-01", "2026-07-31", "Jul 2026")
+    assert (st["opening_balance"], st["charges"], st["charges_count"]) == (1000, 2360, 1)
+    assert (st["payments"], st["payments_count"], st["closing_balance"]) == (1000, 1, 2360)
+    lines = [(ln["date"], ln["kind"], ln["balance"]) for ln in st["lines"]]
+    assert lines == [("2026-07-02", "bill_payment", 0), ("2026-07-05", "bill", 2360)]
+    assert st["vendor"]["name"] == "Ravi Motors" and st["company"]["company_name"]
+
+    wide = F(api, users, "GET", f"/vendors/{V['ravi']}/statement",
+             params={"from": "2026-06-01", "to": "2026-07-31"}).json()
+    assert (wide["opening_balance"], wide["charges"], wide["payments"], wide["closing_balance"]) == (0, 3360, 1000, 2360)
+    assert wide["label"] == "01 Jun 2026 to 31 Jul 2026" and len(wide["lines"]) == 3
+    assert F(api, users, "GET", f"/vendors/{V['ravi']}/statement", params={"month": "2026-06"}).json()["closing_balance"] == 1000
+
+    # Linked marketplace vendor: the paid booking payout (net 1416, period to 31 Jul, paid 5 Aug) is on its account
+    fl = F(api, users, "GET", f"/vendors/{V['fleet']}/statement", params={"month": "2026-08"}).json()
+    assert (fl["opening_balance"], fl["payments"], fl["closing_balance"]) == (1416, 1416, 0)
+    assert fl["lines"][0]["kind"] == "payout_payment"
+
+    for params in ({"from": "2026-07-01"}, {"from": "2026-07-31", "to": "2026-07-01"}, {"month": "2026-13"},
+                   {"from": "2026-02-30", "to": "2026-03-01"}):
+        assert F(api, users, "GET", f"/vendors/{V['ravi']}/statement", params=params).status_code == 400, params
+    assert F(api, users, "GET", f"/vendors/{ObjectId()}/statement").status_code == 404
+    for who in ("admin", "employee"):
+        assert F(api, users, "GET", f"/vendors/{V['ravi']}/statement", who=who).status_code == 403
+        assert F(api, users, "GET", f"/vendors/{V['ravi']}/statement/export", who=who).status_code == 403
+
+    r = F(api, users, "GET", f"/vendors/{V['ravi']}/statement/export", params={"month": "2026-07"})
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/csv")
+    assert "ravi-motors" in r.headers["content-disposition"]
+    rows = list(csv.reader(io.StringIO(r.content.decode("utf-8-sig"))))
+    assert rows[0] == ["Date", "Type", "Reference", "Description", "Charges", "Payments", "Balance"]
+    assert rows[1][1] == "Opening balance" and float(rows[1][6]) == 1000
+    assert [x[1] for x in rows[2:4]] == ["Bill payment", "Bill"]
+    assert rows[-1][1] == "Closing balance" and float(rows[-1][6]) == 2360 and len(rows) == 5
+
+
+def test_overview_top_vendors(api, users, test_db):
+    _pay(api, users, _bill(api, users, "cloud", _day(-10), 5000), _day(-1))
+    _bill(api, users, "ravi", _day(-20), 300)
+    o = F(api, users, "GET", "/overview").json()
+    top = o["top_vendors"]
+    assert top["days"] == 90 and top["since"] == _day(-89) and len(top["items"]) <= 5
+    first = top["items"][0]
+    assert (first["vendor_id"], first["name"]) == (V["cloud"], "CloudHost") and first["spent"] >= 5000
+    ravi = next(i for i in top["items"] if i["vendor_id"] == V["ravi"])
+    assert ravi["billed"] >= 300 and ravi["bills_outstanding"] == 2660
+    assert "net_mtd" in o["cards"] and "bills_paid_mtd" in o["cards"]
+    assert "Exported vendor statement" in {a["action"] for a in test_db.activity_logs.find({"module": "Finance"})}

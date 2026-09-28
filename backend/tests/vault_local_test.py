@@ -416,8 +416,11 @@ def test_expiry_reminders_sent_once(api, users, test_db):
     dx = _ok_upload(api, users, name="permit.pdf", title="Road permit", expires_on=_day(-1))
     far = _ok_upload(api, users, name="deed.pdf", title="Deed", expires_on=_day(90))
 
+    # Every active Founder and Admin is reminded (the owner is the Founder here, so no duplicate).
+    recipients = test_db.users.count_documents({"role": {"$in": ["Founder", "Admin"]},
+                                                "status": {"$ne": "deactivated"}, "is_active": {"$ne": False}})
     r = call(api, f, "POST", "/vault/reminders/run")
-    assert r.status_code == 200 and r.json()["sent"] == 3
+    assert r.status_code == 200 and r.json()["sent"] == 3 * recipients
 
     def notes(doc):
         return list(test_db.notifications.find({"user_id": f["id"], "link": f"/company-vault?doc={doc['id']}"}))
@@ -426,6 +429,9 @@ def test_expiry_reminders_sent_once(api, users, test_db):
     assert len(notes(d7)) == 1
     assert len(notes(dx)) == 1 and notes(dx)[0]["title"] == "Document expired"
     assert notes(far) == []
+    admin_notes = list(test_db.notifications.find({"user_id": users["admin"]["id"],
+                                                   "link": f"/company-vault?doc={dx['id']}"}))
+    assert len(admin_notes) == 1
     assert set(test_db.vault_documents.find_one({"_id": ObjectId(d7["id"])})["reminders_sent"]) == {"30d", "7d"}
 
     # Idempotent: nothing new on a second run.
@@ -433,10 +439,41 @@ def test_expiry_reminders_sent_once(api, users, test_db):
 
     # Crossing into the 7-day window sends the next stage once.
     test_db.vault_documents.update_one({"_id": ObjectId(d30["id"])}, {"$set": {"expires_on": _day(7)}})
-    assert call(api, f, "POST", "/vault/reminders/run").json()["sent"] == 1
+    assert call(api, f, "POST", "/vault/reminders/run").json()["sent"] == recipients
     assert len(notes(d30)) == 2
 
     # Changing the expiry through the API resets the reminders.
     call(api, f, "PATCH", f"/vault/documents/{d7['id']}", json={"expires_on": _day(20)})
-    assert call(api, f, "POST", "/vault/reminders/run").json()["sent"] == 1
+    assert call(api, f, "POST", "/vault/reminders/run").json()["sent"] == recipients
     assert len(notes(d7)) == 2
+
+
+def test_expiry_reminder_reaches_owner_once(api, users, test_db):
+    f, mgr = users["founder"], users["manager"]
+    test_db.vault_documents.update_many({}, {"$set": {"reminders_sent": ["30d", "7d", "expired"]}})
+    doc = _ok_upload(api, users, name="owned.pdf", title="Owned by manager", expires_on=_day(3))
+    # e.g. uploaded while the owner still held vault.manage; ownership keeps them in the loop
+    test_db.vault_documents.update_one({"_id": ObjectId(doc["id"])}, {"$set": {"uploaded_by": mgr["id"]}})
+    link = f"/company-vault?doc={doc['id']}"
+    call(api, f, "POST", "/vault/reminders/run")
+    owner_notes = list(test_db.notifications.find({"user_id": mgr["id"], "link": link}))
+    assert len(owner_notes) == 1 and owner_notes[0]["title"] == "Document expiring soon"
+    assert test_db.notifications.count_documents({"user_id": f["id"], "link": link}) == 1
+    # other non-admins are not reminded; a second run sends nothing (dedupe)
+    assert test_db.notifications.count_documents({"user_id": users["employee"]["id"], "link": link}) == 0
+    assert call(api, f, "POST", "/vault/reminders/run").json()["sent"] == 0
+    assert test_db.notifications.count_documents({"user_id": mgr["id"], "link": link}) == 1
+
+
+def test_duplicate_folder_name_message(api, users):
+    a = users["admin"]
+    name = _uname("Board")
+    r = call(api, users["founder"], "POST", "/vault/folders",
+             json={"name": name, "access": _access(user_ids=[users["founder"]["id"]])})
+    assert r.status_code == 201, r.text
+    # Founder/Admin see every folder, so they get the explicit duplicate message
+    r = call(api, a, "POST", "/vault/folders", json={"name": name.upper()})
+    assert r.status_code == 409 and r.json()["detail"] == "A folder with this name already exists"
+    # people without vault.manage are refused before any name check, so nothing leaks
+    r = call(api, users["manager"], "POST", "/vault/folders", json={"name": name})
+    assert r.status_code == 403 and "already exists" not in r.text

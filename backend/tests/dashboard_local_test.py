@@ -156,6 +156,7 @@ def test_tasks_are_due_today_or_overdue(api, users, test_db):
         ("Overdue", (today - timedelta(days=2)).isoformat(), "low", "todo"),
         ("Due today", today.isoformat(), "urgent", "in_progress"),
         ("Due tomorrow", (today + timedelta(days=1)).isoformat(), "urgent", "todo"),
+        ("Review overdue", (today - timedelta(days=1)).isoformat(), "medium", "review"),
         ("Done", today.isoformat(), "high", "completed"),
         ("Undated", None, "high", "todo"),
     ]
@@ -163,12 +164,15 @@ def test_tasks_are_due_today_or_overdue(api, users, test_db):
         test_db.tasks.insert_one({"title": title, "due_date": due, "priority": prio, "status": status,
                                   "assignee_id": users["employee"]["id"]})
     data = _stats(api, users["founder"])
-    assert [t["title"] for t in data["tasks_today"]] == ["Due today", "Overdue"]
-    assert [t["overdue"] for t in data["tasks_today"]] == [False, True]
-    assert data["tasks_due_count"] == 2
+    assert [t["title"] for t in data["tasks_today"]] == ["Due today", "Review overdue", "Overdue"]
+    assert [t["overdue"] for t in data["tasks_today"]] == [False, True, True]
+    assert data["tasks_due_count"] == 3
     assert data["tasks_today"][0]["assignee_name"] == "Test Employee"
     ops = {s["label"]: s for s in data["company_health"]["signals"]}["Operations"]
-    assert ops["value"] == 75  # 3 of 4 open tasks are not overdue
+    assert ops["value"] == 60  # 3 of 5 open tasks (review counts as open) are not overdue
+    # Team KPIs (roles without Marketplace): the overdue review task counts as overdue.
+    kpis = _kpis(_stats(api, users["manager"]))
+    assert kpis["overdue_tasks"]["value"] == 2 and kpis["open_tasks"]["value"] == 5
 
 
 def test_manager_sees_only_department_tasks_and_opportunities(api, users, test_db):
@@ -285,6 +289,36 @@ def test_activity_module_filter(api, users, test_db):
     rows = call(api, users["founder"], "GET", "/activity", params={"module": "Task Board"}).json()
     assert rows and {r["module"] for r in rows} == {"Task Board"}
     assert call(api, users["employee"], "GET", "/activity/modules").status_code == 403
+
+
+def test_activity_cursor_pagination(api, users, test_db):
+    founder = users["founder"]
+    # Five rows sharing one timestamp plus two later ones: the cursor must not skip ties.
+    rows = [{"user_id": founder["id"], "action": f"Paged {i}", "module": "Paging",
+             "created_at": "2032-01-01T00:00:00+00:00" if i < 5 else f"2032-01-01T00:00:0{i}+00:00"} for i in range(7)]
+    test_db.activity_logs.insert_many(rows)
+
+    # The bare-list shape stays for existing callers (Dashboard).
+    assert isinstance(call(api, founder, "GET", "/activity", params={"limit": 2}).json(), list)
+
+    seen, cursor, pages = [], None, 0
+    while True:
+        params = {"limit": 3, "paged": True, "module": "Paging", **({"before": cursor} if cursor else {})}
+        body = call(api, founder, "GET", "/activity", params=params).json()
+        seen += [r["action"] for r in body["items"]]
+        pages += 1
+        if not body["has_more"]:
+            assert body["next_cursor"] is None
+            break
+        cursor = body["next_cursor"]
+    assert pages == 3
+    assert len(seen) == 7 and len(set(seen)) == 7
+    assert seen[:2] == ["Paged 6", "Paged 5"]
+
+    # A bare created_at is accepted as a cursor too.
+    body = call(api, founder, "GET", "/activity",
+                params={"paged": True, "module": "Paging", "before": "2032-01-01T00:00:05+00:00"}).json()
+    assert len(body["items"]) == 5 and body["has_more"] is False
 
 
 # ------------------------- recent notifications -------------------------

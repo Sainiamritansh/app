@@ -25,9 +25,11 @@ export default function Finance() {
   const { can } = usePermission();
   const [params, setParams] = useSearchParams();
   const tab = TABS.some((t) => t.value === params.get("tab")) ? params.get("tab") : "overview";
-  const setTab = (v) => setParams((p) => { p.set("tab", v); return p; }, { replace: true });
+  // `vendor` is per-tab state (bills filter / open vendor panel), so switching tabs clears it.
+  const setTab = (v) => setParams((p) => { p.set("tab", v); p.delete("vendor"); return p; }, { replace: true });
   const canManage = can("finance.manage");
   const viewVendorBills = (vendorId) => setParams((p) => { p.set("tab", "bills"); p.set("vendor", vendorId); return p; }, { replace: true });
+  const openVendor = (vendorId) => setParams((p) => { p.set("tab", "vendors"); p.set("vendor", vendorId); return p; });
 
   if (!can("finance.view")) {
     return (
@@ -52,12 +54,12 @@ export default function Finance() {
             <TabsTrigger key={t.value} value={t.value} data-testid={`finance-tab-${t.value}`}>{t.label}</TabsTrigger>
           ))}
         </TabsList>
-        <TabsContent value="overview" className="mt-6"><FinanceOverview onNavigate={setTab} /></TabsContent>
+        <TabsContent value="overview" className="mt-6"><FinanceOverview onNavigate={setTab} onOpenVendor={openVendor} /></TabsContent>
         <TabsContent value="invoices" className="mt-6"><InvoicesTab canManage={canManage} /></TabsContent>
         <TabsContent value="payouts" className="mt-6"><PayoutsTab canManage={canManage} /></TabsContent>
         <TabsContent value="vendors" className="mt-6"><VendorsTab canManage={canManage} onViewBills={viewVendorBills} /></TabsContent>
         <TabsContent value="bills" className="mt-6"><BillsTab canManage={canManage} /></TabsContent>
-        <TabsContent value="statements" className="mt-6"><StatementsTab /></TabsContent>
+        <TabsContent value="statements" className="mt-6"><StatementsTab onOpenVendor={openVendor} /></TabsContent>
         <TabsContent value="settings" className="mt-6"><FinanceSettingsTab canManage={canManage} /></TabsContent>
       </Tabs>
     </div>

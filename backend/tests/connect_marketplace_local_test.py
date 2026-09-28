@@ -224,6 +224,133 @@ def test_department_group_membership_rules(api, users, test_db):
     assert call(api, users["founder"], "DELETE", f"{path}/{users['employee2']['id']}").status_code == 200
 
 
+# ------------------------- Connect: admins, conversion, manage-all -------------------------
+
+def test_promote_and_demote_admins(api, users, test_db):
+    mgr, emp, emp2 = users["manager"], users["employee"], users["employee2"]
+    ch = _channel(api, mgr, kind="group", members=[emp["id"], emp2["id"]])
+    base = f"/connect/channels/{ch['id']}/admins"
+    # plain members cannot promote; non-members cannot be promoted
+    assert call(api, emp, "POST", f"{base}/{emp2['id']}").status_code == 403
+    assert call(api, mgr, "POST", f"{base}/{users['intern']['id']}").status_code == 404
+    # creator promotes a member -> they can now manage, and are notified
+    r = call(api, mgr, "POST", f"{base}/{emp['id']}")
+    assert r.status_code == 200, r.text
+    assert r.json()["admins"] == [mgr["id"], emp["id"]]
+    assert _listed(api, emp, ch["id"])["can_manage"] is True
+    assert test_db.notifications.find_one({"user_id": emp["id"], "title": "You're now an admin"})
+    assert test_db.activity_logs.find_one({"action": "Promoted channel admin", "target": ch["name"]})
+    members = call(api, emp2, "GET", f"/connect/channels/{ch['id']}/members").json()
+    assert {m["id"] for m in members if m["is_admin"]} == {mgr["id"], emp["id"]}
+    # promoting twice is a no-op
+    assert call(api, mgr, "POST", f"{base}/{emp['id']}").json()["admins"] == [mgr["id"], emp["id"]]
+    # a promoted admin cannot demote the creator; Founder/Admin can
+    assert call(api, emp, "DELETE", f"{base}/{mgr['id']}").status_code == 403
+    assert call(api, emp, "DELETE", f"{base}/{emp2['id']}").status_code == 404  # not an admin
+    r = call(api, users["admin"], "DELETE", f"{base}/{mgr['id']}")
+    assert r.status_code == 200 and r.json()["admins"] == [emp["id"]]
+    # the creator is still a member but no longer manages the group
+    assert _listed(api, mgr, ch["id"])["can_manage"] is False
+    # never zero admins: the last admin cannot step down, even via Founder
+    assert call(api, emp, "DELETE", f"{base}/{emp['id']}").status_code == 400
+    assert call(api, users["founder"], "DELETE", f"{base}/{emp['id']}").status_code == 400
+    # an admin can demote themselves once someone else is admin
+    assert call(api, emp, "POST", f"{base}/{emp2['id']}").status_code == 200
+    r = call(api, emp, "DELETE", f"{base}/{emp['id']}")
+    assert r.status_code == 200 and r.json()["admins"] == [emp2["id"]]
+    # not for public channels
+    legacy = _legacy_channel(test_db, users["founder"])
+    r = call(api, users["founder"], "POST", f"/connect/channels/{legacy}/admins/{users['founder']['id']}")
+    assert r.status_code == 400
+
+
+def test_promote_in_legacy_admin_less_doc(api, users, test_db):
+    """Groups stored before `admins` existed fall back to the creator; promoting keeps the creator."""
+    mgr, emp = users["manager"], users["employee"]
+    gid = str(test_db.channels.insert_one({
+        "name": f"old-{_uid()}", "kind": "group", "members": [mgr["id"], emp["id"]], "created_by": mgr["id"],
+        "created_at": "2025-01-01T00:00:00+00:00", "last_message_at": "2025-01-01T00:00:00+00:00",
+    }).inserted_id)
+    r = call(api, mgr, "POST", f"/connect/channels/{gid}/admins/{emp['id']}")
+    assert r.status_code == 200 and r.json()["admins"] == [mgr["id"], emp["id"]]
+
+
+def test_convert_legacy_channel_to_members_only(api, users, test_db):
+    f, emp2, intern = users["founder"], users["employee2"], users["intern"]
+    cid = str(test_db.channels.insert_one({
+        "name": f"legacy-{_uid()}", "kind": "channel", "description": None, "members": [emp2["id"]],
+        "created_by": users["manager"]["id"], "created_at": "2025-01-01T00:00:00+00:00",
+        "last_message_at": "2025-01-01T00:00:00+00:00",
+    }).inserted_id)
+    path = f"/connect/channels/{cid}/members-only"
+    # only Founder/Admin
+    assert call(api, users["manager"], "POST", path).status_code == 403
+    assert call(api, users["employee"], "POST", path).status_code == 403
+    assert call(api, f, "POST", path, json={"departments": ["No Such Dept"]}).status_code == 422
+    r = call(api, f, "POST", path, json={"departments": ["Sales"]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["members_only"] is True and out["admins"] == [users["manager"]["id"]]
+    assert out["members"][0] == users["manager"]["id"] and emp2["id"] in out["members"]
+    assert f["id"] not in out["members"]  # converting doesn't make the Founder a member
+    # outsiders lose access; members keep it
+    assert _listed(api, intern, cid) is None
+    assert call(api, intern, "POST", f"/connect/channels/{cid}/join").status_code == 403
+    assert call(api, intern, "GET", f"/connect/channels/{cid}/messages").status_code == 403
+    _post(api, emp2, cid, "still here")
+    assert _listed(api, users["manager"], cid)["can_manage"] is True
+    assert test_db.activity_logs.find_one({"action": "Made channel members-only"})
+    # already members-only / wrong kinds / unknown
+    assert call(api, f, "POST", path).status_code == 400
+    ann = _channel(api, f, kind="announcement")
+    assert call(api, users["admin"], "POST", f"/connect/channels/{ann['id']}/members-only").status_code == 400
+    assert call(api, f, "POST", f"/connect/channels/{ObjectId()}/members-only").status_code == 404
+
+
+def test_convert_system_channel_makes_converter_admin(api, users, test_db):
+    cid = str(test_db.channels.insert_one({
+        "name": f"general-{_uid()}", "kind": "channel", "members": [users["employee"]["id"]],
+        "created_by": "system", "created_at": "2025-01-01T00:00:00+00:00",
+        "last_message_at": "2025-01-01T00:00:00+00:00",
+    }).inserted_id)
+    r = call(api, users["admin"], "POST", f"/connect/channels/{cid}/members-only")
+    assert r.status_code == 200, r.text
+    assert r.json()["admins"] == [users["admin"]["id"]]
+    assert set(r.json()["members"]) == {users["employee"]["id"], users["admin"]["id"]}
+
+
+def test_manage_all_channels_is_metadata_only(api, users, test_db):
+    f = users["founder"]
+    ch = _channel(api, users["manager"], kind="group", members=[users["employee"]["id"]])
+    _post(api, users["employee"], ch["id"], "secret plans")
+    legacy = _legacy_channel(test_db, users["manager"])
+    dm = call(api, users["manager"], "POST", f"/connect/dm/{users['employee']['id']}").json()
+    for role in ("manager", "employee", "intern"):
+        assert call(api, users[role], "GET", "/connect/manage/channels").status_code == 403
+    r = call(api, f, "GET", "/connect/manage/channels")
+    assert r.status_code == 200, r.text
+    rows = {c["id"]: c for c in r.json()}
+    assert dm["id"] not in rows
+    row = rows[ch["id"]]
+    assert row["is_member"] is False and row["can_manage"] is True and row["member_count"] == 2
+    assert row["admins"] == [users["manager"]["id"]] and row["can_convert"] is False
+    assert rows[legacy]["can_convert"] is True and rows[legacy]["members_only"] is False
+    assert "secret plans" not in r.text and "last_body" not in row and "members" not in row
+    # Founder can see the member list and change admins without being a member...
+    members = call(api, f, "GET", f"/connect/channels/{ch['id']}/members")
+    assert members.status_code == 200
+    assert {m["id"] for m in members.json()} == {users["manager"]["id"], users["employee"]["id"]}
+    r = call(api, f, "POST", f"/connect/channels/{ch['id']}/admins/{users['employee']['id']}")
+    assert r.status_code == 200 and r.json()["can_manage"] is True
+    assert "secret plans" not in r.text and "last_body" not in r.json()  # no preview for non-members
+    # ...but still cannot read, post or mark read
+    assert call(api, f, "GET", f"/connect/channels/{ch['id']}/messages").status_code == 403
+    assert call(api, f, "POST", f"/connect/channels/{ch['id']}/messages", json={"body": "hi"}).status_code == 403
+    assert call(api, f, "POST", f"/connect/channels/{ch['id']}/read").status_code == 403
+    # outsiders still can't list members
+    assert call(api, users["intern"], "GET", f"/connect/channels/{ch['id']}/members").status_code == 403
+
+
 # ------------------------- Connect: unread -------------------------
 
 def test_unread_counts_and_read_cursor(api, users):
