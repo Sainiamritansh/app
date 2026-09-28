@@ -1,5 +1,6 @@
 """Calendar events: CRUD plus the retrieval views the Calendar module needs —
-single event, date range, month, week, day, agenda and participant filtering.
+single event, date range, month, week, day, agenda, participant filtering,
+search, RSVP and participant availability (free/busy).
 
 Storage: `calendar_events`, with start_time / end_time stored as BSON datetimes
 (UTC) so range queries compare instants, not strings. Every list is sorted by
@@ -27,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from db import get_db
 from auth_utils import get_current_user
 from models import UserPublic
-from models_part2 import CalendarEventIn, CalendarEventPatch, EventCategory
+from models_part2 import CalendarEventIn, CalendarEventPatch, CalendarRsvpIn, EventCategory
 from hub_utils import serialize, utc_iso, log_activity, notify
 from permissions import can
 
@@ -46,7 +47,10 @@ WEEK_START = {"monday": 0, "sunday": 6}
 REMINDER_INTERVAL_SECONDS = float(os.environ.get("CALENDAR_REMINDER_INTERVAL_SECONDS", "60"))
 # Zero-length events (reminders, deadlines) still get their reminder shortly after start.
 REMINDER_GRACE = timedelta(minutes=10)
-INTERNAL_FIELDS = ("reminder_at", "reminder_sent")
+INTERNAL_FIELDS = ("reminder_at", "reminder_sent", "responses")
+MAX_SEARCH_LENGTH = 100
+MAX_AVAILABILITY_USERS = 50
+MAX_AVAILABILITY_DAYS = 31
 
 
 # ------------------------- time helpers -------------------------
@@ -145,6 +149,9 @@ def _build_query(current: UserPublic, start: datetime, end: datetime, filters: "
     organizer_id = _resolve_user_id(filters.organizer_id, current, "organizer_id")
     if organizer_id:
         clauses.append({"organizer_id": organizer_id})
+    if filters.q:
+        pattern = {"$regex": re.escape(filters.q), "$options": "i"}
+        clauses.append({"$or": [{"title": pattern}, {"location": pattern}, {"description": pattern}]})
     if not filters.include_cancelled:
         clauses.append({"status": {"$ne": "cancelled"}})
     return {"$and": clauses}
@@ -159,12 +166,15 @@ class EventFilters:
         participant_id: Optional[str] = Query(None, description="User id or 'me'. Matches organiser or participant."),
         organizer_id: Optional[str] = Query(None, description="User id or 'me'."),
         include_cancelled: bool = False,
+        q: Optional[str] = Query(None, max_length=MAX_SEARCH_LENGTH,
+                                 description="Case-insensitive search in title, location and description."),
         tz: str = Query(DEFAULT_TZ, description="IANA timezone used to interpret dates and day boundaries."),
     ):
         self.category = category
         self.participant_id = participant_id
         self.organizer_id = organizer_id
         self.include_cancelled = include_cancelled
+        self.q = (q or "").strip() or None
         self.zone = _zone(tz)
 
 
@@ -200,8 +210,12 @@ async def _serialize_events(db, docs: list[dict]) -> list[dict]:
         event["end_time"] = _as_utc(d["end_time"]).isoformat()
         organizer = users.get(d.get("organizer_id"))
         event["organizer_name"] = organizer["name"] if organizer else None
+        responses = d.get("responses") or {}
         event["participants"] = [
-            {"id": pid, "name": users[pid]["name"], "photo": users[pid].get("photo"), "role": users[pid].get("role")}
+            {
+                "id": pid, "name": users[pid]["name"], "photo": users[pid].get("photo"), "role": users[pid].get("role"),
+                "response": responses.get(pid, "pending"),
+            }
             for pid in d.get("participant_ids", [])
             if pid in users
         ]
@@ -422,6 +436,15 @@ async def update_event(event_id: str, payload: CalendarEventPatch, current: User
             raise HTTPException(422, "department is required for department-visible events")
     if "participant_ids" in updates:
         await _validate_participants(db, updates["participant_ids"])
+    rescheduled = start != _as_utc(existing["start_time"]) or end != _as_utc(existing["end_time"])
+    responses = existing.get("responses") or {}
+    if rescheduled and responses:
+        # A new time needs fresh answers: people who accepted the old slot may not be free.
+        updates["responses"] = {}
+    elif "participant_ids" in updates and responses:
+        kept = {uid: r for uid, r in responses.items() if uid in updates["participant_ids"]}
+        if kept != responses:
+            updates["responses"] = kept
     if "start_time" in updates or "reminder_minutes" in updates:
         minutes = updates["reminder_minutes"] if "reminder_minutes" in updates else existing.get("reminder_minutes")
         # The edit form always resends start_time and reminder_minutes; only re-arm the reminder when
@@ -441,10 +464,36 @@ async def update_event(event_id: str, payload: CalendarEventPatch, current: User
     await _notify_many(db, added, "Event invitation",
                        f"{current.name} invited you to {doc['title']} on {_when(doc['start_time'])}",
                        link=_event_link(doc))
+    others = [p for p in doc.get("participant_ids", []) if p != current.id and p not in added]
     if updates.get("status") == "cancelled" and existing.get("status") != "cancelled":
-        await _notify_many(db, [p for p in doc.get("participant_ids", []) if p != current.id and p not in added],
-                           "Event cancelled", f"{current.name} cancelled {doc['title']}",
+        await _notify_many(db, others, "Event cancelled", f"{current.name} cancelled {doc['title']}",
                            link=_event_link(doc))
+    elif rescheduled and doc.get("status") != "cancelled":
+        await _notify_many(db, others, "Event rescheduled",
+                           f"{current.name} moved {doc['title']} to {_when(doc['start_time'])}",
+                           link=_event_link(doc))
+    return (await _serialize_events(db, [doc]))[0]
+
+
+@router.post("/events/{event_id}/rsvp")
+async def rsvp_event(event_id: str, payload: CalendarRsvpIn, current: UserPublic = Depends(get_current_user)):
+    """An invited participant accepts, declines or tentatively accepts; the organiser is told."""
+    db = get_db()
+    _id = _event_oid(event_id)
+    existing = await db.calendar_events.find_one({"_id": _id})
+    if not existing or current.id not in existing.get("participant_ids", []):
+        # Same response as an unknown id, so invitations cannot be probed.
+        raise HTTPException(404, "Event not found")
+    if existing.get("status") == "cancelled":
+        raise HTTPException(409, "This event was cancelled")
+    previous = (existing.get("responses") or {}).get(current.id)
+    await db.calendar_events.update_one({"_id": _id}, {"$set": {f"responses.{current.id}": payload.response}})
+    doc = await db.calendar_events.find_one({"_id": _id})
+    organizer = existing.get("organizer_id")
+    if previous != payload.response and organizer and organizer != current.id:
+        verb = {"accepted": "accepted", "declined": "declined", "tentative": "might attend"}[payload.response]
+        await notify(db, organizer, "Event response", f"{current.name} {verb} {doc['title']}",
+                     kind="info", link=_event_link(doc))
     return (await _serialize_events(db, [doc]))[0]
 
 
@@ -483,6 +532,71 @@ async def list_invitees(current: UserPublic = Depends(get_current_user)):
         }
         for d in docs
     ]
+
+
+@router.get("/availability")
+async def availability(
+    user_ids: str = Query(..., description="Comma-separated user ids ('me' allowed)."),
+    start: str = Query(..., description="Range start: YYYY-MM-DD or ISO 8601 datetime."),
+    end: str = Query(..., description="Range end: YYYY-MM-DD or ISO 8601 datetime (exclusive)."),
+    exclude_event_id: Optional[str] = Query(None, description="Ignore this event, e.g. the one being edited."),
+    tz: str = Query(DEFAULT_TZ),
+    current: UserPublic = Depends(get_current_user),
+):
+    """Free/busy for the given people: timed events they organise or were invited to
+    (and did not decline). Titles are shown only for events the caller can see;
+    anything else is reported as a plain "Busy" block."""
+    zone = _zone(tz)
+    range_start = _parse_instant(start, zone, "start")
+    range_end = _parse_instant(end, zone, "end")
+    if range_end <= range_start:
+        raise HTTPException(422, "end must be after start")
+    if range_end - range_start > timedelta(days=MAX_AVAILABILITY_DAYS):
+        raise HTTPException(422, f"Range cannot exceed {MAX_AVAILABILITY_DAYS} days")
+    ids = list(dict.fromkeys(
+        _resolve_user_id(v.strip(), current, "user_ids") for v in user_ids.split(",") if v.strip()
+    ))
+    if not ids:
+        raise HTTPException(422, "user_ids is required")
+    if len(ids) > MAX_AVAILABILITY_USERS:
+        raise HTTPException(422, f"At most {MAX_AVAILABILITY_USERS} people at a time")
+
+    clauses = [
+        _overlap_filter(range_start, range_end),
+        {"status": {"$ne": "cancelled"}},
+        {"all_day": {"$ne": True}},
+        {"$or": [{"organizer_id": {"$in": ids}}, {"participant_ids": {"$in": ids}}]},
+    ]
+    if exclude_event_id and ObjectId.is_valid(exclude_event_id):
+        clauses.append({"_id": {"$ne": ObjectId(exclude_event_id)}})
+    db = get_db()
+    docs = await db.calendar_events.find({"$and": clauses}).sort(SORT).limit(MAX_VIEW_EVENTS).to_list(MAX_VIEW_EVENTS)
+
+    visible = {d["_id"] for d in docs}
+    visibility = _visibility_filter(current)
+    if visibility and docs:
+        query = {"$and": [{"_id": {"$in": list(visible)}}, visibility]}
+        visible = {d["_id"] async for d in db.calendar_events.find(query, {"_id": 1})}
+
+    busy = {uid: [] for uid in ids}
+    for d in docs:
+        responses = d.get("responses") or {}
+        people = {d.get("organizer_id"), *d.get("participant_ids", [])}
+        shown = d["_id"] in visible
+        for uid in ids:
+            if uid not in people or responses.get(uid) == "declined":
+                continue
+            busy[uid].append({
+                "start": _as_utc(d["start_time"]).isoformat(),
+                "end": _as_utc(d["end_time"]).isoformat(),
+                "title": d["title"] if shown else "Busy",
+                "event_id": str(d["_id"]) if shown else None,
+                "tentative": d.get("status") == "tentative" or responses.get(uid) == "tentative",
+            })
+    return {
+        "range": {"start": range_start.isoformat(), "end": range_end.isoformat()},
+        "users": [{"user_id": uid, "busy": busy[uid]} for uid in ids],
+    }
 
 
 @router.get("/events")

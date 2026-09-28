@@ -1,10 +1,34 @@
 import { useMemo } from "react";
 import { format, isBefore, startOfDay } from "date-fns";
 import { MapPin, Users, Video, Loader2, CalendarDays } from "lucide-react";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/module/ModulePrimitives";
 import { cn } from "@/lib/utils";
-import { categoryStyle, dayLabel, eventEnd, eventStart, formatEventTime, isInProgress } from "./calendarUtils";
+import {
+  RESPONSE_STYLES, categoryStyle, dayLabel, eventEnd, eventStart, formatEventTime, initials, isInProgress,
+} from "./calendarUtils";
+
+const MAX_AVATARS = 4;
+
+function AvatarStack({ people }) {
+  const shown = people.slice(0, MAX_AVATARS);
+  return (
+    <span className="inline-flex items-center -space-x-1.5">
+      {shown.map((p) => (
+        <Avatar key={p.id} className="h-5 w-5 ring-2 ring-card" title={p.name}>
+          <AvatarImage src={p.photo || undefined} alt="" />
+          <AvatarFallback className="text-[8.5px]">{initials(p.name)}</AvatarFallback>
+        </Avatar>
+      ))}
+      {people.length > MAX_AVATARS && (
+        <span className="h-5 min-w-5 px-1 rounded-full bg-muted ring-2 ring-card text-[9.5px] flex items-center justify-center tabular-nums">
+          +{people.length - MAX_AVATARS}
+        </span>
+      )}
+    </span>
+  );
+}
 
 /** Group events under the local day they start on (or the agenda start, for ones already running). */
 function groupByDay(events, from) {
@@ -19,7 +43,7 @@ function groupByDay(events, from) {
   return [...groups.values()];
 }
 
-export default function AgendaView({ data, from, onSelectEvent, onLoadMore, loadingMore, onCreate }) {
+export default function AgendaView({ data, from, user, onSelectEvent, onLoadMore, loadingMore, onCreate }) {
   const groups = useMemo(() => groupByDay(data.items, startOfDay(from)), [data.items, from]);
   const now = new Date();
 
@@ -48,6 +72,7 @@ export default function AgendaView({ data, from, onSelectEvent, onLoadMore, load
               const live = isInProgress(ev, now);
               // Earlier today's meetings stay listed, just de-emphasised once they are over.
               const past = !ev.all_day && eventEnd(ev) <= now;
+              const mine = ev.participants?.find((p) => p.id === user?.id);
               return (
                 <li key={ev.id}>
                   <button
@@ -69,6 +94,14 @@ export default function AgendaView({ data, from, onSelectEvent, onLoadMore, load
                         {live && ev.status !== "cancelled" && (
                           <span className="inline-flex items-center h-5 px-1.5 rounded text-[10.5px] font-semibold uppercase tracking-wide bg-destructive/10 text-destructive">Now</span>
                         )}
+                        {mine && ev.status !== "cancelled" && (
+                          mine.response === "pending"
+                            ? <span className="inline-flex items-center h-5 px-1.5 rounded text-[10.5px] font-semibold uppercase tracking-wide bg-primary/10 text-primary">Reply needed</span>
+                            : <span className={cn("inline-flex items-center gap-1 text-[11px] font-medium", RESPONSE_STYLES[mine.response].text)}>
+                                <span className={cn("h-1.5 w-1.5 rounded-full", RESPONSE_STYLES[mine.response].dot)} />
+                                {RESPONSE_STYLES[mine.response].label}
+                              </span>
+                        )}
                         {ev.status !== "confirmed" && (
                           <span className="inline-flex items-center h-5 px-1.5 rounded text-[10.5px] font-semibold uppercase tracking-wide bg-muted text-foreground/70">{ev.status}</span>
                         )}
@@ -78,7 +111,10 @@ export default function AgendaView({ data, from, onSelectEvent, onLoadMore, load
                         {ev.location && <span className="inline-flex items-center gap-1"><MapPin className="h-3 w-3" />{ev.location}</span>}
                         {ev.meeting_link && <span className="inline-flex items-center gap-1"><Video className="h-3 w-3" />Online</span>}
                         {ev.participants?.length > 0 && (
-                          <span className="inline-flex items-center gap-1"><Users className="h-3 w-3" />{ev.participants.length}</span>
+                          <span className="inline-flex items-center gap-1.5">
+                            <Users className="h-3 w-3" />
+                            <AvatarStack people={ev.participants} />
+                          </span>
                         )}
                       </div>
                     </div>

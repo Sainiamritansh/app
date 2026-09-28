@@ -407,3 +407,101 @@ def test_reminder_minutes_validation(api, users):
     r = requests.post(f"{api}/calendar/events", headers=users["manager"]["headers"], json={
         "title": "Bad", "start_time": _iso(2031, 1, 5, 10), "end_time": _iso(2031, 1, 5, 11), "reminder_minutes": -5})
     assert r.status_code == 422
+
+
+# ------------------------- search -------------------------
+
+def test_search_matches_title_location_and_description(api, users):
+    a = _create(api, users["founder"], title="Quarterly board review",
+                start_time=_iso(2032, 2, 3, 10), end_time=_iso(2032, 2, 3, 11))
+    b = _create(api, users["founder"], title="Standup", location="Board room",
+                start_time=_iso(2032, 2, 3, 12), end_time=_iso(2032, 2, 3, 13))
+    c = _create(api, users["founder"], title="Lunch", description="Nothing to see",
+                start_time=_iso(2032, 2, 3, 14), end_time=_iso(2032, 2, 3, 15))
+    r = _get(api, users["founder"], "/day", date="2032-02-03", tz="Asia/Kolkata", q="BOARD")
+    assert r.status_code == 200
+    assert _ids(r.json()["events"]) == [a["id"], b["id"]]
+    assert c["id"] not in _ids(r.json()["events"])
+    # Regex metacharacters are matched literally.
+    r = _get(api, users["founder"], "/day", date="2032-02-03", tz="Asia/Kolkata", q=".*")
+    assert r.json()["events"] == []
+
+
+# ------------------------- RSVP -------------------------
+
+def _rsvp(api, user, event_id, response):
+    return requests.post(f"{api}/calendar/events/{event_id}/rsvp", json={"response": response},
+                         headers=user["headers"], timeout=10)
+
+
+def test_rsvp_records_response_and_notifies_organiser(api, users, test_db):
+    ev = _create(api, users["manager"], title="Design crit",
+                 start_time=_iso(2032, 3, 1, 10), end_time=_iso(2032, 3, 1, 11),
+                 participant_ids=[users["employee"]["id"], users["employee2"]["id"]])
+    assert {p["response"] for p in ev["participants"]} == {"pending"}
+    assert "responses" not in ev
+
+    r = _rsvp(api, users["employee"], ev["id"], "accepted")
+    assert r.status_code == 200, r.text
+    by_id = {p["id"]: p["response"] for p in r.json()["participants"]}
+    assert by_id == {users["employee"]["id"]: "accepted", users["employee2"]["id"]: "pending"}
+    note = test_db.notifications.find_one({"user_id": users["manager"]["id"], "title": "Event response",
+                                           "link": f"/calendar?event={ev['id']}"})
+    assert note and "accepted" in note["body"]
+
+
+def test_rsvp_rejects_uninvited_and_bad_values(api, users):
+    ev = _create(api, users["manager"], title="Closed door",
+                 start_time=_iso(2032, 3, 2, 10), end_time=_iso(2032, 3, 2, 11),
+                 participant_ids=[users["employee"]["id"]])
+    assert _rsvp(api, users["employee2"], ev["id"], "accepted").status_code == 404
+    assert _rsvp(api, users["employee"], ev["id"], "maybe").status_code == 422
+    assert _rsvp(api, users["employee"], str(ObjectId()), "accepted").status_code == 404
+
+
+def test_reschedule_resets_responses_and_notifies(api, users, test_db):
+    ev = _create(api, users["manager"], title="Movable",
+                 start_time=_iso(2032, 3, 3, 10), end_time=_iso(2032, 3, 3, 11),
+                 participant_ids=[users["employee"]["id"]])
+    _rsvp(api, users["employee"], ev["id"], "accepted")
+    # A title-only edit keeps answers.
+    r = requests.patch(f"{api}/calendar/events/{ev['id']}", headers=users["manager"]["headers"],
+                       json={"title": "Movable (renamed)"})
+    assert r.json()["participants"][0]["response"] == "accepted"
+    r = requests.patch(f"{api}/calendar/events/{ev['id']}", headers=users["manager"]["headers"],
+                       json={"start_time": _iso(2032, 3, 4, 10), "end_time": _iso(2032, 3, 4, 11)})
+    assert r.status_code == 200
+    assert r.json()["participants"][0]["response"] == "pending"
+    assert test_db.notifications.count_documents({"user_id": users["employee"]["id"], "title": "Event rescheduled",
+                                                  "link": f"/calendar?event={ev['id']}"}) == 1
+
+
+# ------------------------- availability -------------------------
+
+def test_availability_reports_busy_blocks_and_hides_private_titles(api, users):
+    emp = users["employee"]["id"]
+    public = _create(api, users["manager"], title="Team planning",
+                     start_time=_iso(2032, 4, 5, 10), end_time=_iso(2032, 4, 5, 11), participant_ids=[emp])
+    _create(api, users["employee"], title="Private 1:1", visibility="private",
+            start_time=_iso(2032, 4, 5, 14), end_time=_iso(2032, 4, 5, 15))
+    declined = _create(api, users["manager"], title="Optional sync",
+                       start_time=_iso(2032, 4, 5, 16), end_time=_iso(2032, 4, 5, 17), participant_ids=[emp])
+    _rsvp(api, users["employee"], declined["id"], "declined")
+
+    r = _get(api, users["employee2"], "/availability", user_ids=emp,
+             start="2032-04-05", end="2032-04-06", tz="Asia/Kolkata")
+    assert r.status_code == 200, r.text
+    busy = r.json()["users"][0]["busy"]
+    assert [b["title"] for b in busy] == ["Team planning", "Busy"]
+    assert busy[0]["event_id"] == public["id"] and busy[1]["event_id"] is None
+
+    r = _get(api, users["employee2"], "/availability", user_ids=emp, start="2032-04-05", end="2032-04-06",
+             tz="Asia/Kolkata", exclude_event_id=public["id"])
+    assert [b["title"] for b in r.json()["users"][0]["busy"]] == ["Busy"]
+
+
+def test_availability_validation(api, users):
+    h = users["founder"]
+    assert _get(api, h, "/availability", user_ids="me", start="2032-04-06", end="2032-04-05").status_code == 422
+    assert _get(api, h, "/availability", user_ids="me", start="2032-01-01", end="2032-03-01").status_code == 422
+    assert _get(api, h, "/availability", user_ids="nope", start="2032-01-01", end="2032-01-02").status_code == 422
