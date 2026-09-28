@@ -7,33 +7,76 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { api } from "@/lib/api";
 import { formatDistanceToNow } from "date-fns";
+import { toast } from "sonner";
 import { AlertTriangle, ScrollText } from "lucide-react";
 
 const ALL = "__all__";
 
+const PAGE_SIZE = 50;
+
+// Keep the newest page from `fresh` plus any older rows the user already paged in.
+function mergeFirstPage(prev, fresh) {
+  if (!fresh.has_more || prev.logs.length <= fresh.items.length) {
+    return { logs: fresh.items, cursor: fresh.next_cursor, hasMore: fresh.has_more };
+  }
+  const ids = new Set(fresh.items.map((l) => l.id));
+  const last = fresh.items[fresh.items.length - 1]?.created_at || "";
+  const tail = prev.logs.filter((l) => !ids.has(l.id) && (l.created_at || "") <= last);
+  return { logs: [...fresh.items, ...tail], cursor: prev.cursor, hasMore: prev.hasMore };
+}
+
 export default function ActivityLogs() {
-  const [logs, setLogs] = useState([]);
+  const [page, setPage] = useState({ logs: [], cursor: null, hasMore: false });
+  const logs = page.logs;
   const [q, setQ] = useState("");
   const [module, setModule] = useState(ALL);
   const [modules, setModules] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(null);
   const reqRef = useRef(0);
+  // Bumped when the filter changes, so a "Load more" reply for the old module is dropped.
+  const genRef = useRef(0);
+  const moduleRef = useRef(module);
 
-  // Module filtering happens server-side (?module=) so the 200-row limit applies per module.
+  // Module filtering happens server-side (?module=) so pagination applies per module.
   const load = useCallback(({ background = false } = {}) => {
     if (!background) {
       setLoading(true);
       setError(null);
     }
-    const params = { limit: 200, ...(module !== ALL ? { module } : {}) };
+    if (moduleRef.current !== module) {
+      moduleRef.current = module;
+      genRef.current += 1;
+    }
+    const params = { limit: PAGE_SIZE, paged: true, ...(module !== ALL ? { module } : {}) };
     // Only the latest request may update the list (a slow earlier module's reply must not win).
     const req = ++reqRef.current;
     api.get("/activity", { params })
-      .then(({ data }) => { if (req === reqRef.current) setLogs(data); })
+      .then(({ data }) => {
+        if (req !== reqRef.current) return;
+        setPage((prev) => (background ? mergeFirstPage(prev, data) : { logs: data.items, cursor: data.next_cursor, hasMore: data.has_more }));
+      })
       .catch((e) => { if (!background && req === reqRef.current) setError(e?.response?.data?.detail || "Could not load activity logs."); })
       .finally(() => { if (!background) setLoading(false); });
   }, [module]);
+
+  const loadMore = () => {
+    if (!page.cursor || loadingMore) return;
+    const gen = genRef.current;
+    setLoadingMore(true);
+    const params = { limit: PAGE_SIZE, paged: true, before: page.cursor, ...(module !== ALL ? { module } : {}) };
+    api.get("/activity", { params })
+      .then(({ data }) => {
+        if (gen !== genRef.current) return;
+        setPage((prev) => {
+          const ids = new Set(prev.logs.map((l) => l.id));
+          return { logs: [...prev.logs, ...data.items.filter((l) => !ids.has(l.id))], cursor: data.next_cursor, hasMore: data.has_more };
+        });
+      })
+      .catch(() => { if (gen === genRef.current) toast.error("Could not load older activity."); })
+      .finally(() => setLoadingMore(false));
+  };
 
   useEffect(() => { load(); }, [load]);
   useLiveRefresh(load, 30000);
@@ -100,6 +143,13 @@ export default function ActivityLogs() {
               </li>
             ))}
           </ul>
+        )}
+        {!error && page.hasMore && (
+          <div className="border-t border-border p-3 text-center">
+            <Button variant="ghost" size="sm" onClick={loadMore} disabled={loadingMore} className="h-8 text-xs" data-testid="activity-load-more">
+              {loadingMore ? "Loading…" : "Load more"}
+            </Button>
+          </div>
         )}
       </Card>
     </div>

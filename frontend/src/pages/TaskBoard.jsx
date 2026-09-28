@@ -64,17 +64,18 @@ function formatDateBadge(t) {
       </Badge>
     );
   }
-  if (isYesterday) {
-    return (
-      <Badge variant="outline" className="bg-amber-500/10 text-amber-600 border-amber-200 dark:border-amber-800 text-[11px] font-medium shrink-0">
-        Yesterday
-      </Badge>
-    );
-  }
+  // An open task due yesterday is overdue (red); "Yesterday" is only for done/undated items.
   if (isOverdue) {
     return (
       <Badge variant="destructive" className="text-[11px] font-medium shrink-0">
         Overdue · {d.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}
+      </Badge>
+    );
+  }
+  if (isYesterday) {
+    return (
+      <Badge variant="outline" className="bg-amber-500/10 text-amber-600 border-amber-200 dark:border-amber-800 text-[11px] font-medium shrink-0">
+        Yesterday
       </Badge>
     );
   }

@@ -258,6 +258,26 @@ def test_create_rules(api, users):
     assert r.status_code == 201 and r.json()["attachments"] == []
 
 
+def test_empty_due_date_is_stored_as_null(api, users, test_db):
+    founder = users["founder"]
+    t = _task(api, founder, due_date="")
+    assert t["due_date"] is None
+    assert test_db.tasks.find_one({"_id": ObjectId(t["id"])})["due_date"] is None
+
+    call(api, founder, "PATCH", f"/tasks/{t['id']}", json={"due_date": "2031-05-01"})
+    r = call(api, founder, "PATCH", f"/tasks/{t['id']}", json={"due_date": "  "})
+    assert r.status_code == 200, r.text
+    assert test_db.tasks.find_one({"_id": ObjectId(t["id"])})["due_date"] is None
+
+    # Legacy "" reads as empty: echoing an empty due date back is not an edit.
+    test_db.tasks.update_one({"_id": ObjectId(t["id"])}, {"$set": {"due_date": "", "updated_at": "legacy"}})
+    assert call(api, founder, "PATCH", f"/tasks/{t['id']}", json={"due_date": ""}).status_code == 200
+    doc = test_db.tasks.find_one({"_id": ObjectId(t["id"])})
+    assert doc["updated_at"] == "legacy"
+    assert call(api, founder, "PATCH", f"/tasks/{t['id']}", json={"due_date": None}).status_code == 200
+    assert test_db.tasks.find_one({"_id": ObjectId(t["id"])})["updated_at"] == "legacy"
+
+
 # ------------------------- 5. notifications -------------------------
 
 def test_reassign_notification_only_on_change(api, users, test_db):

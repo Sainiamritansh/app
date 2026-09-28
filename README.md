@@ -174,7 +174,7 @@ Every page reads real data from the database. Empty data is shown as empty, neve
 Endpoints: `/api/auth` (login, register, refresh, logout, me, attendance, forgot-password, reset-password/validate, reset-password), `/api/users` (list, directory, `PATCH /me`, `POST /me/password`).
 
 ### Dashboard
-- KPIs, revenue and booking charts, city and vendor performance (Founder only, from Marketplace data); team KPIs for other roles (open and overdue tasks, open pipeline count and value, people).
+- KPIs, revenue and booking charts, city and vendor performance (Founder only, from Marketplace data); team KPIs for other roles (open and overdue tasks, open pipeline count and value, people). Open tasks are `todo`, `in_progress` and `review` (the same set as the Task Board's "mine" count), so a task in review past its due date counts as overdue.
 - Today's tasks, upcoming calendar events (next five, including events already in progress), activity feed, company health and system status.
 - A Manager's pending-leave count covers their own department only, matching the Employees module.
 - Public login-page live KPIs.
@@ -195,6 +195,7 @@ Endpoints: `/api/marketplace/{cities|vendors|vehicles|customers|pricing|coupons|
 - Comments, PDF attachments, links, assignee notifications and assignment emails. Assigning a task to yourself sends no email.
 - Visibility follows the role table: all tasks, own department, own/created, or assigned only.
 - `?task_id=<id>` opens a task directly; links in notifications and emails use it.
+- Date badges: an open task past its due date (including yesterday) shows a red "Overdue" badge. An empty due date is stored as `null` (older tasks holding `""` are read as no due date).
 
 Endpoints: `/api/tasks` (CRUD, `PATCH /{id}/status`, `POST /{id}/comments`, files upload/download/delete, `GET /stats/overview`).
 
@@ -219,12 +220,15 @@ Endpoints: `/api/employees` (list, invite, invitations, resend/revoke, accept-in
 - Channels, groups, direct messages and announcements with unread counts and read state.
 - **Members-only channels and groups (WhatsApp-style).** New channels and groups are private: only members can see, read and post. On create, pick individual employees and/or whole departments (a snapshot of the department's current active members).
 - Member list dialog (admins first), add members or departments, remove members, and leave. The creator is the channel's first admin; `can_manage` tells the UI who can add/remove (channel admins, Founder, Admin). Channel admins can't remove the creator; only Founder/Admin can. A group is never left without an admin.
+- **Channel admins**: channel admins, Founder and Admin can make members admins or remove admin rights from the Members dialog. Only Founder/Admin can demote the creator, and the last admin can't step down (department groups excepted).
+- **Manage channels** (Founder/Admin): lists every channel, group and announcement channel, including ones they're not in, to manage members and admins. It shows membership metadata only; reading and posting stay members-only, and message previews are never returned to non-members.
+- **Make members-only** (Founder/Admin): converts a legacy public channel. Its current members plus its creator keep access (optionally add whole departments at the same time); the creator becomes admin, or the converting user if there is no creator.
 - Removed members are notified and the channel disappears from their list on the next poll.
 - **Department groups** are created and kept in sync automatically from each employee's department. Their membership follows the org chart, so only Founder/Admin manage them and members can't leave them.
-- **Legacy channels** created before members-only existed stay public and joinable by everyone.
+- **Legacy channels** created before members-only existed stay public and joinable by everyone until a Founder/Admin makes them members-only.
 - **Announcements** are company-wide broadcasts; only Founder and Admin create and post in them.
 
-Endpoints: `/api/connect/channels` (list, create), `/departments`, `/channels/{id}/members` (list, add, `DELETE …/{user_id}` to remove or leave), `/dm-users`, `/users`, `/dm/{peer_id}`, `/channels/{id}/messages`, `/join`, `/read`.
+Endpoints: `/api/connect/channels` (list, create), `/departments`, `/channels/{id}/members` (list, add, `DELETE …/{user_id}` to remove or leave), `/channels/{id}/admins/{user_id}` (`POST` promote, `DELETE` demote), `POST /channels/{id}/members-only`, `/manage/channels` (Founder/Admin), `/dm-users`, `/users`, `/dm/{peer_id}`, `/channels/{id}/messages`, `/join`, `/read`.
 
 ### Calendar
 - Month, week, day and agenda views; participants; visibility (everyone, department, private); reminders delivered as notifications.
@@ -235,11 +239,12 @@ Endpoints: `/api/connect/channels` (list, create), `/departments`, `/channels/{i
 Endpoints: `/api/calendar/events` (CRUD, date range, participant filter, sorting, pagination), `/events/{id}`, `/month`, `/week`, `/day`, `/agenda`, `/invitees`.
 
 ### Company Vault
-- Company documents in folders with tags, versions (upload new, download, restore), inline preview, expiry dates and reminders at 30 days, 7 days and on expiry. Files up to 25 MB, stored in MongoDB GridFS.
+- Company documents in folders with tags, versions (upload new, download, restore), inline preview, expiry dates and reminders at 30 days, 7 days and on expiry, sent once per stage to every Founder and Admin plus the document's owner. Files up to 25 MB, stored in MongoDB GridFS.
 - **Everyone can open the vault; only Founder and Admin upload, create folders, edit, delete and manage access** (`vault.manage`).
 - **Per-item access** on every folder and document: everyone, or restricted to any mix of roles, departments and specific employees. Folder access cascades: a document is visible only if both it and its folder admit you. Founder and Admin see everything.
 - Items you can't see are hidden from lists and return 404 when opened directly. Restricted items show a badge.
 - Items created before access control existed have no access list and stay visible to everyone.
+- Folder names are unique vault-wide (case-insensitive). The "already exists" message is only shown to people who can see the clashing folder (Founder/Admin, the only roles that create folders); anyone else would get a neutral "name not available".
 - Employees who are individually given access get a "Document shared with you" notification (only newly added people, and only if they can actually open it).
 - Deep links: `?doc=<id>`, `?create=1`.
 
@@ -251,10 +256,12 @@ Endpoints: `/api/vault/folders`, `/tags`, `/documents` (upload is multipart with
 - **Payouts**: vendor payout batches from outstanding bookings, mark paid, delete.
 - **Vendors** (`finance_vendors`): supplier and payee directory with contact, GSTIN, category and active/inactive status. A vendor can optionally be linked to one Marketplace vendor. Vendor detail shows total spent, outstanding, overdue and a history of bills plus (for a linked Marketplace vendor) booking payouts. A vendor with bills can't be deleted; mark it inactive instead. Inactive vendors can't receive new bills.
 - **Vendor bills** (`vendor_bills`): expenses owed to a vendor, status `pending`, `paid` or `cancelled`, with an overdue flag for pending bills past their due date. Bill dates can't be in the future; due date must be on or after the bill date. Only pending bills can be edited or deleted; mark paid (with payment date) or cancel. Filters by vendor, status (including overdue), month, category and text; CSV export.
-- Invoices and payouts can be filtered by Marketplace vendor. The overview includes a payables card (pending and overdue bills).
-- Monthly statements with CSV export; editable commission and GST settings.
+- **Vendors list** shows total spent, outstanding, overdue, bill count and last bill date per vendor; click a column header to sort. `?tab=vendors&vendor=<id>` opens a vendor's panel directly.
+- **Per-vendor statement** (Statement tab in the vendor panel): pick a month or a from/to range to see opening outstanding, bills and linked payouts charged, payments, closing outstanding and a ledger with running balance. CSV export and print view.
+- Invoices and payouts can be filtered by Marketplace vendor. The overview includes a payables card (pending and overdue bills), a "Net after vendor bills (MTD)" card and **Top vendors by spend** (last 90 days, ranked by money paid) linking to each vendor.
+- **Monthly statements** with CSV export include vendor bills: bills recorded (by bill date) and paid (by payment date), totals by vendor and by category, and **net after bills** = platform commission − bills paid in the month. Cancelled bills are excluded. Editable commission and GST settings.
 
-Endpoints: `/api/finance/settings`, `/invoices` (list, export, eligible, create, bulk, issue, pay, void), `/payouts` (outstanding, create, pay, delete), `/statements` (+ export), `/overview`, `/vendors` (CRUD, `marketplace-options`), `/bills` (list, export, create, edit, pay, cancel, delete).
+Endpoints: `/api/finance/settings`, `/invoices` (list, export, eligible, create, bulk, issue, pay, void), `/payouts` (outstanding, create, pay, delete), `/statements` (+ export), `/overview`, `/vendors` (CRUD, `marketplace-options`, `/{id}/statement` + `/statement/export`), `/bills` (list, export, create, edit, pay, cancel, delete).
 
 ### CRM (Founder, Admin, Manager)
 - Tabs: Overview, Customers, Segments, Follow-ups.
@@ -289,7 +296,7 @@ Endpoints: `/api/ai/status`, `/conversations` (CRUD), `POST /conversations/{id}/
 
 ### Notifications, Activity Logs, Settings, About
 - **Notifications**: in-app list, unread count, mark one or all read. Users can only read and change their own.
-- **Activity Logs**: audit trail of changes. Founder/Admin see everything; a Manager sees their department and their own actions.
+- **Activity Logs**: audit trail of changes. Founder/Admin see everything; a Manager sees their department and their own actions. Newest 50 first, with "Load more" for older entries (`GET /api/activity?paged=true&before=<next_cursor>` returns `{items, has_more, next_cursor}`; without `paged` it returns a plain list).
 - **Settings**: profile, company profile (Founder edits), theme, security (change password), roles.
 - **About WavyGo**: company information page.
 
@@ -328,7 +335,7 @@ All routes are under `/api`. Full, always-current reference: `/docs`.
 | Tasks | `/api/tasks` | CRUD, status (drag-drop), comments, files, stats |
 | Employees | `/api/employees` | directory, invitations, status, attendance + check-in/out, leave, performance, departments |
 | Opportunities | `/api/opportunities` | CRUD, assign / unassign, status, stats |
-| Connect | `/api/connect` | channels, departments, members (add / remove / leave), DMs, messages, read state |
+| Connect | `/api/connect` | channels, departments, members (add / remove / leave), admins, members-only conversion, manage-all list, DMs, messages, read state |
 | Calendar | `/api/calendar` | events CRUD, month / week / day / agenda, invitees |
 | Notifications | `/api/notifications` | list, unread count, mark read |
 | Activity | `/api/activity` | audit log, modules |
@@ -351,7 +358,7 @@ cd backend
 
 - `pytest.ini` runs tests in parallel with `pytest-xdist` (`-n 2 --dist loadscope`); use `-n 0` to run serially.
 - `tests/*_local_test.py` are self-contained: each module starts its own API server on a free port against a throwaway database on the MongoDB at `MONGO_URL` (default `mongodb://127.0.0.1:27017`), and deletes it afterwards. See [`tests/local_harness.py`](backend/tests/local_harness.py). Suites: auth, password reset, dashboard, employees, tasks and opportunities, Connect and Marketplace, calendar, vault, finance, CRM and marketing, analytics, AI.
-- `tests/backend_test.py`, `backend_part2_test.py` and `rbac_test.py` are end-to-end suites against a running deployment. They are skipped unless `WAVYGO_E2E_URL` is set. Don't point them at production data.
+- `tests/backend_test.py`, `backend_part2_test.py` and `rbac_test.py` are end-to-end suites against a running deployment. They are skipped unless `WAVYGO_E2E_URL`, `FOUNDER_EMAIL` and `FOUNDER_PASSWORD` are set (the Founder login on that deployment). Other role accounts come from `E2E_ADMIN_EMAIL`, `E2E_MANAGER_EMAIL`, `E2E_EMPLOYEE_EMAIL`, `E2E_INTERN_EMAIL` (default `<role>@wavygo.in`) with password `E2E_PASSWORD` (default `FOUNDER_PASSWORD`); see [`tests/e2e_accounts.py`](backend/tests/e2e_accounts.py). Don't point them at production data.
 - CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the backend suites against a MongoDB 7 service and verifies the frontend build with `npm ci`.
 
 ---
@@ -398,6 +405,16 @@ Frontend routes: `/login`, `/accept-invite`, `/reset-password`, `/dashboard`, `/
 ---
 
 ## Changelog
+
+### 2026-09-29: per-vendor finance, channel admins, gap fixes
+
+- **Finance**: per-vendor statements (month or range, opening/closing outstanding, ledger, CSV, print); monthly statements include vendor bills by vendor and category with net after bills; Overview "Top vendors by spend" and net card; sortable per-vendor columns; `?tab=vendors&vendor=<id>` deep link.
+- **Connect**: promote / demote channel admins; Founder/Admin "Manage channels" view (details only, no messages) and converting legacy public channels to members-only; message previews no longer returned to non-members.
+- **Company Vault**: expiry reminders go to Founders, Admins and the document owner; duplicate folder names don't reveal hidden folders.
+- **Activity Logs**: "Load more" with cursor pagination (`?paged=true&before=`).
+- **Marketplace**: Dashboard tab refreshes live.
+- **Dashboard / Task Board**: overdue tasks in `review` count as open/overdue; open tasks due yesterday show "Overdue"; empty due dates stored as null.
+- **Testing**: end-to-end suites read Founder credentials from `FOUNDER_EMAIL` / `FOUNDER_PASSWORD` (other roles from `E2E_*` variables) instead of hardcoded passwords.
 
 ### 2026-09-28: member-only channels, vault access, vendors, QA sweep
 

@@ -46,6 +46,11 @@ class MembersIn(BaseModel):
         return self
 
 
+class ConvertIn(BaseModel):
+    """Optional departments whose current active members join when a legacy channel goes members-only."""
+    departments: List[str] = Field(default_factory=list)
+
+
 class ChannelCreate(ChannelIn):
     """Channel names must be non-blank; surrounding whitespace is trimmed."""
     model_config = ConfigDict(str_strip_whitespace=True)
@@ -86,6 +91,13 @@ def _can_manage(ch: dict, current: UserPublic) -> bool:
     if ch.get("department"):
         return False
     return current.id in _channel_admins(ch)
+
+
+async def _get_channel(db, channel_id: str) -> dict:
+    ch = await db.channels.find_one({"_id": oid(channel_id)})
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    return ch
 
 
 async def _visible_channel(db, channel_id: str, current: UserPublic) -> dict:
@@ -152,6 +164,9 @@ async def _channel_meta(db, doc, current: UserPublic, unread: int | None = None)
     doc["unread"] = unread
     doc["members_only"] = not _is_public(doc)
     doc["member_count"] = len(doc.get("members", []))
+    if not _can_view(doc, current_id):
+        # Founder/Admin managing a channel they're not in: membership metadata only, no message preview.
+        doc.pop("last_body", None)
     if doc.get("kind") in MEMBER_KINDS:
         doc["admins"] = _channel_admins(doc)
         doc["can_manage"] = _can_manage(doc, current)
@@ -231,9 +246,13 @@ async def create_channel(payload: ChannelCreate,
 
 @router.get("/channels/{channel_id}/members")
 async def list_members(channel_id: str, current: UserPublic = Depends(get_current_user)):
-    """Member profiles of a channel the caller can see, admins first."""
+    """Member profiles of a channel the caller can see or manage, admins first."""
     db = get_db()
-    ch = await _visible_channel(db, channel_id, current)
+    ch = await _get_channel(db, channel_id)
+    # Founder/Admin may see who is in a channel to manage it without being a member themselves.
+    # This never grants access to its messages.
+    if not (_can_view(ch, current.id) or _can_manage(ch, current)):
+        raise HTTPException(403, "Not a member")
     ids = [m for m in ch.get("members", []) if ObjectId.is_valid(m)]
     admins = set(_channel_admins(ch)) if ch.get("kind") in MEMBER_KINDS else set()
     proj = {"name": 1, "email": 1, "role": 1, "photo": 1, "online": 1, "designation": 1, "department": 1,
@@ -319,6 +338,113 @@ async def remove_member(channel_id: str, user_id: str, current: UserPublic = Dep
     doc = await db.channels.find_one({"_id": ch["_id"]})
     await _channel_meta(db, doc, current)
     return serialize(doc)
+
+
+async def _member_channel(db, channel_id: str) -> dict:
+    ch = await _get_channel(db, channel_id)
+    if ch["kind"] not in MEMBER_KINDS or _is_public(ch):
+        raise HTTPException(400, "Admins can only be managed in private channels and groups")
+    return ch
+
+
+@router.post("/channels/{channel_id}/admins/{user_id}")
+async def promote_admin(channel_id: str, user_id: str, current: UserPublic = Depends(get_current_user)):
+    """Make a member a channel admin (channel admins, Founder, Admin)."""
+    db = get_db()
+    ch = await _member_channel(db, channel_id)
+    if not _can_manage(ch, current):
+        raise HTTPException(403, "Only the channel's admins, Founder or Admin can change admins")
+    if user_id not in ch.get("members", []):
+        raise HTTPException(404, "Not a member of this channel")
+    admins = _channel_admins(ch)
+    if user_id not in admins:
+        await db.channels.update_one({"_id": ch["_id"]}, {"$set": {"admins": [*admins, user_id]}})
+        await log_activity(db, current, "Promoted channel admin", "WavyGo Connect", target=ch["name"],
+                           meta={"user_id": user_id})
+        if user_id != current.id:
+            await notify(db, user_id, "You're now an admin", f"{current.name} made you an admin of {ch['name']}.",
+                         kind="info", link="/wavygo-connect")
+    doc = await db.channels.find_one({"_id": ch["_id"]})
+    await _channel_meta(db, doc, current)
+    return serialize(doc)
+
+
+@router.delete("/channels/{channel_id}/admins/{user_id}")
+async def demote_admin(channel_id: str, user_id: str, current: UserPublic = Depends(get_current_user)):
+    """Remove a member's admin rights (channel admins, Founder, Admin). The creator can only be demoted by
+    Founder/Admin, and a channel is never left without an admin (department groups excepted: they are
+    managed by Founder/Admin and have no admins by default)."""
+    db = get_db()
+    ch = await _member_channel(db, channel_id)
+    if not _can_manage(ch, current):
+        raise HTTPException(403, "Only the channel's admins, Founder or Admin can change admins")
+    admins = _channel_admins(ch)
+    if user_id not in admins:
+        raise HTTPException(404, "Not an admin of this channel")
+    if user_id == ch.get("created_by") and current.role not in MANAGER_ROLES:
+        raise HTTPException(403, "The channel creator can only be demoted by Founder or Admin")
+    remaining = [a for a in admins if a != user_id]
+    if not remaining and not ch.get("department"):
+        raise HTTPException(400, "A channel needs at least one admin. Promote someone else first")
+    await db.channels.update_one({"_id": ch["_id"]}, {"$set": {"admins": remaining}})
+    await log_activity(db, current, "Demoted channel admin", "WavyGo Connect", target=ch["name"],
+                       meta={"user_id": user_id})
+    doc = await db.channels.find_one({"_id": ch["_id"]})
+    await _channel_meta(db, doc, current)
+    return serialize(doc)
+
+
+@router.post("/channels/{channel_id}/members-only")
+async def make_members_only(channel_id: str, payload: Optional[ConvertIn] = None,
+                            current: UserPublic = Depends(require_roles(*MANAGER_ROLES))):
+    """Convert a legacy public channel to members-only (Founder/Admin). Members become its current
+    member list plus the creator, plus everyone currently in any named department. The creator is its
+    admin (or the converting user, when there is no usable creator)."""
+    db = get_db()
+    departments = payload.departments if payload else []
+    ch = await _get_channel(db, channel_id)
+    if ch.get("kind") != "channel" or not _is_public(ch):
+        raise HTTPException(400, "Only public (legacy) channels can be made members-only")
+    existing = [m for m in ch.get("members", []) if m]
+    creator = ch.get("created_by")
+    creator = creator if creator and ObjectId.is_valid(creator) else None
+    dept_ids = await _department_member_ids(db, departments)
+    members = list(dict.fromkeys([*([creator] if creator else []), *existing, *dept_ids]))
+    admins = [creator] if creator else [current.id]
+    if current.id in admins and current.id not in members:
+        members.append(current.id)
+    await db.channels.update_one({"_id": ch["_id"]}, {"$set": {"members_only": True, "members": members,
+                                                                 "admins": admins}})
+    await log_activity(db, current, "Made channel members-only", "WavyGo Connect", target=ch["name"],
+                       meta={"members": len(members), "departments": _dedupe_names(departments)})
+    for uid in [m for m in dept_ids if m not in existing and m != current.id]:
+        await notify(db, uid, "Added to channel", f"{current.name} added you to {ch['name']}.",
+                     kind="info", link="/wavygo-connect")
+    doc = await db.channels.find_one({"_id": ch["_id"]})
+    await _channel_meta(db, doc, current)
+    return serialize(doc)
+
+
+@router.get("/manage/channels")
+async def manage_channels(current: UserPublic = Depends(require_roles(*MANAGER_ROLES))):
+    """Every channel, group and announcement channel (not DMs), for Founder/Admin membership management.
+    Metadata only: no message previews, and reading messages stays members-only."""
+    db = get_db()
+    docs = await db.channels.find({"kind": {"$in": [*MEMBER_KINDS, "announcement"]}},
+                                  {"last_body": 0}).sort("name", 1).to_list(1000)
+    out = []
+    for d in docs:
+        public = _is_public(d)
+        out.append({
+            "id": str(d["_id"]), "name": d.get("name"), "kind": d.get("kind"),
+            "description": d.get("description"), "department": d.get("department"),
+            "members_only": not public, "member_count": len(d.get("members", [])),
+            "admins": _channel_admins(d) if d.get("kind") in MEMBER_KINDS else [],
+            "created_by": d.get("created_by"), "is_member": current.id in d.get("members", []),
+            "can_manage": _can_manage(d, current),
+            "can_convert": d.get("kind") == "channel" and public,
+        })
+    return out
 
 
 HIGH_ROLES = {"Founder", "Admin", "Manager"}

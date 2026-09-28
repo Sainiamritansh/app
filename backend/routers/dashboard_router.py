@@ -36,7 +36,8 @@ IST = ZoneInfo("Asia/Kolkata")
 REVENUE_STATUSES = ["confirmed", "active", "completed"]
 # Tasks not yet migrated may still hold inline file data; the dashboard never needs it.
 TASK_FIELDS = {"attachments": 0, "comments": 0}
-OPEN_TASK_STATUSES = ["todo", "in_progress"]
+# "review" is still open work (matches the Task Board's "mine" count), so it can be overdue too.
+OPEN_TASK_STATUSES = ["todo", "in_progress", "review"]
 CLOSED_OPPORTUNITY_STATUSES = ["won", "lost", "closed"]
 PRIORITY_RANK = {"urgent": 4, "high": 3, "medium": 2, "low": 1}
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)

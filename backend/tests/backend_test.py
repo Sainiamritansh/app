@@ -1,21 +1,15 @@
 from __future__ import annotations
 """WavyGo OS backend API tests."""
-import os
 # pyrefly: ignore [missing-import]
 import pytest
 import requests
 
 # End-to-end suite against a running deployment. Opt in by pointing WAVYGO_E2E_URL at it
 # (e.g. a staging backend); without it the suite is skipped so CI never hits production.
-BASE_URL = os.environ.get("WAVYGO_E2E_URL", "").rstrip("/")
-pytestmark = pytest.mark.skipif(not BASE_URL, reason="set WAVYGO_E2E_URL to run the end-to-end suite")
-API = f"{BASE_URL}/api"
+# Credentials come from the environment (FOUNDER_EMAIL / FOUNDER_PASSWORD, see e2e_accounts.py).
+from e2e_accounts import API, E2E_SKIP, FOUNDER, ADMIN, MANAGER, EMPLOYEE, INTERN  # noqa: E402
 
-FOUNDER = {"email": os.environ.get("FOUNDER_EMAIL", "anilanand635@gmail.com"), "password": "Wavygo@2026"}
-ADMIN = {"email": "admin@wavygo.in", "password": "Wavygo@2026"}
-MANAGER = {"email": "manager@wavygo.in", "password": "Wavygo@2026"}
-EMPLOYEE = {"email": "employee@wavygo.in", "password": "Wavygo@2026"}
-INTERN = {"email": "intern@wavygo.in", "password": "Wavygo@2026"}
+pytestmark = E2E_SKIP
 
 
 @pytest.fixture(scope="module")
@@ -167,7 +161,7 @@ def test_update_profile_and_password_roundtrip(s):
     assert r.json()["designation"] != "QA Tester"
 
     # change password to new
-    new_pwd = "Wavygo@2026_TMP"
+    new_pwd = EMPLOYEE["password"] + "_TMP"
     r = s.post(f"{API}/users/me/password", json={"current_password": EMPLOYEE["password"], "new_password": new_pwd}, headers=h)
     assert r.status_code == 200
 

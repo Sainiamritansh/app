@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { PageHeader, StatCard, EmptyState, StatusPill } from "@/components/module/ModulePrimitives";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -217,10 +217,13 @@ function CrudTable({ endpoint, columns, formFields, title, module, testid, defau
 function MarketplaceDashboardTab() {
   const [t, setT] = useState(null);
   const [a, setA] = useState(null);
-  useEffect(() => {
-    api.get("/marketplace/dashboard").then(({ data }) => setT(data.totals)).catch(e => toast.error(formatApiError(e)));
-    api.get("/marketplace/analytics").then(({ data }) => setA(data)).catch(e => toast.error(formatApiError(e)));
+  // Background refreshes are silent; the tab only mounts while it is open, so polling stops elsewhere.
+  const load = useCallback(({ background = false } = {}) => {
+    api.get("/marketplace/dashboard").then(({ data }) => setT(data.totals)).catch(e => { if (!background) toast.error(formatApiError(e)); });
+    api.get("/marketplace/analytics").then(({ data }) => setA(data)).catch(e => { if (!background) toast.error(formatApiError(e)); });
   }, []);
+  useEffect(() => { load(); }, [load]);
+  useLiveRefresh(load, 30000);
   if (!t) return <div className="text-sm text-muted-foreground">Loading…</div>;
   const kpis = [
     { label: "Vehicles", value: t.vehicles, icon: Bike },

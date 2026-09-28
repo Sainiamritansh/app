@@ -21,6 +21,8 @@ Rules
 - Month / day boundaries use the company timezone, Asia/Kolkata.
 - Vendor earnings = booking amount x (1 - commission %). Only completed bookings are paid out, so a
   booking that may still be cancelled never lands in a payout.
+- Vendor bills (cancelled excluded) count by bill_date when recorded and by payment.paid_on when paid.
+  Monthly statements report net_after_bills = platform commission - vendor bills paid in the month.
 - Everything is Founder-only via `permissions.can` (finance.view / finance.manage).
 """
 from __future__ import annotations
@@ -840,7 +842,8 @@ async def cancel_payout(payout_id: str, current: UserPublic = Manager):
 STAT_FIELDS = ("gross_revenue", "revenue_bookings", "platform_commission", "vendor_earnings", "vendor_paid",
                "vendor_owed", "gst_collected", "invoices_issued", "invoiced_amount", "invoices_paid", "paid_amount",
                "invoices_outstanding", "outstanding_amount", "invoices_void", "refunded_amount",
-               "cancelled_bookings", "pending_bookings", "uninvoiced_bookings")
+               "cancelled_bookings", "pending_bookings", "uninvoiced_bookings",
+               "bills_recorded", "bills_recorded_amount", "bills_paid", "bills_paid_amount", "net_after_bills")
 
 
 async def month_stats(db, first: str, last: str, settings: dict) -> dict[str, dict]:
@@ -914,11 +917,65 @@ async def month_stats(db, first: str, last: str, settings: dict) -> dict[str, di
                 stats[vym]["invoices_void"] += 1
                 if inv.get("voided_from") == "paid":
                     stats[vym]["refunded_amount"] += inv.get("total") or 0
+    # Vendor bills (cancelled excluded): recorded by bill_date, paid by payment.paid_on.
+    lo, hi = f"{first}-01", f"{_add_months(last, 1)}-01"
+    async for b in db.vendor_bills.find(
+            {"status": {"$ne": "cancelled"},
+             "$or": [{"bill_date": {"$gte": lo, "$lt": hi}}, {"payment.paid_on": {"$gte": lo, "$lt": hi}}]},
+            {"bill_date": 1, "total": 1, "status": 1, "payment.paid_on": 1}):
+        total = float(b.get("total") or 0)
+        ym = (b.get("bill_date") or "")[:7]
+        if ym in stats:
+            stats[ym]["bills_recorded"] += 1
+            stats[ym]["bills_recorded_amount"] += total
+        pym = ((b.get("payment") or {}).get("paid_on") or "")[:7]
+        if b.get("status") == "paid" and pym in stats:
+            stats[pym]["bills_paid"] += 1
+            stats[pym]["bills_paid_amount"] += total
     for s in stats.values():
         for k, v in s.items():
             if isinstance(v, float):
                 s[k] = _money(v)
+        s["net_after_bills"] = _money(Decimal(str(s["platform_commission"])) - Decimal(str(s["bills_paid_amount"])))
     return stats
+
+
+async def _bills_breakdown(db, month: str) -> dict:
+    """Vendor bills for one month, by vendor and by category: recorded (bill_date in month) and
+    paid (payment.paid_on in month). Cancelled bills are excluded."""
+    lo, hi = f"{month}-01", f"{_add_months(month, 1)}-01"
+    by_vendor: dict[str, dict] = {}
+    by_category: dict[str, dict] = {}
+
+    def blank(**kw):
+        return {**kw, "recorded": 0.0, "recorded_count": 0, "paid": 0.0, "paid_count": 0, "pending": 0.0}
+    async for b in db.vendor_bills.find(
+            {"status": {"$ne": "cancelled"},
+             "$or": [{"bill_date": {"$gte": lo, "$lt": hi}}, {"payment.paid_on": {"$gte": lo, "$lt": hi}}]},
+            {"vendor_id": 1, "vendor_name": 1, "category": 1, "bill_date": 1, "total": 1, "status": 1,
+             "payment.paid_on": 1}):
+        total = float(b.get("total") or 0)
+        cat = b.get("category") or "other"
+        rows = (by_vendor.setdefault(b.get("vendor_id"), blank(vendor_id=b.get("vendor_id"),
+                                                                vendor_name=b.get("vendor_name") or "Unknown vendor")),
+                by_category.setdefault(cat, blank(category=cat)))
+        recorded = lo <= (b.get("bill_date") or "") < hi
+        paid = b.get("status") == "paid" and lo <= ((b.get("payment") or {}).get("paid_on") or "") < hi
+        for r in rows:
+            if recorded:
+                r["recorded"] += total
+                r["recorded_count"] += 1
+                if b.get("status") == "pending":
+                    r["pending"] += total
+            if paid:
+                r["paid"] += total
+                r["paid_count"] += 1
+
+    def done(rows):
+        out = [{k: (_money(v) if isinstance(v, float) else v) for k, v in r.items()} for r in rows]
+        out.sort(key=lambda r: (-(r["paid"] + r["recorded"]), r.get("vendor_name") or r.get("category") or ""))
+        return out
+    return {"by_vendor": done(by_vendor.values()), "by_category": done(by_category.values())}
 
 
 def _check_month(month: Optional[str]) -> str:
@@ -935,8 +992,11 @@ async def _statement(db, month: str) -> dict:
     trailing = [{"month": ym, "label": _month_label(ym), **stats[ym]} for ym in sorted(stats)]
     totals = {f: (_money(sum(t[f] for t in trailing)) if isinstance(trailing[0][f], float) else sum(t[f] for t in trailing))
               for f in STAT_FIELDS}
+    totals["net_after_bills"] = _money(Decimal(str(totals["platform_commission"]))
+                                       - Decimal(str(totals["bills_paid_amount"])))
     return {"month": month, "label": _month_label(month), "summary": stats[month], "trailing": trailing,
-            "trailing_totals": totals, "commission_pct": settings["commission_pct"], "gst_pct": settings["gst_pct"]}
+            "trailing_totals": totals, "commission_pct": settings["commission_pct"], "gst_pct": settings["gst_pct"],
+            "vendor_bills": await _bills_breakdown(db, month)}
 
 
 @router.get("/statements")
@@ -953,6 +1013,9 @@ STAT_LABELS = {
     "invoices_void": "Invoices voided", "refunded_amount": "Refunded (voided paid invoices)",
     "cancelled_bookings": "Cancelled bookings", "pending_bookings": "Pending bookings",
     "uninvoiced_bookings": "Uninvoiced revenue bookings",
+    "bills_recorded": "Vendor bills recorded", "bills_recorded_amount": "Vendor bills recorded amount",
+    "bills_paid": "Vendor bills paid", "bills_paid_amount": "Vendor bills paid amount",
+    "net_after_bills": "Net (commission - paid vendor bills)",
 }
 
 
@@ -963,11 +1026,84 @@ async def export_statement(month: Optional[str] = None, current: UserPublic = Vi
     header = ["Month"] + [STAT_LABELS[f] for f in STAT_FIELDS]
     rows = [[t["month"]] + [t[f] for f in STAT_FIELDS] for t in st["trailing"]]
     rows.append(["Trailing 12 months"] + [st["trailing_totals"][f] for f in STAT_FIELDS])
+    vb = st["vendor_bills"]
+    if vb["by_vendor"]:
+        rows += [[], [f"Vendor bills by vendor · {st['label']}", "Recorded", "Recorded amount", "Paid",
+                      "Paid amount", "Still pending"]]
+        rows += [[r["vendor_name"], r["recorded_count"], r["recorded"], r["paid_count"], r["paid"], r["pending"]]
+                 for r in vb["by_vendor"]]
+        rows += [[], [f"Vendor bills by category · {st['label']}", "Recorded", "Recorded amount", "Paid",
+                      "Paid amount", "Still pending"]]
+        rows += [[r["category"], r["recorded_count"], r["recorded"], r["paid_count"], r["paid"], r["pending"]]
+                 for r in vb["by_category"]]
     await log_activity(db, current, "Exported finance statement", MODULE, target=st["month"])
     return _csv_response(f"wavygo-statement-{st['month']}.csv", header, rows)
 
 
 # ------------------------------------------------------------------ overview
+
+def _ist_date_of(value) -> Optional[str]:
+    dt = _as_utc(value)
+    return dt.astimezone(IST).date().isoformat() if dt else None
+
+
+def _payout_charge_date(p: dict) -> Optional[str]:
+    """A booking payout is owed from the end of its period (or when created / paid, if earlier)."""
+    dates = [d for d in (_ist_date_of(p.get("created_at")), p.get("period_end"), p.get("paid_on")) if d]
+    return min(dates) if dates else None
+
+
+async def _top_vendors(db, days: int = 90, limit: int = 5) -> dict:
+    """Finance vendors ranked by spend over the last `days` days (IST, today inclusive).
+    spent = paid bills (by payment date) + paid linked booking payouts (by paid_on);
+    billed = bills recorded (by bill date) + linked payouts falling due. Cancelled bills are excluded."""
+    since = (_today() - timedelta(days=days - 1)).isoformat()
+    rows: dict[str, dict] = {}
+
+    def row(vid):
+        return rows.setdefault(vid, {"spent": 0.0, "billed": 0.0, "bills": 0})
+    async for b in db.vendor_bills.find(
+            {"status": {"$ne": "cancelled"}, "$or": [{"bill_date": {"$gte": since}}, {"payment.paid_on": {"$gte": since}}]},
+            {"vendor_id": 1, "bill_date": 1, "total": 1, "status": 1, "payment.paid_on": 1}):
+        r = row(b.get("vendor_id"))
+        if (b.get("bill_date") or "") >= since:
+            r["billed"] += float(b.get("total") or 0)
+            r["bills"] += 1
+        if b.get("status") == "paid" and ((b.get("payment") or {}).get("paid_on") or "") >= since:
+            r["spent"] += float(b.get("total") or 0)
+    linked = {d["marketplace_vendor_id"]: str(d["_id"]) async for d in db.finance_vendors.find(
+        {"marketplace_vendor_id": {"$nin": [None, ""]}}, {"marketplace_vendor_id": 1})}
+    if linked:
+        async for p in db.payouts.find({"vendor_id": {"$in": list(linked)}},
+                                       {"vendor_id": 1, "status": 1, "net": 1, "paid_on": 1, "created_at": 1,
+                                        "period_end": 1}):
+            charged, paid_on = _payout_charge_date(p), p.get("paid_on")
+            is_new = bool(charged and charged >= since)
+            is_paid = bool(p.get("status") == "paid" and paid_on and paid_on >= since)
+            if not (is_new or is_paid):
+                continue
+            r = row(linked[p["vendor_id"]])
+            if is_new:
+                r["billed"] += float(p.get("net") or 0)
+            if is_paid:
+                r["spent"] += float(p.get("net") or 0)
+    ranked = sorted(((vid, r) for vid, r in rows.items() if r["spent"] or r["billed"]),
+                    key=lambda x: (-x[1]["spent"], -x[1]["billed"]))[:limit]
+    ids = [vid for vid, _ in ranked]
+    oids = [o for o in (_oid_or_none(i) for i in ids) if o]
+    vendors = {str(d["_id"]): d async for d in db.finance_vendors.find(
+        {"_id": {"$in": oids}}, {"name": 1, "category": 1, "status": 1})}
+    stats = await _bill_stats(db, ids)
+    items = []
+    for vid, r in ranked:
+        v = vendors.get(vid) or {}
+        st = stats.get(vid) or {}
+        items.append({"vendor_id": vid, "name": v.get("name") or "Unknown vendor", "category": v.get("category"),
+                      "status": v.get("status"), "spent": _money(r["spent"]), "billed": _money(r["billed"]),
+                      "bills": r["bills"], "bills_outstanding": _money(st.get("pending")),
+                      "overdue": _money(st.get("overdue"))})
+    return {"days": days, "since": since, "items": items}
+
 
 @router.get("/overview")
 async def overview(current: UserPublic = Viewer):
@@ -1005,7 +1141,9 @@ async def overview(current: UserPublic = Viewer):
             "bills_pending": _money(bills_pending[0]["total"]) if bills_pending else 0.0,
             "bills_pending_count": bills_pending[0]["n"] if bills_pending else 0,
             "bills_overdue": _money(bills_pending[0]["overdue"]) if bills_pending else 0.0,
+            "bills_paid_mtd": cur["bills_paid_amount"], "net_mtd": cur["net_after_bills"],
         },
+        "top_vendors": await _top_vendors(db),
         "series": [{"month": ym, "label": _month_start(ym).strftime("%b"), "revenue": stats[ym]["gross_revenue"],
                     "commission": stats[ym]["platform_commission"], "gst": stats[ym]["gst_collected"]}
                    for ym in sorted(stats)],
@@ -1247,6 +1385,126 @@ async def get_vendor(vendor_id: str, current: UserPublic = Viewer):
     out = _vendor_out(v, bills.get(str(v["_id"])), payouts.get(mp))
     out["history"] = await _vendor_history(db, v)
     return out
+
+
+def _statement_period(month: Optional[str], date_from: Optional[str], date_to: Optional[str]) -> tuple[date, date]:
+    if date_from or date_to:
+        if not (date_from and date_to):
+            raise HTTPException(400, "Provide both from and to dates")
+        start, end = _parse_date(date_from, "from"), _parse_date(date_to, "to")
+        if end < start:
+            raise HTTPException(400, "The to date must be on or after the from date")
+        if (end - start).days > 3700:
+            raise HTTPException(400, "Statement range cannot exceed 10 years")
+        return start, end
+    m = _check_month(month)
+    return _month_start(m), _month_start(_add_months(m, 1)) - timedelta(days=1)
+
+
+def _ledger_entry(date_, kind, id_, reference, description, category, charge, payment, status,
+                  due_date=None, overdue=False) -> dict:
+    return {"date": date_, "kind": kind, "id": id_, "reference": reference, "description": description,
+            "category": category, "charge": charge, "payment": payment, "status": status,
+            "due_date": due_date, "overdue": overdue}
+
+
+async def _vendor_ledger(db, v: dict) -> list[dict]:
+    """Every charge (bill, linked booking payout) and payment for a vendor, oldest first.
+    Cancelled bills are left out entirely, as if never owed."""
+    today = _today().isoformat()
+    entries = []
+    async for b in db.vendor_bills.find({"vendor_id": str(v["_id"]), "status": {"$ne": "cancelled"}}):
+        total, ref, bid = _money(b.get("total")), b.get("bill_number"), str(b["_id"])
+        entries.append(_ledger_entry(
+            b.get("bill_date"), "bill", bid, ref, b.get("description"), b.get("category"), total, 0.0, b.get("status"),
+            b.get("due_date"), bool(b.get("status") == "pending" and b.get("due_date") and b["due_date"] < today)))
+        pay = b.get("payment") or {}
+        if b.get("status") == "paid" and pay.get("paid_on"):
+            method = (pay.get("method") or "").replace("_", " ")
+            desc = "Payment" + (f" for bill {ref}" if ref else "") + (f" via {method}" if method else "")
+            entries.append(_ledger_entry(pay["paid_on"], "bill_payment", bid, pay.get("reference"), desc,
+                                         b.get("category"), 0.0, total, "paid"))
+    if v.get("marketplace_vendor_id"):
+        async for p in db.payouts.find({"vendor_id": v["marketplace_vendor_id"]}):
+            net, pid = _money(p.get("net")), str(p["_id"])
+            desc = f"Booking payout {p.get('period_start')} to {p.get('period_end')} · {p.get('bookings_count')} booking(s)"
+            entries.append(_ledger_entry(_payout_charge_date(p), "payout", pid,
+                                         f"batch {p.get('batch_id')}", desc, "fleet_partner", net, 0.0, p.get("status")))
+            if p.get("status") == "paid" and p.get("paid_on"):
+                entries.append(_ledger_entry(p["paid_on"], "payout_payment", pid, p.get("reference"),
+                                             f"Payout transfer · {desc}", "fleet_partner", 0.0, net, "paid"))
+    order = {"bill": 0, "payout": 0, "bill_payment": 1, "payout_payment": 1}
+    entries.sort(key=lambda e: (e["date"] or "", order[e["kind"]], e["id"]))
+    return entries
+
+
+async def _vendor_statement(db, v: dict, start: date, end: date) -> dict:
+    lo, hi = start.isoformat(), end.isoformat()
+    ledger = await _vendor_ledger(db, v)
+    opening = sum((Decimal(str(e["charge"])) - Decimal(str(e["payment"])) for e in ledger if (e["date"] or "") < lo),
+                  Decimal("0"))
+    balance, charges, payments, charges_n, payments_n, lines = opening, Decimal("0"), Decimal("0"), 0, 0, []
+    for e in ledger:
+        if not (lo <= (e["date"] or "") <= hi):
+            continue
+        balance += Decimal(str(e["charge"])) - Decimal(str(e["payment"]))
+        if e["charge"]:
+            charges += Decimal(str(e["charge"]))
+            charges_n += 1
+        if e["payment"]:
+            payments += Decimal(str(e["payment"]))
+            payments_n += 1
+        lines.append({**e, "balance": _money(balance)})
+    settings = await _settings(db)
+    vendor = {k: v.get(k) for k in ("name", "category", "contact_person", "email", "phone", "tax_id", "address",
+                                    "status", "payment_terms_days", "marketplace_vendor_id", "marketplace_vendor_name")}
+    vendor["id"] = str(v["_id"])
+    whole_month = start.day == 1 and end == _month_start(_add_months(start.strftime("%Y-%m"), 1)) - timedelta(days=1)
+    label = start.strftime("%b %Y") if whole_month else f"{start.strftime('%d %b %Y')} to {end.strftime('%d %b %Y')}"
+    return {
+        "vendor": vendor, "from": lo, "to": hi, "label": label,
+        "opening_balance": _money(opening), "charges": _money(charges), "charges_count": charges_n,
+        "payments": _money(payments), "payments_count": payments_n, "closing_balance": _money(balance),
+        "lines": lines, "generated_at": utc_iso(),
+        "company": {k: settings.get(k) for k in ("company_name", "company_gstin", "company_state", "billing_address")},
+    }
+
+
+@router.get("/vendors/{vendor_id}/statement")
+async def vendor_statement(vendor_id: str, month: Optional[str] = None,
+                           date_from: Optional[str] = Query(None, alias="from"),
+                           date_to: Optional[str] = Query(None, alias="to"), current: UserPublic = Viewer):
+    """One vendor's account for a month (default: current) or a from/to range: opening outstanding,
+    charges (bills and linked booking payouts) and payments in the period, closing outstanding and
+    a running ledger."""
+    db = get_db()
+    v = await _get_vendor(db, vendor_id)
+    start, end = _statement_period(month, date_from, date_to)
+    return await _vendor_statement(db, v, start, end)
+
+
+LEDGER_KINDS = {"bill": "Bill", "bill_payment": "Bill payment", "payout": "Booking payout",
+                "payout_payment": "Payout transfer"}
+
+
+@router.get("/vendors/{vendor_id}/statement/export")
+async def export_vendor_statement(vendor_id: str, month: Optional[str] = None,
+                                  date_from: Optional[str] = Query(None, alias="from"),
+                                  date_to: Optional[str] = Query(None, alias="to"), current: UserPublic = Viewer):
+    db = get_db()
+    v = await _get_vendor(db, vendor_id)
+    start, end = _statement_period(month, date_from, date_to)
+    st = await _vendor_statement(db, v, start, end)
+    header = ["Date", "Type", "Reference", "Description", "Charges", "Payments", "Balance"]
+    rows = [[st["from"], "Opening balance", "", "", "", "", st["opening_balance"]]]
+    rows += [[ln["date"], LEDGER_KINDS[ln["kind"]], ln["reference"], ln["description"], ln["charge"] or "",
+              ln["payment"] or "", ln["balance"]] for ln in st["lines"]]
+    rows.append([st["to"], "Closing balance", "", f"{st['charges_count']} charge(s), {st['payments_count']} payment(s)",
+                 st["charges"], st["payments"], st["closing_balance"]])
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", v.get("name") or "").strip("-").lower()[:40] or "vendor"
+    await log_activity(db, current, "Exported vendor statement", MODULE, target=f"{v['name']} · {st['label']}",
+                       meta={"vendor_id": str(v["_id"]), "from": st["from"], "to": st["to"]})
+    return _csv_response(f"wavygo-vendor-statement-{slug}-{st['from']}-to-{st['to']}.csv", header, rows)
 
 
 @router.put("/vendors/{vendor_id}")

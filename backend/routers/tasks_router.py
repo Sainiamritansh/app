@@ -59,6 +59,13 @@ class TaskFileIn(BaseModel):
     comment_id: Optional[str] = None
 
 
+def _clean_due(value):
+    """An empty due date is stored as null (older tasks may still hold "", read as empty)."""
+    if isinstance(value, str):
+        value = value.strip()
+    return value or None
+
+
 async def _dept_ids(db, department):
     if not department:
         return []
@@ -298,6 +305,7 @@ async def create_task(payload: TaskIn, background_tasks: BackgroundTasks, curren
     doc["title"] = title
     doc["reporter_id"] = current.id
     doc["assignee_id"] = doc.get("assignee_id") or None
+    doc["due_date"] = _clean_due(doc.get("due_date"))
     doc["attachments"] = []
 
     await _check_member(db, current, doc["assignee_id"])
@@ -396,8 +404,12 @@ async def update_task(task_id: str, payload: TaskPatchIn, background_tasks: Back
         changes["title"] = changes["title"].strip()
     if "assignee_id" in changes:
         changes["assignee_id"] = changes["assignee_id"] or None
+    if "due_date" in changes:
+        changes["due_date"] = _clean_due(changes["due_date"])
     # Values echoed back unchanged are not edits (and must not count as reassignments).
-    changes = {k: v for k, v in changes.items() if existing.get(k) != v}
+    # Legacy tasks may store "" for "no due date"; that equals a cleared (null) due date.
+    before = {**existing, "due_date": _clean_due(existing.get("due_date"))}
+    changes = {k: v for k, v in changes.items() if before.get(k) != v}
 
     if current.role == "Intern" and set(changes) - {"status"}:
         # Interns may only change the status of their own assigned tasks.
