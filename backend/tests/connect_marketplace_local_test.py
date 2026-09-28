@@ -750,3 +750,60 @@ def test_today_bookings_use_ist_and_status_order(api, users, test_db):
     order = [s["status"] for s in call(api, users["founder"], "GET", "/marketplace/analytics").json()["by_status"]]
     lifecycle = ["pending", "confirmed", "active", "completed", "cancelled"]
     assert order == [s for s in lifecycle if s in order]
+
+
+# ------------------------- Connect: edit / delete messages -------------------------
+
+def _group_with(api, owner, *members):
+    return _channel(api, owner, kind="group", members=[m["id"] for m in members])
+
+
+def test_sender_can_edit_message(api, users):
+    ch = _group_with(api, users["manager"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"], "helo")
+    r = call(api, users["employee"], "PATCH", f"/connect/channels/{ch['id']}/messages/{msg['id']}", json={"body": " hello "})
+    assert r.status_code == 200, r.text
+    assert r.json()["body"] == "hello" and r.json()["edited_at"]
+    listed = call(api, users["manager"], "GET", f"/connect/channels/{ch['id']}/messages").json()
+    assert listed[-1]["body"] == "hello" and listed[-1]["edited_at"]
+    assert _listed(api, users["manager"], ch["id"])["last_body"] == "hello"
+
+
+def test_only_sender_can_edit_and_body_required(api, users):
+    ch = _group_with(api, users["manager"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"])
+    path = f"/connect/channels/{ch['id']}/messages/{msg['id']}"
+    assert call(api, users["manager"], "PATCH", path, json={"body": "hijack"}).status_code == 403
+    assert call(api, users["founder"], "PATCH", path, json={"body": "hijack"}).status_code == 403
+    assert call(api, users["employee"], "PATCH", path, json={"body": "   "}).status_code == 422
+    # Outsiders can't even see the channel.
+    assert call(api, users["employee2"], "PATCH", path, json={"body": "x"}).status_code in (403, 404)
+
+
+def test_sender_can_delete_message(api, users):
+    ch = _group_with(api, users["manager"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"], "oops secret")
+    path = f"/connect/channels/{ch['id']}/messages/{msg['id']}"
+    assert call(api, users["manager"], "DELETE", path).status_code == 403
+    r = call(api, users["employee"], "DELETE", path)
+    assert r.status_code == 200, r.text
+    listed = call(api, users["manager"], "GET", f"/connect/channels/{ch['id']}/messages").json()
+    assert listed[-1]["deleted"] is True and listed[-1]["body"] == ""
+    assert _listed(api, users["manager"], ch["id"])["last_body"] == "Message deleted"
+    # Deleted messages can't be edited or deleted again.
+    assert call(api, users["employee"], "PATCH", path, json={"body": "back"}).status_code == 404
+    assert call(api, users["employee"], "DELETE", path).status_code == 404
+
+
+def test_founder_can_moderate_delete(api, users, test_db):
+    ch = _group_with(api, users["founder"], users["employee"])
+    msg = _post(api, users["employee"], ch["id"], "off-topic")
+    r = call(api, users["founder"], "DELETE", f"/connect/channels/{ch['id']}/messages/{msg['id']}")
+    assert r.status_code == 200, r.text
+    assert test_db.activity_logs.find_one({"action": "Deleted message", "user_id": users["founder"]["id"]})
+
+
+def test_edit_delete_unknown_message(api, users):
+    ch = _group_with(api, users["manager"], users["employee"])
+    for bad in ("nope", "0" * 24):
+        assert call(api, users["employee"], "DELETE", f"/connect/channels/{ch['id']}/messages/{bad}").status_code == 404

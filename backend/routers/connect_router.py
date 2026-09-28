@@ -591,6 +591,67 @@ async def send_message(channel_id: str, payload: MessageCreate, current: UserPub
     return serialize(doc)
 
 
+class MessageEdit(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+    body: str = Field(min_length=1, max_length=4000)
+
+
+async def _own_message(db, channel_id: str, message_id: str, current: UserPublic) -> tuple[dict, dict]:
+    """The channel (visible to the caller) and a live message in it, else 404."""
+    ch = await _visible_channel(db, channel_id, current)
+    if not ObjectId.is_valid(message_id):
+        raise HTTPException(404, "Message not found")
+    msg = await db.messages.find_one({"_id": ObjectId(message_id), "channel_id": channel_id})
+    if not msg or msg.get("deleted"):
+        raise HTTPException(404, "Message not found")
+    return ch, msg
+
+
+async def _refresh_preview(db, channel_id: str, message: dict) -> None:
+    """Keep the channel list preview in step when its latest message is edited or deleted."""
+    latest = await db.messages.find_one({"channel_id": channel_id}, sort=[("created_at", -1)])
+    if latest and latest["_id"] == message["_id"]:
+        preview = "Message deleted" if message.get("deleted") else message["body"][:120]
+        await db.channels.update_one({"_id": oid(channel_id)}, {"$set": {"last_body": preview}})
+
+
+@router.patch("/channels/{channel_id}/messages/{message_id}")
+async def edit_message(channel_id: str, message_id: str, payload: MessageEdit,
+                       current: UserPublic = Depends(get_current_user)):
+    """Only the sender can edit their message; it is marked as edited."""
+    db = get_db()
+    _, msg = await _own_message(db, channel_id, message_id, current)
+    if msg.get("sender_id") != current.id:
+        raise HTTPException(403, "You can only edit your own messages")
+    if payload.body == msg.get("body"):
+        return serialize(msg)
+    now = utc_iso()
+    await db.messages.update_one({"_id": msg["_id"]}, {"$set": {"body": payload.body, "edited_at": now, "updated_at": now}})
+    msg.update(body=payload.body, edited_at=now, updated_at=now)
+    await _refresh_preview(db, channel_id, msg)
+    return serialize(msg)
+
+
+@router.delete("/channels/{channel_id}/messages/{message_id}")
+async def delete_message(channel_id: str, message_id: str, current: UserPublic = Depends(get_current_user)):
+    """The sender can delete their message; Founder/Admin can remove any message (moderation).
+    The message stays in place as "This message was deleted" so the conversation still reads."""
+    db = get_db()
+    ch, msg = await _own_message(db, channel_id, message_id, current)
+    own = msg.get("sender_id") == current.id
+    if not own and current.role not in MANAGER_ROLES:
+        raise HTTPException(403, "You can only delete your own messages")
+    now = utc_iso()
+    fields = {"deleted": True, "body": "", "attachments": [], "deleted_at": now, "deleted_by": current.id, "updated_at": now}
+    await db.messages.update_one({"_id": msg["_id"]}, {"$set": fields})
+    msg.update(fields)
+    await _refresh_preview(db, channel_id, msg)
+    if not own:
+        await log_activity(db, current, "Deleted message", "WavyGo Connect",
+                           target=f"{msg.get('sender_name')} in {ch['name']}")
+    return serialize(msg)
+
+
 @router.post("/channels/{channel_id}/join")
 async def join_channel(channel_id: str, current: UserPublic = Depends(get_current_user)):
     db = get_db()

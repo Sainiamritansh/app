@@ -11,7 +11,12 @@ import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, ShieldPlus, ShieldMinus, UserPlus, UserMinus, LogOut, Crown, Settings2 } from "lucide-react";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription,
+  AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, ShieldPlus, ShieldMinus, UserPlus, UserMinus, LogOut, Crown, Settings2, MoreHorizontal, Pencil, Trash2, Copy, Ban, Check, X } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -107,6 +112,10 @@ export default function WavygoConnect() {
   const [users, setUsers] = useState([]);
   const [activeId, setActiveId] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [editingId, setEditingId] = useState(null);   // message being edited inline
+  const [editText, setEditText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [deleting, setDeleting] = useState(null);     // message awaiting delete confirmation
   const [text, setText] = useState("");
   const [createOpen, setCreateOpen] = useState(false);
   const [dmOpen, setDmOpen] = useState(false);
@@ -261,7 +270,9 @@ export default function WavygoConnect() {
     try {
       const { data } = await api.get(`/connect/channels/${id}/messages`);
       if (id !== activeIdRef.current) return;
-      const sig = `${id}:${data.length}:${data[data.length - 1]?.id || ""}`;
+      // Include the latest edit/delete time so changes to existing messages re-render too.
+      const changed = data.reduce((max, m) => (m.updated_at && m.updated_at > max ? m.updated_at : max), "");
+      const sig = `${id}:${data.length}:${data[data.length - 1]?.id || ""}:${changed}`;
       if (sig === msgSigRef.current) return;
       msgSigRef.current = sig;
       scrollNextRef.current = scroll || isNearBottom();
@@ -272,6 +283,7 @@ export default function WavygoConnect() {
   useEffect(() => {
     activeIdRef.current = activeId;
     msgSigRef.current = "";
+    setEditingId(null);
     if (activeId) {
       loadMessages(activeId, { scroll: true });
       const t = setInterval(() => loadMessages(activeId, { silent: true }), 5000);
@@ -367,6 +379,47 @@ export default function WavygoConnect() {
       setDmOpen(false);
       loadChannels(data.id);
     } catch (e) { toast.error(formatApiError(e)); }
+  }
+
+  // ------------------------- edit / delete -------------------------
+
+  function startEdit(m) {
+    setEditingId(m.id);
+    setEditText(m.body);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditText("");
+  }
+
+  async function saveEdit(m) {
+    const body = editText.trim();
+    if (!body || savingEdit) return;
+    if (body === m.body) { cancelEdit(); return; }
+    setSavingEdit(true);
+    try {
+      const { data } = await api.patch(`/connect/channels/${activeId}/messages/${m.id}`, { body });
+      setMessages((list) => list.map((x) => (x.id === m.id ? data : x)));
+      cancelEdit();
+      loadChannels(null, true);
+    } catch (e) { toast.error(formatApiError(e)); } finally { setSavingEdit(false); }
+  }
+
+  async function confirmDeleteMessage() {
+    const m = deleting;
+    if (!m) return;
+    try {
+      const { data } = await api.delete(`/connect/channels/${activeId}/messages/${m.id}`);
+      setMessages((list) => list.map((x) => (x.id === m.id ? data : x)));
+      if (editingId === m.id) cancelEdit();
+      toast.success("Message deleted");
+      loadChannels(null, true);
+    } catch (e) { toast.error(formatApiError(e)); } finally { setDeleting(null); }
+  }
+
+  async function copyMessage(m) {
+    try { await navigator.clipboard.writeText(m.body); toast.success("Copied"); } catch { toast.error("Couldn't copy"); }
   }
 
   async function send() {
@@ -618,16 +671,73 @@ export default function WavygoConnect() {
                 {messages.length === 0 && <div className="text-center text-sm text-muted-foreground py-16">No messages yet. Say hello 👋</div>}
                 {messages.map(m => {
                   const mine = m.sender_id === user?.id;
+                  const canEditMsg = mine && !m.deleted;
+                  const canDeleteMsg = !m.deleted && (mine || isOrgAdmin);
+                  const editing = editingId === m.id;
                   return (
-                    <div key={m.id} className={cn("flex gap-2.5", mine && "flex-row-reverse")}>
+                    <div key={m.id} className={cn("group flex gap-2.5", mine && "flex-row-reverse")} data-testid="connect-message">
                       <Avatar className="h-7 w-7 shrink-0"><AvatarImage src={m.sender_photo || undefined} /><AvatarFallback className="text-[9px] bg-wavygo-100 text-wavygo-800">{initials(m.sender_name)}</AvatarFallback></Avatar>
-                      <div className={cn("max-w-[70%]", mine && "text-right")}>
+                      <div className={cn("max-w-[70%] min-w-0", mine && "text-right", editing && "w-full")}>
                         <div className={cn("flex items-baseline gap-2 mb-0.5", mine && "flex-row-reverse")}>
                           <span className="text-[12px] font-medium">{m.sender_name}</span>
                           <span className="text-[10.5px] text-muted-foreground">{(() => { try { return formatDistanceToNow(new Date(m.created_at), { addSuffix: true }); } catch { return ""; } })()}</span>
+                          {m.edited_at && !m.deleted && <span className="text-[10.5px] text-muted-foreground italic" title={`Edited ${new Date(m.edited_at).toLocaleString()}`}>(edited)</span>}
                         </div>
-                        <div className={cn("inline-block rounded-lg px-3 py-2 text-[13.5px] leading-relaxed", mine ? "bg-primary text-primary-foreground" : "bg-muted text-foreground")}>
-                          {m.body}
+                        <div className={cn("flex items-center gap-1", mine && "flex-row-reverse")}>
+                          {editing ? (
+                            <div className="w-full text-left space-y-1.5">
+                              <Textarea
+                                autoFocus
+                                rows={2}
+                                maxLength={4000}
+                                value={editText}
+                                onChange={(e) => setEditText(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveEdit(m); }
+                                  if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+                                }}
+                                className="text-[13.5px] min-h-[60px]"
+                                data-testid="connect-edit-input"
+                              />
+                              <div className="flex items-center justify-end gap-1.5">
+                                <span className="text-[10.5px] text-muted-foreground mr-auto">Enter to save · Esc to cancel</span>
+                                <Button size="sm" variant="ghost" className="h-7 gap-1" onClick={cancelEdit}><X className="h-3.5 w-3.5" />Cancel</Button>
+                                <Button size="sm" className="h-7 gap-1" onClick={() => saveEdit(m)} disabled={!editText.trim() || savingEdit} data-testid="connect-edit-save">
+                                  <Check className="h-3.5 w-3.5" />Save
+                                </Button>
+                              </div>
+                            </div>
+                          ) : m.deleted ? (
+                            <div className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-[13px] italic text-muted-foreground border border-dashed border-border">
+                              <Ban className="h-3.5 w-3.5" /> This message was deleted
+                            </div>
+                          ) : (
+                            <div className={cn("inline-block rounded-lg px-3 py-2 text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-left", mine ? "bg-primary text-primary-foreground" : "bg-muted text-foreground")}>
+                              {m.body}
+                            </div>
+                          )}
+                          {!editing && !m.deleted && (
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <button type="button" aria-label="Message options" data-testid="connect-message-menu"
+                                        className="shrink-0 h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 hover:bg-muted transition-opacity">
+                                  <MoreHorizontal className="h-4 w-4" />
+                                </button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align={mine ? "end" : "start"} className="w-40">
+                                <DropdownMenuItem onSelect={() => copyMessage(m)}><Copy className="h-4 w-4 mr-2" />Copy text</DropdownMenuItem>
+                                {canEditMsg && <DropdownMenuItem onSelect={() => startEdit(m)} data-testid="connect-message-edit"><Pencil className="h-4 w-4 mr-2" />Edit</DropdownMenuItem>}
+                                {canDeleteMsg && (
+                                  <>
+                                    <DropdownMenuSeparator />
+                                    <DropdownMenuItem onSelect={() => setDeleting(m)} className="text-destructive focus:text-destructive" data-testid="connect-message-delete">
+                                      <Trash2 className="h-4 w-4 mr-2" />{mine ? "Delete" : "Delete (moderate)"}
+                                    </DropdownMenuItem>
+                                  </>
+                                )}
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -637,7 +747,13 @@ export default function WavygoConnect() {
 
               {(active.kind !== "announcement" || canPostAnnouncement) && (
                 <div className="border-t border-border px-4 py-3 flex items-center gap-2">
-                  <Input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), send())}
+                  <Input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => {
+                           if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+                           else if (e.key === "ArrowUp" && !text) {
+                             const last = [...messages].reverse().find((m) => m.sender_id === user?.id && !m.deleted);
+                             if (last) { e.preventDefault(); startEdit(last); }
+                           }
+                         }}
                          placeholder={`Message ${active.kind === "dm" ? active.display_name || active.name : "#" + active.name}`}
                          className="h-10" data-testid="connect-message-input" />
                   <Button onClick={send} disabled={!text.trim()} data-testid="connect-send-btn"><Send className="h-4 w-4" /></Button>
@@ -647,6 +763,28 @@ export default function WavygoConnect() {
           )}
         </Card>
       </div>
+
+      <AlertDialog open={!!deleting} onOpenChange={(o) => !o && setDeleting(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete this message?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {deleting && deleting.sender_id !== user?.id
+                ? `This removes ${deleting.sender_name}'s message for everyone. It will show as "This message was deleted".`
+                : `It will be removed for everyone and show as "This message was deleted". This can't be undone.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {deleting?.body && (
+            <div className="rounded-md bg-muted px-3 py-2 text-[13px] text-muted-foreground line-clamp-3 whitespace-pre-wrap">{deleting.body}</div>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmDeleteMessage} className="bg-destructive text-destructive-foreground hover:bg-destructive/90" data-testid="connect-confirm-delete">
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* New channel dialog */}
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
