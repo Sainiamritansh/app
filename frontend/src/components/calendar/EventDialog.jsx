@@ -11,11 +11,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import AvailabilityPanel from "./AvailabilityPanel";
 import { api, formatApiError } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import {
-  CATEGORIES, DEFAULT_REMINDER, REMINDERS, STATUSES, VISIBILITY, categoryStyle, combineDateTime, eventEnd, eventStart, initials,
-  lastEventDay, safeUrl,
+  CATEGORIES, DEFAULT_REMINDER, DURATION_PRESETS, REMINDERS, STATUSES, VISIBILITY, categoryStyle, combineDateTime,
+  durationLabel, eventEnd, eventStart, initials, lastEventDay, safeUrl,
 } from "./calendarUtils";
 
 const DATE = "yyyy-MM-dd";
@@ -47,8 +48,8 @@ function formFromEvent(ev) {
   };
 }
 
-function blankForm(start) {
-  const end = addHours(start, 1);
+function blankForm(start, requestedEnd) {
+  const end = requestedEnd && requestedEnd > start ? requestedEnd : addHours(start, 1);
   return {
     title: "",
     description: "",
@@ -175,7 +176,12 @@ function FieldError({ children }) {
   return children ? <p className="text-[12px] text-destructive mt-1">{children}</p> : null;
 }
 
-export default function EventDialog({ open, onOpenChange, event, defaultStart, onSaved, user }) {
+/** A duplicate keeps everything but the status, which starts fresh. */
+function formFromTemplate(ev) {
+  return { ...formFromEvent(ev), status: "confirmed" };
+}
+
+export default function EventDialog({ open, onOpenChange, event, template, defaultStart, defaultEnd, onSaved, user }) {
   const editing = !!event;
   const [form, setForm] = useState(() => blankForm(defaultStart || new Date()));
   const [errors, setErrors] = useState({});
@@ -185,9 +191,11 @@ export default function EventDialog({ open, onOpenChange, event, defaultStart, o
 
   useEffect(() => {
     if (!open) return;
-    setForm(event ? formFromEvent(event) : blankForm(defaultStart || new Date()));
+    if (event) setForm(formFromEvent(event));
+    else if (template) setForm(formFromTemplate(template));
+    else setForm(blankForm(defaultStart || new Date(), defaultEnd));
     setErrors({});
-  }, [open, event, defaultStart]);
+  }, [open, event, template, defaultStart, defaultEnd]);
 
   useEffect(() => {
     if (!open || people.length) return;
@@ -232,8 +240,33 @@ export default function EventDialog({ open, onOpenChange, event, defaultStart, o
     });
   };
 
+  /** Quick duration: keep the start, move the end. */
+  const setDuration = (minutes) => {
+    const { start } = resolveTimes(form);
+    if (!start) return;
+    const end = new Date(start.getTime() + minutes * 60000);
+    set({ endDate: format(end, DATE), endTime: format(end, TIME) });
+  };
+
+  const pickSlot = (start, end) => {
+    set({ startDate: format(start, DATE), startTime: format(start, TIME), endDate: format(end, DATE), endTime: format(end, TIME) });
+    toast.success(`Moved to ${format(start, "EEE d MMM, h:mm a")}`);
+  };
+
+  const times = resolveTimes(form);
+  const duration = !form.allDay && times.start && times.end ? Math.round((times.end - times.start) / 60000) : null;
+  const organizer = editing
+    ? { id: event.organizer_id, name: event.organizer_name || "Organiser", you: event.organizer_id === user?.id }
+    : user && { id: user.id, name: user.name, photo: user.photo, you: true };
+  const availabilityPeople = useMemo(() => {
+    const invited = form.participantIds.map((id) => people.find((p) => p.id === id)).filter(Boolean);
+    return [organizer, ...invited.filter((p) => p.id !== organizer?.id)].filter((p) => p?.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.participantIds, people, organizer?.id]);
+
   const submit = async (e) => {
     e.preventDefault();
+    if (saving) return;
     const found = validate(form);
     setErrors(found);
     if (Object.keys(found).length) return;
@@ -273,13 +306,20 @@ export default function EventDialog({ open, onOpenChange, event, defaultStart, o
     <Dialog open={open} onOpenChange={(o) => !saving && onOpenChange(o)}>
       <DialogContent className="max-w-xl max-h-[92vh] overflow-y-auto scrollbar-thin" data-testid="calendar-event-form">
         <DialogHeader>
-          <DialogTitle className="font-display">{editing ? "Edit event" : "New event"}</DialogTitle>
+          <DialogTitle className="font-display">{editing ? "Edit event" : template ? "Duplicate event" : "New event"}</DialogTitle>
           <DialogDescription>
-            {editing ? "Changes are visible to everyone who can see this event." : "Invited people get a notification with the event details."}
+            {editing
+              ? "Changes are visible to everyone who can see this event. Moving it asks invitees to respond again."
+              : "Invited people get a notification and can reply Going, Maybe or Can't go."}
           </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={submit} className="space-y-4" noValidate>
+        <form
+          onSubmit={submit}
+          onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submit(e); }}
+          className="space-y-4"
+          noValidate
+        >
           <div>
             <Label htmlFor="ev-title">Title</Label>
             <Input id="ev-title" className="mt-1" autoFocus maxLength={200} value={form.title}
@@ -336,6 +376,27 @@ export default function EventDialog({ open, onOpenChange, event, defaultStart, o
                 ? <Input type="time" step={300} className="w-32" value={form.endTime} onChange={(e) => set({ endTime: e.target.value })} />
                 : <span />}
             </div>
+            {!form.allDay && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11.5px] text-muted-foreground mr-0.5">Duration</span>
+                {DURATION_PRESETS.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setDuration(m)}
+                    className={cn(
+                      "h-6 px-2 rounded-full border text-[11.5px] tabular-nums transition-colors",
+                      duration === m ? "border-primary bg-primary/10 text-primary font-medium" : "border-border hover:bg-muted",
+                    )}
+                  >
+                    {durationLabel(m)}
+                  </button>
+                ))}
+                {duration !== null && duration > 0 && !DURATION_PRESETS.includes(duration) && (
+                  <span className="text-[11.5px] text-muted-foreground tabular-nums">· {durationLabel(duration)}</span>
+                )}
+              </div>
+            )}
             <FieldError>{errors.start || errors.end}</FieldError>
           </div>
 
@@ -373,6 +434,16 @@ export default function EventDialog({ open, onOpenChange, event, defaultStart, o
             </div>
           </div>
 
+          {!form.allDay && form.participantIds.length > 0 && times.start && times.end && times.end >= times.start && (
+            <AvailabilityPanel
+              start={times.start}
+              end={times.end}
+              people={availabilityPeople}
+              excludeEventId={event?.id}
+              onPickSlot={pickSlot}
+            />
+          )}
+
           <div>
             <Label htmlFor="ev-desc">Description</Label>
             <Textarea id="ev-desc" rows={3} className="mt-1" maxLength={5000} value={form.description}
@@ -396,6 +467,7 @@ export default function EventDialog({ open, onOpenChange, event, defaultStart, o
             <Button type="submit" disabled={saving} className="gap-1.5" data-testid="calendar-save-event">
               {saving && <Loader2 className="h-4 w-4 animate-spin" />}
               {editing ? "Save changes" : "Schedule event"}
+              <kbd className="hidden sm:inline ml-1 text-[10px] opacity-60 font-sans">Ctrl ↵</kbd>
             </Button>
           </DialogFooter>
         </form>

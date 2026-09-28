@@ -178,3 +178,108 @@ export function safeUrl(url) {
 export function canModifyEvent(ev, user, can, action) {
   return !!user && (ev.organizer_id === user.id || can(action));
 }
+
+/** Compact time for month chips: "7:45a", "10p". */
+export function chipTime(d) {
+  const h = d.getHours();
+  const m = d.getMinutes();
+  const suffix = h < 12 ? "a" : "p";
+  const h12 = h % 12 || 12;
+  return m ? `${h12}:${String(m).padStart(2, "0")}${suffix}` : `${h12}${suffix}`;
+}
+
+export function canEditEvent(ev, user, can) {
+  return canModifyEvent(ev, user, can, "calendar.edit_any");
+}
+
+// ------------------------- RSVP -------------------------
+
+export const RSVP_OPTIONS = [
+  { key: "accepted", label: "Going" },
+  { key: "tentative", label: "Maybe" },
+  { key: "declined", label: "Can't go" },
+];
+
+export const RESPONSE_STYLES = {
+  accepted:  { label: "Going",    dot: "bg-emerald-500", text: "text-emerald-700 dark:text-emerald-300" },
+  tentative: { label: "Maybe",    dot: "bg-amber-500",   text: "text-amber-700 dark:text-amber-300" },
+  declined:  { label: "Can't go", dot: "bg-rose-500",    text: "text-rose-700 dark:text-rose-300" },
+  pending:   { label: "Awaiting", dot: "bg-slate-300 dark:bg-slate-600", text: "text-muted-foreground" },
+};
+
+export function responseCounts(ev) {
+  const counts = { accepted: 0, tentative: 0, declined: 0, pending: 0 };
+  for (const p of ev.participants || []) counts[p.response || "pending"] += 1;
+  return counts;
+}
+
+// ------------------------- scheduling helpers -------------------------
+
+export const DURATION_PRESETS = [15, 30, 45, 60, 90, 120];
+
+export function durationLabel(minutes) {
+  if (minutes < 60) return `${minutes}m`;
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
+
+/** "in 25 min", "in 3 h", "now", or null once it's over / far away. */
+export function relativeStart(ev, now = new Date()) {
+  const start = eventStart(ev);
+  const end = eventEnd(ev);
+  if (start <= now && now < end) return "Happening now";
+  const minutes = Math.round((start - now) / 60000);
+  if (minutes < 0) return null;
+  if (minutes < 1) return "Starting now";
+  if (minutes < 60) return `In ${minutes} min`;
+  if (minutes < 24 * 60) return `In ${Math.round(minutes / 60)} h`;
+  const days = Math.round(minutes / (24 * 60));
+  return `In ${days} day${days === 1 ? "" : "s"}`;
+}
+
+/** Overlap of [aStart, aEnd) and [bStart, bEnd); zero-length ranges count when inside. */
+export function rangesOverlap(aStart, aEnd, bStart, bEnd) {
+  if (+aStart === +aEnd) return aStart >= bStart && aStart < bEnd;
+  if (+bStart === +bEnd) return bStart >= aStart && bStart < aEnd;
+  return aStart < bEnd && bStart < aEnd;
+}
+
+// ------------------------- export -------------------------
+
+const icsDate = (d) => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
+const icsDay = (d) => format(d, "yyyyMMdd");
+const icsText = (v = "") => String(v).replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/[,;]/g, (c) => `\\${c}`);
+
+/** A minimal RFC 5545 file for one event, so it can be added to Google / Outlook / Apple calendars. */
+export function buildIcs(ev) {
+  const start = eventStart(ev);
+  const end = eventEnd(ev);
+  const lines = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//WavyGo OS//Calendar//EN", "CALSCALE:GREGORIAN", "BEGIN:VEVENT",
+    `UID:${ev.id}@wavygo`,
+    `DTSTAMP:${icsDate(new Date())}`,
+    ...(ev.all_day
+      ? [`DTSTART;VALUE=DATE:${icsDay(start)}`, `DTEND;VALUE=DATE:${icsDay(end)}`]
+      : [`DTSTART:${icsDate(start)}`, `DTEND:${icsDate(end)}`]),
+    `SUMMARY:${icsText(ev.title)}`,
+    ev.location && `LOCATION:${icsText(ev.location)}`,
+    (ev.description || ev.meeting_link) && `DESCRIPTION:${icsText([ev.description, ev.meeting_link].filter(Boolean).join("\n\n"))}`,
+    safeUrl(ev.meeting_link) && `URL:${safeUrl(ev.meeting_link)}`,
+    `STATUS:${ev.status === "cancelled" ? "CANCELLED" : ev.status === "tentative" ? "TENTATIVE" : "CONFIRMED"}`,
+    "END:VEVENT", "END:VCALENDAR",
+  ].filter(Boolean);
+  return lines.join("\r\n");
+}
+
+export function downloadIcs(ev) {
+  const blob = new Blob([buildIcs(ev)], { type: "text/calendar;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${(ev.title || "event").replace(/[^\w\- ]+/g, "").trim() || "event"}.ics`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}

@@ -296,6 +296,7 @@ class MessageIn(BaseModel):
 EventCategory = Literal["Meeting", "Product Launch", "Team Sync", "Workshop", "Milestone", "Reminder", "Other"]
 EventVisibility = Literal["public", "department", "private"]
 EventStatus = Literal["confirmed", "tentative", "cancelled"]
+RsvpResponse = Literal["accepted", "tentative", "declined"]
 
 MAX_EVENT_PARTICIPANTS = 200
 MAX_REMINDER_MINUTES = 7 * 24 * 60
@@ -361,3 +362,7 @@ class CalendarEventPatch(BaseModel):
 
     check_tz = field_validator("start_time", "end_time")(_require_tz)
     check_participant_ids = field_validator("participant_ids")(_dedupe_ids)
+
+
+class CalendarRsvpIn(BaseModel):
+    response: RsvpResponse
