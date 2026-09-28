@@ -183,6 +183,7 @@ Endpoints: `GET /api/dashboard/stats`, `GET /api/dashboard/live-kpis`.
 
 ### Marketplace (Founder only)
 - Tabs: Dashboard, Bookings, Customers, Vendors, Vehicles, Cities, Pricing, Coupons, KYC, Support, Reviews, Analytics.
+- The Dashboard tab refreshes live every 30 seconds while visible and when you return to the browser tab.
 - Bookings: create, status flow `pending → confirmed → active → completed / cancelled`. A booking can redeem a coupon: validity dates, active flag and usage limit are checked and the use is counted atomically. Cancelling a booking gives the coupon use back once (repeat cancels are no-ops).
 - Coupons: `valid_from` / `valid_till` must be `YYYY-MM-DD` dates in order; validity is compared with today's IST date.
 - KYC workflow for vendors and customers (Aadhaar, PAN, DL, GST, CIN, other), support tickets with priority and status.
