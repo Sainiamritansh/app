@@ -29,6 +29,11 @@ def email_configured() -> bool:
     return bool(_brevo_key() and _sender()["email"])
 
 
+def _esc(value) -> str:
+    """HTML-escape a value for an email body (None becomes empty)."""
+    return html.escape("" if value is None else str(value), quote=True)
+
+
 def _skip_unconfigured(kind: str, recipient: str) -> bool:
     """Log and report True when sending must be skipped because email is not configured."""
     if email_configured():
@@ -50,8 +55,10 @@ def send_invitation_email(
     if _skip_unconfigured("invitation", recipient_email):
         return False
 
-    accept_url = f"{FRONTEND_URL}/accept-invite?token={token}"
+    accept_url = f"{FRONTEND_URL}/accept-invite?token={quote(token)}"
     url = BREVO_URL
+    # Names, roles and the inviter come from user input; escape them so they render as text.
+    h_name, h_role, h_by, h_url = _esc(recipient_name), _esc(role), _esc(invited_by), _esc(accept_url)
     headers = {
         "api-key": _brevo_key(),
         "Content-Type": "application/json",
@@ -60,8 +67,8 @@ def send_invitation_email(
         "X-Mailin-Click": "0"
     }
 
-    desig_html = f"<div><strong>Designation:</strong> {designation}</div>" if designation else ""
-    dept_html = f"<div><strong>Department:</strong> {department}</div>" if department else ""
+    desig_html = f"<div><strong>Designation:</strong> {_esc(designation)}</div>" if designation else ""
+    dept_html = f"<div><strong>Department:</strong> {_esc(department)}</div>" if department else ""
 
     text_content = f"Hello {recipient_name},\n\nYou have been invited by {invited_by} to join WavyGo OS as {role}.\n\nPlease click the link below to accept your invitation:\n{accept_url}\n\n© 2026 WavyGo OS"
 
@@ -90,11 +97,11 @@ def send_invitation_email(
       <h1 class="brand-name">WavyGo OS</h1>
       <span class="badge">Team Invitation</span>
     </div>
-    <p class="greeting">Hello {recipient_name},</p>
-    <p class="text">You have been invited by <strong>{invited_by}</strong> to join the <strong>WavyGo OS</strong> workspace.</p>
+    <p class="greeting">Hello {h_name},</p>
+    <p class="text">You have been invited by <strong>{h_by}</strong> to join the <strong>WavyGo OS</strong> workspace.</p>
     
     <div class="box">
-      <div><strong>Role:</strong> {role}</div>
+      <div><strong>Role:</strong> {h_role}</div>
       {desig_html}
       {dept_html}
     </div>
@@ -102,12 +109,12 @@ def send_invitation_email(
     <p class="text">Please click the button below to accept your invitation and set up your account password. Once accepted, your profile will be added to the employee directory.</p>
 
     <div class="btn-wrapper">
-      <a href="{accept_url}" class="btn" target="_blank">Accept Invitation & Join Team</a>
+      <a href="{h_url}" class="btn" target="_blank">Accept Invitation &amp; Join Team</a>
     </div>
 
     <div class="link-note">
       If the button does not work, copy and paste this URL into your browser:<br>
-      <a href="{accept_url}" style="color: #2563eb;">{accept_url}</a>
+      <a href="{h_url}" style="color: #2563eb;">{h_url}</a>
     </div>
 
     <div class="footer">
@@ -150,6 +157,7 @@ def send_password_reset_email(
 
     login_url = f"{FRONTEND_URL}/login"
     url = BREVO_URL
+    h_name, h_by, h_email, h_pwd = _esc(recipient_name), _esc(reset_by), _esc(recipient_email), _esc(new_password)
     headers = {
         "api-key": _brevo_key(),
         "Content-Type": "application/json",
@@ -199,17 +207,17 @@ def send_password_reset_email(
       <h1 class="brand-name">WavyGo OS</h1>
       <span class="badge">Password Reset</span>
     </div>
-    <p class="greeting">Hello {recipient_name},</p>
-    <p class="text">Your account password for <strong>WavyGo OS</strong> has been reset by <strong>{reset_by}</strong>.</p>
+    <p class="greeting">Hello {h_name},</p>
+    <p class="text">Your account password for <strong>WavyGo OS</strong> has been reset by <strong>{h_by}</strong>.</p>
     
     <div class="cred-box">
       <div class="cred-row">
         <div class="cred-label">Account Email</div>
-        <div class="cred-email">{recipient_email}</div>
+        <div class="cred-email">{h_email}</div>
       </div>
       <div class="cred-row">
         <div class="cred-label">New Password</div>
-        <div class="cred-pwd">{new_password}</div>
+        <div class="cred-pwd">{h_pwd}</div>
       </div>
     </div>
 
@@ -289,6 +297,8 @@ def send_assignment_email(
     }
 
     role_info = f" ({assigned_by_role})" if assigned_by_role else ""
+    h_name, h_title, h_by, h_url = _esc(recipient_name), _esc(item_title), _esc(assigned_by), _esc(erp_url)
+    h_role_info = _esc(role_info)
     priority_info = f"\nPriority: {priority}" if priority else ""
     deadline_info = f"\nDeadline / Due Date: {deadline}" if deadline else ""
 
@@ -310,9 +320,9 @@ def send_assignment_email(
 
     extra_rows = []
     if priority:
-        extra_rows.append(f'<div class="item-row"><strong>Priority / Type:</strong> {priority}</div>')
+        extra_rows.append(f'<div class="item-row"><strong>Priority / Type:</strong> {_esc(priority)}</div>')
     if deadline:
-        extra_rows.append(f'<div class="item-row"><strong>Due Date / Deadline:</strong> {deadline}</div>')
+        extra_rows.append(f'<div class="item-row"><strong>Due Date / Deadline:</strong> {_esc(deadline)}</div>')
     extra_html = "\n      ".join(extra_rows)
 
     html_content = f"""<!DOCTYPE html>
@@ -343,24 +353,24 @@ def send_assignment_email(
       <h1 class="brand-name">WavyGo OS</h1>
       <span class="badge">{badge_label}</span>
     </div>
-    <p class="greeting">Hello {recipient_name},</p>
+    <p class="greeting">Hello {h_name},</p>
     <p class="text">A new task/opportunity has been assigned to you on the ERP. Please log in to the ERP and check the details.</p>
     
     <div class="item-box">
-      <div class="item-row"><strong>{item_label}:</strong> {item_title}</div>
-      <div class="item-row"><strong>Assigned by:</strong> {assigned_by}{role_info}</div>
+      <div class="item-row"><strong>{item_label}:</strong> {h_title}</div>
+      <div class="item-row"><strong>Assigned by:</strong> {h_by}{h_role_info}</div>
       {extra_html}
     </div>
 
     <p class="text">You have been directed to open the ERP to review all assignment details, milestones, and instructions.</p>
 
     <div class="btn-wrapper">
-      <a href="{erp_url}" class="btn" target="_blank">Open ERP & Check Details</a>
+      <a href="{h_url}" class="btn" target="_blank">Open ERP &amp; Check Details</a>
     </div>
 
     <div class="link-note">
       If the button does not work, copy and paste this URL into your browser:<br>
-      <a href="{erp_url}" style="color: #2563eb;">{erp_url}</a>
+      <a href="{h_url}" style="color: #2563eb;">{h_url}</a>
     </div>
 
     <p class="signoff">
@@ -603,4 +613,134 @@ def send_password_reset_link_email(
         return False
     except Exception as e:
         logger.error("[Email] Exception sending password reset link: %s", e)
+        return False
+
+
+# ------------------------- calendar -------------------------
+
+CALENDAR_EMAILS = {
+    # kind: (badge, badge background, badge colour, subject prefix, headline)
+    "invite":     ("Event Invitation", "#eff6ff", "#1d4ed8", "Invitation", "{actor} invited you to an event."),
+    "reminder":   ("Event Reminder",   "#ecfdf5", "#047857", "Reminder",   "Your event {when_phrase}."),
+    "rescheduled": ("Event Rescheduled", "#fef3c7", "#b45309", "Rescheduled", "{actor} moved this event to a new time. Please reply again."),
+    "cancelled":  ("Event Cancelled",  "#fef2f2", "#b91c1c", "Cancelled",  "{actor} cancelled this event."),
+}
+
+
+def send_calendar_email(
+    recipient_email: str,
+    recipient_name: str,
+    kind: str,
+    title: str,
+    when: str,
+    actor: str = "",
+    location: str | None = None,
+    meeting_link: str | None = None,
+    event_id: str | None = None,
+    when_phrase: str = "starts soon",
+) -> bool:
+    """Calendar invitation / reminder / reschedule / cancellation email via Brevo."""
+    if kind not in CALENDAR_EMAILS:
+        raise ValueError(f"unknown calendar email kind: {kind}")
+    if _skip_unconfigured(f"calendar {kind}", recipient_email):
+        return False
+
+    badge, badge_bg, badge_fg, prefix, headline = CALENDAR_EMAILS[kind]
+    headline = headline.format(actor=actor or "Someone", when_phrase=when_phrase)
+    event_url = f"{FRONTEND_URL}/calendar" + (f"?event={quote(str(event_id))}" if event_id else "")
+    join_url = meeting_link if meeting_link and meeting_link.startswith(("https://", "http://")) else None
+    struck = kind == "cancelled"
+
+    rows = [f'<div class="item-row"><strong>When:</strong> {_esc(when)}</div>']
+    if location:
+        rows.append(f'<div class="item-row"><strong>Where:</strong> {_esc(location)}</div>')
+    if join_url and not struck:
+        rows.append(f'<div class="item-row"><strong>Online:</strong> <a href="{_esc(join_url)}" style="color:#2563eb;">Join meeting</a></div>')
+    rows_html = "\n      ".join(rows)
+    title_html = f'<s>{_esc(title)}</s>' if struck else _esc(title)
+
+    text_lines = [
+        f"Hello {recipient_name or 'there'},",
+        "",
+        headline,
+        "",
+        f"{title}",
+        f"When: {when}",
+        *( [f"Where: {location}"] if location else [] ),
+        *( [f"Join: {join_url}"] if join_url and not struck else [] ),
+        "",
+        f"Open in WavyGo OS: {event_url}",
+        "",
+        "© 2026 WavyGo OS",
+    ]
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{ font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif; background-color: #f8fafc; margin: 0; padding: 24px; color: #1e293b; }}
+    .card {{ max-width: 540px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 36px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }}
+    .brand {{ text-align: center; margin-bottom: 24px; }}
+    .brand-name {{ font-size: 26px; font-weight: 800; color: #2563eb; letter-spacing: -0.5px; margin: 0; }}
+    .badge {{ display: inline-block; background: {badge_bg}; color: {badge_fg}; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-top: 6px; }}
+    .greeting {{ font-size: 18px; font-weight: 600; color: #0f172a; margin-top: 0; }}
+    .text {{ font-size: 15px; line-height: 1.6; color: #475569; }}
+    .event-title {{ font-size: 20px; font-weight: 700; color: #0f172a; margin: 0 0 12px 0; }}
+    .item-box {{ background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 18px; margin: 20px 0; font-size: 14px; line-height: 1.6; }}
+    .item-row {{ margin-bottom: 6px; }}
+    .btn-wrapper {{ text-align: center; margin: 30px 0 24px 0; }}
+    .btn {{ background-color: #2563eb; color: #ffffff !important; font-size: 15px; font-weight: 600; text-decoration: none; padding: 14px 32px; border-radius: 8px; display: inline-block; }}
+    .footer {{ text-align: center; font-size: 12px; color: #94a3b8; margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 20px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <h1 class="brand-name">WavyGo OS</h1>
+      <span class="badge">{badge}</span>
+    </div>
+    <p class="greeting">Hello {_esc(recipient_name or "there")},</p>
+    <p class="text">{_esc(headline)}</p>
+
+    <div class="item-box">
+      <p class="event-title">{title_html}</p>
+      {rows_html}
+    </div>
+
+    <div class="btn-wrapper">
+      <a href="{_esc(event_url)}" class="btn" target="_blank">{"View in Calendar" if struck else "Open Event &amp; Reply"}</a>
+    </div>
+
+    <div class="footer">
+      <p>© 2026 WavyGo OS · Enterprise Workspace Platform</p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    data = {
+        "sender": _sender(),
+        "to": [{"email": recipient_email, "name": recipient_name or recipient_email}],
+        "subject": f"{prefix}: {title} · {when}",
+        "htmlContent": html_content,
+        "textContent": "\n".join(text_lines),
+    }
+    headers = {
+        "api-key": _brevo_key(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Mailin-Track": "0",
+        "X-Mailin-Click": "0",
+    }
+    try:
+        response = requests.post(BREVO_URL, json=data, headers=headers, timeout=15)
+        if response.status_code in (200, 201, 202):
+            logger.info("[Email] Calendar %s email sent to %s", kind, recipient_email)
+            return True
+        logger.error("[Email] Failed to send calendar %s email to %s: %s - %s",
+                     kind, recipient_email, response.status_code, response.text)
+        return False
+    except Exception as e:
+        logger.error("[Email] Exception sending calendar %s email: %s", kind, e)
         return False

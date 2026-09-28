@@ -91,7 +91,8 @@ def test_db(mongo):
 def api(mongo, harness_env, tmp_path_factory):
     port = _free_port()
     log = open(tmp_path_factory.mktemp("api") / "uvicorn.log", "w")
-    env = {**os.environ, "DB_NAME": mongo.harness_db_name, **harness_env}
+    # Never send real email from tests: an empty key makes every email sender a logged no-op.
+    env = {**os.environ, "DB_NAME": mongo.harness_db_name, "BREVO_API_KEY": "", **harness_env}
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "server:app", "--port", str(port)],
         cwd=BACKEND_DIR, env=env, stdout=log, stderr=subprocess.STDOUT,
