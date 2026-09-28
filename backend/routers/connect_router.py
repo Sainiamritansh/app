@@ -1,5 +1,7 @@
 from __future__ import annotations
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
 from bson import ObjectId
 from db import get_db
 from auth_utils import get_current_user, require_roles
@@ -9,13 +11,77 @@ from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, not
 
 router = APIRouter(prefix="/connect", tags=["connect"])
 
+# Anyone can see and join these kinds; every other kind (group, dm, ...) is members-only.
+PUBLIC_KINDS = ("channel", "announcement")
 
-async def _channel_meta(db, doc, current_id: str):
-    last = None
-    if doc.get("last_message_at"):
-        last = doc["last_message_at"]
-    unread = 0  # future: track per-user read cursor
-    doc["last_message_at"] = last
+
+class MembersIn(BaseModel):
+    member_ids: List[str] = Field(min_length=1)
+
+
+class ChannelCreate(ChannelIn):
+    """Channel names must be non-blank; surrounding whitespace is trimmed."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    name: str = Field(min_length=1, max_length=80)
+    description: Optional[str] = Field(default=None, max_length=500)
+
+
+class MessageCreate(MessageIn):
+    """Blank (whitespace-only) messages are rejected."""
+    model_config = ConfigDict(str_strip_whitespace=True)
+    body: str = Field(min_length=1, max_length=4000)
+
+
+def _can_view(ch: dict, user_id: str) -> bool:
+    return ch.get("kind") in PUBLIC_KINDS or user_id in ch.get("members", [])
+
+
+async def _visible_channel(db, channel_id: str, current: UserPublic) -> dict:
+    ch = await db.channels.find_one({"_id": oid(channel_id)})
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    if not _can_view(ch, current.id):
+        raise HTTPException(403, "Not a member")
+    return ch
+
+
+async def _validate_member_ids(db, ids: list[str]) -> list[str]:
+    """Dedupe and ensure every id is an existing, active user (422 otherwise)."""
+    ids = list(dict.fromkeys(ids))
+    if not ids:
+        return []
+    if not all(ObjectId.is_valid(i) for i in ids):
+        raise HTTPException(422, "Invalid member id")
+    found = await db.users.count_documents({
+        "_id": {"$in": [ObjectId(i) for i in ids]},
+        "status": {"$ne": "deactivated"}, "is_active": {"$ne": False},
+    })
+    if found != len(ids):
+        raise HTTPException(422, "One or more members do not exist")
+    return ids
+
+
+async def _unread_counts(db, channels: list[dict], current_id: str) -> dict[str, int]:
+    """Messages from others newer than the user's read cursor, per channel id (single aggregate).
+    Without a cursor every message from others counts as unread."""
+    if not channels:
+        return {}
+    ids = [str(c["_id"]) for c in channels]
+    cursors = {r["channel_id"]: r["last_read_at"]
+               for r in await db.channel_reads.find({"user_id": current_id, "channel_id": {"$in": ids}}).to_list(len(ids))}
+    conds = [{"channel_id": cid, "created_at": {"$gt": cursors[cid]}} if cid in cursors else {"channel_id": cid}
+             for cid in ids]
+    pipe = [
+        {"$match": {"sender_id": {"$ne": current_id}, "$or": conds}},
+        {"$group": {"_id": "$channel_id", "n": {"$sum": 1}}},
+    ]
+    return {r["_id"]: r["n"] for r in await db.messages.aggregate(pipe).to_list(len(ids))}
+
+
+async def _channel_meta(db, doc, current_id: str, unread: int | None = None):
+    if unread is None:
+        unread = (await _unread_counts(db, [doc], current_id)).get(str(doc["_id"]), 0)
+    doc["last_message_at"] = doc.get("last_message_at")
     doc["unread"] = unread
     # For DMs, resolve peer name
     if doc.get("kind") == "dm":
@@ -39,27 +105,61 @@ async def list_channels(kind: str | None = None, current: UserPublic = Depends(g
     # visible: public channels + those the user belongs to
     q["$or"] = [{"kind": {"$in": ["channel", "announcement"]}}, {"members": current.id}]
     docs = await db.channels.find(q).sort("last_message_at", -1).to_list(200)
+    unread = await _unread_counts(db, docs, current.id)
     for d in docs:
-        await _channel_meta(db, d, current.id)
+        await _channel_meta(db, d, current.id, unread.get(str(d["_id"]), 0))
     return serialize_many(docs)
 
 
 @router.post("/channels", status_code=201)
-async def create_channel(payload: ChannelIn,
+async def create_channel(payload: ChannelCreate,
                          current: UserPublic = Depends(require_roles("Founder", "Admin", "Manager"))):
     db = get_db()
     if payload.kind == "announcement" and current.role not in ("Founder", "Admin"):
         raise HTTPException(403, "Only Founder or Admin can create announcement channels")
+    if payload.kind == "dm":
+        raise HTTPException(400, "Use /connect/dm/{peer_id} to start a direct message")
     doc = payload.model_dump()
-    if current.id not in doc["members"]:
-        doc["members"].append(current.id)
+    doc["description"] = doc.get("description") or None
+    added = [m for m in await _validate_member_ids(db, doc["members"]) if m != current.id]
+    doc["members"] = [current.id, *added]
     doc["created_by"] = current.id
     doc["created_at"] = utc_iso()
     doc["last_message_at"] = utc_iso()
     res = await db.channels.insert_one(doc)
     doc["_id"] = res.inserted_id
     await _channel_meta(db, doc, current.id)
-    await log_activity(db, current, f"Created {doc['kind']}", "WavyGo Connect", target=doc["name"])
+    await log_activity(db, current, f"Created {doc['kind']}", "WavyGo Connect", target=doc["name"],
+                       meta={"members": len(doc["members"])})
+    if doc["kind"] not in PUBLIC_KINDS:
+        for uid in added:
+            await notify(db, uid, "Added to group", f"{current.name} added you to {doc['name']}.",
+                         kind="info", link="/wavygo-connect")
+    return serialize(doc)
+
+
+@router.post("/channels/{channel_id}/members")
+async def add_members(channel_id: str, payload: MembersIn, current: UserPublic = Depends(get_current_user)):
+    """Add members to a private group. Allowed for the group's creator, Founder and Admin."""
+    db = get_db()
+    ch = await db.channels.find_one({"_id": oid(channel_id)})
+    if not ch:
+        raise HTTPException(404, "Channel not found")
+    if ch["kind"] in PUBLIC_KINDS or ch["kind"] == "dm":
+        raise HTTPException(400, "Members can only be added to groups")
+    if ch.get("created_by") != current.id and current.role not in ("Founder", "Admin"):
+        raise HTTPException(403, "Only the group creator, Founder or Admin can add members")
+    existing = set(ch.get("members", []))
+    added = [m for m in await _validate_member_ids(db, payload.member_ids) if m not in existing]
+    if added:
+        await db.channels.update_one({"_id": ch["_id"]}, {"$addToSet": {"members": {"$each": added}}})
+        await log_activity(db, current, "Added group members", "WavyGo Connect", target=ch["name"],
+                           meta={"added": added})
+        for uid in added:
+            await notify(db, uid, "Added to group", f"{current.name} added you to {ch['name']}.",
+                         kind="info", link="/wavygo-connect")
+    doc = await db.channels.find_one({"_id": ch["_id"]})
+    await _channel_meta(db, doc, current.id)
     return serialize(doc)
 
 
@@ -136,9 +236,9 @@ async def open_dm(peer_id: str, current: UserPublic = Depends(get_current_user))
         raise HTTPException(400, "Cannot DM yourself")
     peer = await db.users.find_one(
         {"_id": oid(peer_id)},
-        {"name": 1, "role": 1, "department": 1, "designation": 1, "status": 1}
+        {"name": 1, "role": 1, "department": 1, "designation": 1, "status": 1, "is_active": 1}
     )
-    if not peer:
+    if not peer or peer.get("status") == "deactivated" or peer.get("is_active") is False:
         raise HTTPException(404, "User not found")
 
     # Respective department members connect with same department and high designation personnel
@@ -176,26 +276,18 @@ async def open_dm(peer_id: str, current: UserPublic = Depends(get_current_user))
 async def list_messages(channel_id: str, limit: int = Query(100, ge=1, le=500),
                         current: UserPublic = Depends(get_current_user)):
     db = get_db()
-    ch = await db.channels.find_one({"_id": oid(channel_id)})
-    if not ch:
-        raise HTTPException(404, "Channel not found")
-    if ch["kind"] in ("dm", "group") and current.id not in ch.get("members", []):
-        raise HTTPException(403, "Not a member")
+    await _visible_channel(db, channel_id, current)
     docs = await db.messages.find({"channel_id": channel_id}).sort("created_at", -1).to_list(limit)
     docs.reverse()
     return serialize_many(docs)
 
 
 @router.post("/channels/{channel_id}/messages", status_code=201)
-async def send_message(channel_id: str, payload: MessageIn, current: UserPublic = Depends(get_current_user)):
+async def send_message(channel_id: str, payload: MessageCreate, current: UserPublic = Depends(get_current_user)):
     db = get_db()
-    ch = await db.channels.find_one({"_id": oid(channel_id)})
-    if not ch:
-        raise HTTPException(404, "Channel not found")
+    ch = await _visible_channel(db, channel_id, current)
     if ch["kind"] == "announcement" and current.role not in ("Founder", "Admin"):
         raise HTTPException(403, "Only Founder or Admin can post in announcement channels")
-    if ch["kind"] in ("dm", "group") and current.id not in ch.get("members", []):
-        raise HTTPException(403, "Not a member")
     doc = {
         "channel_id": channel_id,
         "channel_name": ch["name"],
@@ -221,6 +313,20 @@ async def join_channel(channel_id: str, current: UserPublic = Depends(get_curren
     ch = await db.channels.find_one({"_id": oid(channel_id)})
     if not ch:
         raise HTTPException(404, "Channel not found")
+    if ch["kind"] not in PUBLIC_KINDS:
+        raise HTTPException(403, "Private groups and direct messages cannot be joined")
     if current.id not in ch.get("members", []):
-        await db.channels.update_one({"_id": oid(channel_id)}, {"$push": {"members": current.id}})
+        await db.channels.update_one({"_id": oid(channel_id)}, {"$addToSet": {"members": current.id}})
+        await log_activity(db, current, "Joined channel", "WavyGo Connect", target=ch["name"])
     return {"ok": True}
+
+
+@router.post("/channels/{channel_id}/read")
+async def mark_read(channel_id: str, current: UserPublic = Depends(get_current_user)):
+    """Move the user's read cursor for this channel to now (clears its unread count)."""
+    db = get_db()
+    await _visible_channel(db, channel_id, current)
+    now = utc_iso()
+    await db.channel_reads.update_one({"channel_id": channel_id, "user_id": current.id},
+                                      {"$set": {"last_read_at": now}}, upsert=True)
+    return {"ok": True, "last_read_at": now}

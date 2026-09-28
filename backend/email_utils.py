@@ -1,20 +1,39 @@
 from __future__ import annotations
+import html
+import logging
 import os
 import requests
 from hub_utils import find_user
 
-def _get_default_brevo_key() -> str:
-    parts = [
-        "xkeysib-",
-        "7e5f78c73ca14cf003b4a9599ea52b62041a6bcf3b18f06576ffb433a0c6cd1a",
-        "-sRYkky73HZ8ldhy7"
-    ]
-    return "".join(parts)
+logger = logging.getLogger(__name__)
 
-BREVO_API_KEY = os.environ.get("BREVO_API_KEY") or _get_default_brevo_key()
-BREVO_SENDER_EMAIL = os.environ.get("BREVO_SENDER_EMAIL", "garv.agarwal2409@gmail.com")
-BREVO_SENDER_NAME = os.environ.get("BREVO_SENDER_NAME", "WavyGo OS")
+# Brevo credentials come from the environment only (BREVO_API_KEY, BREVO_SENDER_EMAIL,
+# optional BREVO_SENDER_NAME). Without them every sender is a logged no-op.
+BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://app-eta-flax-97.vercel.app")
+
+
+def _brevo_key() -> str:
+    return (os.environ.get("BREVO_API_KEY") or "").strip()
+
+
+def _sender() -> dict:
+    email = (os.environ.get("BREVO_SENDER_EMAIL") or "").strip()
+    name = (os.environ.get("BREVO_SENDER_NAME") or "WavyGo OS").strip()
+    return {"name": name, "email": email}
+
+
+def email_configured() -> bool:
+    """True when both an API key and a sender address are configured."""
+    return bool(_brevo_key() and _sender()["email"])
+
+
+def _skip_unconfigured(kind: str, recipient: str) -> bool:
+    """Log and report True when sending must be skipped because email is not configured."""
+    if email_configured():
+        return False
+    logger.warning("[Email] BREVO_API_KEY / BREVO_SENDER_EMAIL not configured; skipped %s email to %s", kind, recipient)
+    return True
 
 
 def send_invitation_email(
@@ -27,14 +46,13 @@ def send_invitation_email(
     department: str | None = None,
 ) -> bool:
     """Send team invitation email via Brevo REST API."""
-    if not BREVO_API_KEY:
-        print("[Email] Warning: BREVO_API_KEY not configured")
+    if _skip_unconfigured("invitation", recipient_email):
         return False
 
     accept_url = f"{FRONTEND_URL}/accept-invite?token={token}"
-    url = "https://api.brevo.com/v3/smtp/email"
+    url = BREVO_URL
     headers = {
-        "api-key": BREVO_API_KEY,
+        "api-key": _brevo_key(),
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-Mailin-Track": "0",
@@ -99,7 +117,7 @@ def send_invitation_email(
 </html>"""
 
     data = {
-        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "sender": _sender(),
         "to": [{"email": recipient_email, "name": recipient_name}],
         "subject": f"You're invited to join WavyGo OS as {role}",
         "htmlContent": html_content,
@@ -109,13 +127,13 @@ def send_invitation_email(
     try:
         response = requests.post(url, json=data, headers=headers, timeout=15, allow_redirects=True)
         if response.status_code in (200, 201, 202):
-            print(f"[Email] Invitation email sent to {recipient_email}")
+            logger.info(f"[Email] Invitation email sent to {recipient_email}")
             return True
         else:
-            print(f"[Email] Failed to send email to {recipient_email}: {response.status_code} - {response.text}")
+            logger.error(f"[Email] Failed to send email to {recipient_email}: {response.status_code} - {response.text}")
             return False
     except Exception as e:
-        print(f"[Email] Exception sending email: {e}")
+        logger.error(f"[Email] Exception sending email: {e}")
         return False
 
 
@@ -126,14 +144,13 @@ def send_password_reset_email(
     reset_by: str,
 ) -> bool:
     """Send password reset notification email with new password via Brevo REST API."""
-    if not BREVO_API_KEY:
-        print("[Email] Warning: BREVO_API_KEY not configured")
+    if _skip_unconfigured("password reset", recipient_email):
         return False
 
     login_url = f"{FRONTEND_URL}/login"
-    url = "https://api.brevo.com/v3/smtp/email"
+    url = BREVO_URL
     headers = {
-        "api-key": BREVO_API_KEY,
+        "api-key": _brevo_key(),
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-Mailin-Track": "0",
@@ -213,7 +230,7 @@ def send_password_reset_email(
 </html>"""
 
     data = {
-        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "sender": _sender(),
         "to": [{"email": recipient_email, "name": recipient_name}],
         "subject": "Your WavyGo OS Password Has Been Reset",
         "htmlContent": html_content,
@@ -223,13 +240,13 @@ def send_password_reset_email(
     try:
         response = requests.post(url, json=data, headers=headers, timeout=15, allow_redirects=True)
         if response.status_code in (200, 201, 202):
-            print(f"[Email] Password reset email sent to {recipient_email}")
+            logger.info(f"[Email] Password reset email sent to {recipient_email}")
             return True
         else:
-            print(f"[Email] Failed to send password reset email to {recipient_email}: {response.status_code} - {response.text}")
+            logger.error(f"[Email] Failed to send password reset email to {recipient_email}: {response.status_code} - {response.text}")
             return False
     except Exception as e:
-        print(f"[Email] Exception sending password reset email: {e}")
+        logger.error(f"[Email] Exception sending password reset email: {e}")
         return False
 
 
@@ -247,8 +264,7 @@ def send_assignment_email(
     erp_url: str | None = None,
 ) -> bool:
     """Send automatic email notification to assigned employee when task/opportunity is assigned."""
-    if not BREVO_API_KEY:
-        print("[Email] Warning: BREVO_API_KEY not configured")
+    if _skip_unconfigured("assignment", recipient_email):
         return False
 
     is_task = item_type.lower() == "task"
@@ -258,9 +274,9 @@ def send_assignment_email(
     if not erp_url:
         erp_url = f"{FRONTEND_URL}/task-board" if is_task else f"{FRONTEND_URL}/opportunity-hub"
 
-    url = "https://api.brevo.com/v3/smtp/email"
+    url = BREVO_URL
     headers = {
-        "api-key": BREVO_API_KEY,
+        "api-key": _brevo_key(),
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-Mailin-Track": "0",
@@ -355,7 +371,7 @@ def send_assignment_email(
 </html>"""
 
     data = {
-        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "sender": _sender(),
         "to": [{"email": recipient_email, "name": recipient_name}],
         "subject": subject,
         "htmlContent": html_content,
@@ -365,13 +381,13 @@ def send_assignment_email(
     try:
         response = requests.post(url, json=data, headers=headers, timeout=15, allow_redirects=True)
         if response.status_code in (200, 201, 202):
-            print(f"[Email] Assignment email sent to {recipient_email} for {item_type} '{item_title}'")
+            logger.info(f"[Email] Assignment email sent to {recipient_email} for {item_type} '{item_title}'")
             return True
         else:
-            print(f"[Email] Failed to send assignment email to {recipient_email}: {response.status_code} - {response.text}")
+            logger.error(f"[Email] Failed to send assignment email to {recipient_email}: {response.status_code} - {response.text}")
             return False
     except Exception as e:
-        print(f"[Email] Exception sending assignment email: {e}")
+        logger.error(f"[Email] Exception sending assignment email: {e}")
         return False
 
 
@@ -443,12 +459,12 @@ async def notify_assignment_by_email(
 
     assignee = await find_user(db, assignee_id)
     if not assignee:
-        print(f"[Email] Assignee user '{assignee_id}' not found in ERP directory")
+        logger.info(f"[Email] Assignee user '{assignee_id}' not found in ERP directory")
         return False
 
     recipient_email = (assignee.get("email") or "").strip()
     if not recipient_email:
-        print(f"[Email] Assignee user '{assignee_id}' does not have a registered email in ERP")
+        logger.info(f"[Email] Assignee user '{assignee_id}' does not have a registered email in ERP")
         return False
 
     recipient_name = assignee.get("name") or "Employee"
@@ -481,3 +497,105 @@ async def notify_assignment_by_email(
     return True
 
 
+
+
+def send_password_reset_link_email(
+    recipient_email: str,
+    recipient_name: str,
+    reset_url: str,
+    expires_minutes: int = 30,
+) -> bool:
+    """Send a self-service password reset link via Brevo REST API.
+
+    The caller builds `reset_url` (it carries the raw single-use token). Returns
+    False, after logging, when email is not configured or sending fails.
+    """
+    if _skip_unconfigured("password reset link", recipient_email):
+        return False
+
+    name = html.escape(recipient_name or "there")
+    safe_url = html.escape(reset_url, quote=True)
+    headers = {
+        "api-key": _brevo_key(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Mailin-Track": "0",
+        "X-Mailin-Click": "0"
+    }
+
+    text_content = (
+        f"Hello {recipient_name or 'there'},\n\n"
+        f"We received a request to reset the password for your WavyGo OS account ({recipient_email}).\n\n"
+        f"Open the link below to choose a new password. It can be used once and expires in {expires_minutes} minutes:\n"
+        f"{reset_url}\n\n"
+        f"If you did not request this, you can ignore this email; your password will not change.\n\n"
+        f"© 2026 WavyGo OS"
+    )
+
+    html_content = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body {{ font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif; background-color: #f8fafc; margin: 0; padding: 24px; color: #1e293b; }}
+    .card {{ max-width: 540px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 36px; box-shadow: 0 4px 16px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }}
+    .brand {{ text-align: center; margin-bottom: 24px; }}
+    .brand-name {{ font-size: 26px; font-weight: 800; color: #2563eb; letter-spacing: -0.5px; margin: 0; }}
+    .badge {{ display: inline-block; background: #fef3c7; color: #b45309; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-top: 6px; }}
+    .greeting {{ font-size: 18px; font-weight: 600; color: #0f172a; margin-top: 0; }}
+    .text {{ font-size: 15px; line-height: 1.6; color: #475569; }}
+    .btn-wrapper {{ text-align: center; margin: 32px 0 24px 0; }}
+    .btn {{ background-color: #2563eb; color: #ffffff !important; font-size: 15px; font-weight: 600; text-decoration: none; padding: 14px 32px; border-radius: 8px; display: inline-block; }}
+    .link-note {{ font-size: 13px; color: #64748b; text-align: center; word-break: break-all; }}
+    .security-note {{ font-size: 13px; color: #64748b; background: #f8fafc; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 4px; margin-top: 20px; line-height: 1.5; }}
+    .footer {{ text-align: center; font-size: 12px; color: #94a3b8; margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 20px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <h1 class="brand-name">WavyGo OS</h1>
+      <span class="badge">Password Reset</span>
+    </div>
+    <p class="greeting">Hello {name},</p>
+    <p class="text">We received a request to reset the password for your <strong>WavyGo OS</strong> account. Click the button below to choose a new password.</p>
+
+    <div class="btn-wrapper">
+      <a href="{safe_url}" class="btn" target="_blank">Reset My Password</a>
+    </div>
+
+    <div class="link-note">
+      If the button does not work, copy and paste this URL into your browser:<br>
+      <a href="{safe_url}" style="color: #2563eb;">{safe_url}</a>
+    </div>
+
+    <div class="security-note">
+      <strong>Security Notice:</strong> This link can be used once and expires in {expires_minutes} minutes. If you did not request a password reset, you can safely ignore this email; your password will not change.
+    </div>
+
+    <div class="footer">
+      <p>© 2026 WavyGo OS · Enterprise Workspace Platform</p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    data = {
+        "sender": _sender(),
+        "to": [{"email": recipient_email, "name": recipient_name or recipient_email}],
+        "subject": "Reset your WavyGo OS password",
+        "htmlContent": html_content,
+        "textContent": text_content
+    }
+
+    try:
+        response = requests.post(BREVO_URL, json=data, headers=headers, timeout=15, allow_redirects=True)
+        if response.status_code in (200, 201, 202):
+            logger.info("[Email] Password reset link sent to %s", recipient_email)
+            return True
+        logger.error("[Email] Failed to send password reset link to %s: %s - %s",
+                     recipient_email, response.status_code, response.text)
+        return False
+    except Exception as e:
+        logger.error("[Email] Exception sending password reset link: %s", e)
+        return False

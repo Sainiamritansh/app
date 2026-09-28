@@ -14,6 +14,13 @@ from email_utils import (
 from hub_utils import find_user
 
 
+@pytest.fixture(autouse=True)
+def _email_configured(monkeypatch):
+    # email_utils skips sending when Brevo isn't configured; these tests mock the HTTP call.
+    monkeypatch.setenv("BREVO_API_KEY", "test-key")
+    monkeypatch.setenv("BREVO_SENDER_EMAIL", "noreply@test.wavygo.in")
+
+
 def test_send_task_assignment_email_payload():
     with patch("email_utils.requests.post") as mock_post:
         mock_response = MagicMock()
@@ -252,6 +259,8 @@ def test_task_router_create_and_update_dispatches_email():
         mock_db.tasks.insert_one = AsyncMock(return_value=mock_insert_res)
         mock_db.activity_logs.insert_one = AsyncMock()
         mock_db.notifications.insert_one = AsyncMock()
+        # Assignees are looked up to make sure they are active users.
+        mock_db.users.find_one = AsyncMock(return_value={"_id": ObjectId(), "status": "active"})
 
         # Test create_task
         task_payload = TaskIn(
@@ -334,6 +343,8 @@ def test_opp_router_create_and_assign_dispatches_email():
         mock_db.opportunities.insert_one = AsyncMock(return_value=mock_insert_res)
         mock_db.activity_logs.insert_one = AsyncMock()
         mock_db.notifications.insert_one = AsyncMock()
+        # assign_opp now checks the assignee exists.
+        mock_db.users.find_one = AsyncMock(return_value={"_id": ObjectId(emp_id), "name": "Employee"})
 
         opp_payload = OpportunityIn(
             title="Patna Junction EV Tender",

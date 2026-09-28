@@ -1,16 +1,40 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { api } from "@/lib/api";
 import { formatDistanceToNow } from "date-fns";
-import { ScrollText } from "lucide-react";
+import { AlertTriangle, ScrollText } from "lucide-react";
+
+const ALL = "__all__";
 
 export default function ActivityLogs() {
   const [logs, setLogs] = useState([]);
   const [q, setQ] = useState("");
+  const [module, setModule] = useState(ALL);
+  const [modules, setModules] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-  useEffect(() => { api.get("/activity?limit=200").then(({ data }) => setLogs(data)); }, []);
+  // Module filtering happens server-side (?module=) so the 200-row limit applies per module.
+  const load = useCallback(({ background = false } = {}) => {
+    if (!background) {
+      setLoading(true);
+      setError(null);
+    }
+    const params = { limit: 200, ...(module !== ALL ? { module } : {}) };
+    api.get("/activity", { params })
+      .then(({ data }) => setLogs(data))
+      .catch((e) => { if (!background) setError(e?.response?.data?.detail || "Could not load activity logs."); })
+      .finally(() => { if (!background) setLoading(false); });
+  }, [module]);
+
+  useEffect(() => { load(); }, [load]);
+  useLiveRefresh(load, 30000);
+  useEffect(() => { api.get("/activity/modules").then(({ data }) => setModules(data)).catch(() => setModules([])); }, []);
 
   const filtered = logs.filter((l) => {
     if (!q) return true;
@@ -26,10 +50,27 @@ export default function ActivityLogs() {
         <p className="text-sm text-muted-foreground mt-2 max-w-xl">Every meaningful action across WavyGo OS lands here. Future modules append to the same audit trail.</p>
       </div>
 
-      <Input placeholder="Filter by user, action, module…" value={q} onChange={(e) => setQ(e.target.value)} className="max-w-md" data-testid="activity-search" />
+      <div className="flex flex-col sm:flex-row gap-3">
+        <Input placeholder="Filter by user, action, module…" value={q} onChange={(e) => setQ(e.target.value)} className="max-w-md" data-testid="activity-search" />
+        <Select value={module} onValueChange={setModule}>
+          <SelectTrigger className="w-full sm:w-[200px]" data-testid="activity-module-filter"><SelectValue placeholder="All modules" /></SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>All modules</SelectItem>
+            {modules.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
+          </SelectContent>
+        </Select>
+      </div>
 
       <Card className="border-border">
-        {filtered.length === 0 ? (
+        {error ? (
+          <div className="p-16 text-center" data-testid="activity-error">
+            <AlertTriangle className="h-8 w-8 mx-auto text-destructive" />
+            <div className="mt-3 text-sm text-muted-foreground">{String(error)}</div>
+            <Button variant="outline" size="sm" onClick={load} className="mt-4 h-8 text-xs">Retry</Button>
+          </div>
+        ) : loading && logs.length === 0 ? (
+          <div className="p-16 text-center text-sm text-muted-foreground">Loading…</div>
+        ) : filtered.length === 0 ? (
           <div className="p-16 text-center">
             <ScrollText className="h-8 w-8 mx-auto text-muted-foreground" />
             <div className="mt-3 text-sm text-muted-foreground">No activity matches your filter.</div>
@@ -44,14 +85,14 @@ export default function ActivityLogs() {
                 <div className="flex-1 min-w-0">
                   <div className="text-[13.5px]">
                     <span className="font-medium text-foreground">{l.user_name}</span>{" "}
-                    <span className="text-muted-foreground">{l.action.toLowerCase()}</span>
+                    <span className="text-muted-foreground">{(l.action || "").toLowerCase()}</span>
                     {l.target && <span className="text-foreground"> · {l.target}</span>}
                   </div>
                   <div className="text-[11px] text-muted-foreground mt-0.5">
                     {(() => { try { return formatDistanceToNow(new Date(l.created_at), { addSuffix: true }); } catch { return ""; } })()}
                   </div>
                 </div>
-                <Badge variant="secondary" className="text-[10px]">{l.module}</Badge>
+                {l.module && <Badge variant="secondary" className="text-[10px]">{l.module}</Badge>}
                 <Badge className="bg-wavygo-50 text-wavygo-800 hover:bg-wavygo-50 text-[10px]">{l.user_role}</Badge>
               </li>
             ))}

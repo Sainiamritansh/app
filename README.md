@@ -1,244 +1,203 @@
-# 🚀 WavyGo ERP System
+# WavyGo OS
 
-[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com/)
-[![React](https://img.shields.io/badge/Frontend-React%20%2F%20Vite-61DAFB?style=for-the-badge&logo=react)](https://reactjs.org/)
-[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=for-the-badge&logo=python)](https://www.python.org/)
-[![TailwindCSS](https://img.shields.io/badge/Styling-TailwindCSS-06B6D4?style=for-the-badge&logo=tailwindcss)](https://tailwindcss.com/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
+Internal operating system (ERP) for **WAVYGO MOBILITY SERVICES PRIVATE LIMITED** — one dashboard for the rental marketplace, tasks, people, opportunities, internal chat and the company calendar.
 
----
-
-## 📌 Project Overview
-
-**WavyGo ERP System** is a next-generation Enterprise Resource Planning (ERP) platform built to unify all core business operations into a single modern dashboard. Designed with role-based access control for **Founders**, **Admins**, and **Employees**, the platform seamlessly integrates daily workforce operations, task and project management, attendance tracking, internal communication via **WavyGo Chat**, and intelligent automation powered by **WavyGo AI**.
-
-Whether managing high-level organization metrics or executing daily tasks, WavyGo ERP provides an intuitive, high-performance solution tailored for fast-growing companies.
+| | |
+| :--- | :--- |
+| **Backend** | FastAPI · Motor (async MongoDB) · JWT auth |
+| **Database** | MongoDB |
+| **Frontend** | React 19 (Create React App + CRACO) · Tailwind CSS · shadcn/ui · Recharts |
+| **Product spec** | [`memory/PRD.md`](memory/PRD.md) — scope, roadmap and the contracts that must not change |
 
 ---
 
-## 👥 Role-Based Access Control (RBAC)
+## Roles
 
-The system enforces strict multi-role permission levels across all modules:
+Five roles, defined once in [`backend/permissions.py`](backend/permissions.py) and mirrored in [`frontend/src/constants/permissions.js`](frontend/src/constants/permissions.js). Change both together.
 
-| Feature / Module | 👑 Founder | 🛡️ Admin | 👤 Employee |
-| :--- | :---: | :---: | :---: |
-| **Executive Overview & Revenue Analytics** | ✅ Full Access | ❌ Restricted | ❌ Restricted |
-| **Organization Settings & Governance** | ✅ Full Access | ⚙️ Config Only | ❌ Restricted |
-| **User & Employee Management** | ✅ Full Access | ✅ Provision / Edit | 👁️ View Directory |
-| **Task Allocation & Management** | ✅ Full Access | ✅ Create & Assign | 📝 Assigned Tasks Only |
-| **Attendance & Time Tracking** | ✅ View All | ✅ Manage & Approve | ⏱️ Log Personal Attendance |
-| **WavyGo AI Assistant** | ✅ Full Access | ✅ Full Access | ✅ Full Access |
-| **WavyGo Chat / Connect** | ✅ Full Access | ✅ Full Access | ✅ Full Access |
-| **Marketplace & Opportunity Hub** | ✅ Full Access | ✅ Full Access | 👁️ View & Apply |
-| **Activity & Audit Logs** | ✅ Full Access | ✅ System Logs | ❌ Restricted |
+| Module | Founder | Admin | Manager | Employee | Intern |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| Dashboard | Company-wide, incl. revenue | Team view | Team view | Personal | Personal |
+| Marketplace (bookings, fleet, vendors) | ✅ | — | — | — | — |
+| Task Board | ✅ all | ✅ all | Own department | Own + create | Assigned only |
+| Opportunity Hub | ✅ | ✅ | Own department | Assigned | — |
+| Employees (directory, invites, leave, attendance) | ✅ | ✅ | Own department | Own workspace | Own workspace |
+| WavyGo Connect (chat) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Calendar | ✅ all events | ✅ all events | Create + visible events | Create + visible events | Visible events |
+| Activity Logs | ✅ all | ✅ all | Team | — | — |
+| Company Vault · Finance | ✅ | — | — | — | — |
+| CRM · Marketing | ✅ | ✅ | ✅ | — | — |
+| Analytics | Marketplace + operations | Operations | Own department | — | — |
+| WavyGo AI | ✅ | ✅ | ✅ | ✅ | ✅ (answers only from data the role can see) |
 
----
-
-## 🌟 Key Features
-
-### 🏢 1. Operations Dashboard
-- Real-time business metrics, key performance indicators (KPIs), and executive summary charts.
-- Dynamic activity stream showing organization-wide actions and updates.
-
-### 🤖 2. WavyGo AI Assistant
-- Integrated AI copilot for answering company queries, generating quick reports, and assisting in task planning.
-- Intelligent search across corporate data and resources.
-
-### 💬 3. WavyGo Chat & Connect
-- Direct messaging and department channels for seamless intra-company communication.
-- Real-time notification system for messages, mentions, and updates.
-
-### 📋 4. Task & Project Management
-- Interactive task boards (Kanban & List views) with drag-and-drop state transitions.
-- Task prioritization, deadlines, tag management, and assignee tracking.
-
-### ⏱️ 5. Attendance & Workforce Management
-- One-click employee check-in and check-out tracking.
-- Automated shift duration calculations and attendance history logs.
-
-### 🛒 6. Marketplace & Opportunity Hub
-- Internal opportunity listings and project assignments.
-- Integration marketplace for extending ERP features and plugins.
+The permission files are the source of truth; this table is a summary.
 
 ---
 
-## 📁 Project Directory Structure
+## Modules
+
+### Built
+- **Dashboard** — KPIs, revenue and booking charts, city and vendor performance, today's tasks, upcoming calendar events, activity feed, system status. All figures come from the database; empty data shows as empty, never as sample numbers.
+- **Marketplace** — cities, vendors, vehicles, customers, bookings, pricing, coupons, reviews, KYC workflow, support tickets, analytics.
+- **Task Board** — Kanban (drag and drop), list and calendar views; comments, PDF attachments, links, assignee notifications.
+- **Employees** — directory by department, invitations (7-day links), one-click check-in / check-out with worked hours, leave requests with approval, performance reviews, departments.
+- **Opportunity Hub** — partnership / deal pipeline with assignment, status and value tracking.
+- **WavyGo Connect** — channels, private groups, direct messages, announcements, unread counts.
+- **Calendar** — month / week / day / agenda views, participants, visibility (everyone / department / private), reminders delivered as notifications, deep links from notifications.
+- **Notifications**, **Activity Logs**, **Settings** (profile, company, theme, security, roles), **About WavyGo**.
+
+- **Company Vault** — company documents in folders with tags, versions, inline preview, expiry dates and reminders (30 days, 7 days, expired). Files are stored in MongoDB GridFS.
+- **Finance** — customer invoices from bookings (GST, financial-year numbering, print), vendor payout batches, monthly statements, CSV exports, editable commission / GST settings.
+- **CRM** — customer 360 (lifetime value, lifecycle stage, timeline of bookings, tickets, KYC and reviews), notes, tags, follow-ups and saved segments.
+- **Marketing** — campaigns with budget, spend, channels, cities, audience segment and coupons; results attributed from bookings that used the campaign's coupons.
+- **Analytics** — marketplace KPIs, trends, cohort retention, city drill-down, fleet utilisation, booking heatmap (Founder); team operations for Admin / Manager; CSV export.
+- **WavyGo AI** — chat assistant (Claude) that answers from company data through read-only tools, scoped to what the user's role can see. Needs `ANTHROPIC_API_KEY`.
+- **Password reset by email** — single-use links valid for 30 minutes (needs Brevo configured).
+
+All pages refresh their data automatically (every 30–60 s while visible, and when you return to the tab).
+
+---
+
+## Project structure
 
 ```text
-app-1/
-├── README.md                    # Project documentation & run guide
-├── Procfile                     # Deployment configuration
-├── design_guidelines.json       # UI/UX & design system tokens
-│
-├── backend/                     # FastAPI Python Backend
-│   ├── main.py                  # Entry point for Uvicorn runner
-│   ├── server.py                # FastAPI app initialization, middleware, routes
-│   ├── db.py                    # Database connection & session setup
-│   ├── models.py                # Core database models & schemas (Users, Auth, Roles)
-│   ├── models_part2.py          # Extended models (Tasks, Attendance, Chat, AI)
-│   ├── permissions.py           # Role-based access permission helper functions
-│   ├── auth_utils.py            # Password hashing, JWT token handling
-│   ├── hub_utils.py             # Helper utilities for Opportunity Hub & Marketplace
-│   ├── seed.py                  # Seed script for initial base data
-│   ├── seed_part2.py            # Seed script for sample tasks, attendance & chat
-│   ├── requirements.txt         # Backend Python dependencies
-│   ├── pytest.ini               # Pytest configuration
-│   │
-│   ├── routers/                 # API Route Controllers
-│   │   ├── auth_router.py          # /api/auth endpoints (Login, Register, Session)
-│   │   ├── users_router.py         # /api/users endpoints
-│   │   ├── dashboard_router.py     # /api/dashboard analytics & statistics
-│   │   ├── employees_router.py     # /api/employees & attendance tracking
-│   │   ├── tasks_router.py         # /api/tasks board endpoints
-│   │   ├── connect_router.py       # /api/connect WavyGo Chat messaging
-│   │   ├── marketplace_router.py   # /api/marketplace extension modules
-│   │   ├── opportunities_router.py # /api/opportunities project hub
-│   │   ├── notifications_router.py # /api/notifications user alerts
-│   │   ├── activity_router.py      # /api/activity audit logs
-│   │   └── settings_router.py      # /api/settings profile & company config
-│   │
-│   └── tests/                   # Backend pytest test suite
-│
-└── frontend/                    # React + Vite Frontend Application
-    ├── package.json             # Frontend dependencies & scripts
-    ├── craco.config.js          # Build configuration
-    ├── tailwind.config.js       # Tailwind CSS design configuration
-    ├── postcss.config.js        # PostCSS configuration
-    ├── components.json          # UI component settings
-    │
-    ├── public/                  # Public static assets & favicon
-    │
-    └── src/                     # Application Source Code
-        ├── index.js             # React entry point
-        ├── index.css            # Global CSS styles & Tailwind directives
-        ├── App.js               # Main App routing & authentication wrapper
-        ├── App.css              # App specific styles
-        │
-        ├── pages/               # Application Pages & Screens
-        │   ├── Login.jsx            # User authentication screen
-        │   ├── Dashboard.jsx        # Role-based executive & employee overview
-        │   ├── Employees.jsx        # Employee directory & attendance tracking
-        │   ├── TaskBoard.jsx        # Project task management (Kanban)
-        │   ├── WavygoConnect.jsx    # WavyGo Chat & communication hub
-        │   ├── AboutWavygo.jsx      # WavyGo AI assistant interface & info
-        │   ├── Marketplace.jsx      # Plugin marketplace page
-        │   ├── OpportunityHub.jsx   # Project & gig opportunities
-        │   ├── ActivityLogs.jsx     # System activity & audit trail
-        │   ├── Notifications.jsx    # User alerts & notifications
-        │   ├── Settings.jsx         # System & user profile settings
-        │   └── Forbidden.jsx        # 403 unauthorized access fallback page
-        │
-        ├── components/          # Reusable UI Components
-        ├── constants/           # Constants & navigation configs
-        ├── contexts/            # React Context providers (Auth, Theme, Socket)
-        ├── hooks/               # Custom React hooks
-        └── lib/                 # Utility functions & API clients
+backend/
+  server.py              FastAPI app: routers, CORS, startup (seed, indexes, calendar reminders)
+  db.py                  Mongo client + ObjectId helpers
+  auth_utils.py          password hashing, JWT, get_current_user / require_roles
+  permissions.py         RBAC matrix (modules + actions)
+  hub_utils.py           log_activity, notify, serialize
+  email_utils.py         transactional email (Brevo), optional
+  models.py              auth / user models
+  models_part2.py        module models (tasks, employees, opportunities, calendar, …)
+  seed.py                idempotent Founder account + indexes, runs on startup
+  seed_part2.py          optional demo data — never runs automatically
+  routers/               one router per module, all mounted under /api
+  tests/                 pytest suites (see Testing)
+frontend/
+  src/App.js             routes; every page renders inside AppShell
+  src/pages/             one page per module
+  src/components/        layout shell, calendar, shadcn ui primitives
+  src/constants/         nav, permissions, test ids
+  src/lib/api.js         axios client (token refresh built in)
+memory/                  PRD and freeze notes
+docs/                    long-form project documentation
 ```
 
 ---
 
-## ⚡ Quick Start & Run Commands
+## Running locally
 
 ### Prerequisites
-- **Node.js**: v18.0.0 or higher
-- **npm**: v9.0.0 or higher
-- **Python**: v3.9 or higher
+- Python 3.11+ (3.12 used in development)
+- Node.js 18+ (22 used in development)
+- MongoDB 6+ running locally, or a MongoDB Atlas connection string
 
----
+### 1. Backend
 
-### 1. 🔧 Backend Setup & Execution
-
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-
-2. Create and activate a Python virtual environment (optional but recommended):
-   ```bash
-   # On macOS/Linux
-   python3 -m venv venv
-   source venv/bin/activate
-
-   # On Windows
-   python -m venv venv
-   venv\Scripts\activate
-   ```
-
-3. Install required Python packages:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Run the FastAPI development server:
-   ```bash
-   uvicorn main:app --reload
-   ```
-
-📍 **Default Backend Server URL**: `http://localhost:8000`  
-📖 **Interactive API Documentation (Swagger UI)**: `http://localhost:8000/docs`  
-📖 **ReDoc API Documentation**: `http://localhost:8000/redoc`
-
----
-
-### 2. 💻 Frontend Setup & Execution
-
-1. Open a new terminal window and navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Run the development server:
-   ```bash
-   npm run dev
-   ```
-
-📍 **Default Frontend Web Application URL**: `http://localhost:5173` *(or `http://localhost:3000` depending on port config)*
-
----
-
-## ⚙️ Environment Variables Setup
-
-### Backend Environment (`backend/.env`)
-```env
-PORT=8000
-HOST=0.0.0.0
-CORS_ORIGINS=http://localhost:5173,http://localhost:3000
-SECRET_KEY=your_super_secret_jwt_key_here
-ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=1440
-DATABASE_URL=sqlite:///./wavygo.db
+```bash
+cd backend
+python -m venv .venv
+# Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env            # then fill in the values below
+uvicorn server:app --reload --port 8000
 ```
 
-### Frontend Environment (`frontend/.env`)
-```env
-REACT_APP_API_URL=http://localhost:8000/api
-VITE_API_BASE_URL=http://localhost:8000/api
+- API: http://localhost:8000/api
+- Interactive docs: http://localhost:8000/docs
+
+On first start the server creates the Founder account from `FOUNDER_EMAIL` / `FOUNDER_PASSWORD`, creates indexes and starts the calendar reminder loop.
+
+### 2. Frontend
+
+```bash
+cd frontend
+npm install
+npm start                       # http://localhost:3000
 ```
+
+`npm run build` produces a production build in `frontend/build`.
 
 ---
 
-## 🔌 API Endpoints Summary
+## Environment variables
 
-| Endpoint Category | Base Path | Key Functionalities |
+### `backend/.env`
+
+| Variable | Required | Purpose |
+| :--- | :---: | :--- |
+| `MONGO_URL` | ✅ | MongoDB connection string, e.g. `mongodb://127.0.0.1:27017` |
+| `DB_NAME` | ✅ | Database name |
+| `JWT_SECRET` | ✅ | Long random string used to sign tokens |
+| `CORS_ORIGINS` | ✅ | Comma-separated frontend origins, or `*` in development |
+| `FOUNDER_EMAIL` | ✅ | Founder login created on first start |
+| `FOUNDER_PASSWORD` | ✅ | Founder password — always set it; never rely on a default |
+| `FOUNDER_NAME` | | Founder display name |
+| `FRONTEND_URL` | ✅ | Public URL of the frontend, used in invitation links |
+| `BREVO_API_KEY` | | Enables invitation / notification emails. Without it, emails are skipped and invite links are shown to copy instead |
+| `BREVO_SENDER_EMAIL` | with Brevo | Verified sender address |
+| `BREVO_SENDER_NAME` | | Sender display name |
+| `CALENDAR_REMINDER_INTERVAL_SECONDS` | | How often reminders are checked (default `60`) |
+| `ANTHROPIC_API_KEY` | for AI | Enables WavyGo AI. Without it the AI page shows a setup message |
+| `ANTHROPIC_MODEL` | | Claude model for WavyGo AI (default `claude-opus-5`) |
+| `WAVYGO_AI_RATE_LIMIT` | | AI messages per user per hour (default `30`) |
+
+Never commit `.env` files or API keys.
+
+### `frontend/.env`
+
+| Variable | Purpose |
+| :--- | :--- |
+| `REACT_APP_BACKEND_URL` | Backend origin, e.g. `http://localhost:8000` (the client adds `/api`) |
+
+---
+
+## API overview
+
+All routes are under `/api` and, except login and the public login-page KPIs, need `Authorization: Bearer <access token>`. Full, always-current reference: `/docs`.
+
+| Area | Base path | Highlights |
 | :--- | :--- | :--- |
-| **Authentication** | `/api/auth` | `/login`, `/register`, `/me`, `/logout` |
-| **Dashboard** | `/api/dashboard` | Executive stats, revenue, activity stream, metrics |
-| **Employees & Attendance**| `/api/employees` | Employee directory, `/check-in`, `/check-out`, attendance logs |
-| **Tasks** | `/api/tasks` | CRUD tasks, status transitions, priority filtering |
-| **WavyGo Connect (Chat)** | `/api/connect` | Chat rooms, direct messages, conversation threads |
-| **WavyGo AI** | `/api/activity` / `/api/dashboard` | AI prompts, automated insight summaries |
-| **Marketplace** | `/api/marketplace` | List & enable enterprise plugins |
-| **Opportunities** | `/api/opportunities` | Internal gig board, project applications |
-| **Settings** | `/api/settings` | Company preferences, role governance, account details |
+| Auth | `/api/auth` | login, refresh (rotating), logout, me, register |
+| Users | `/api/users` | profile, password, directory |
+| Dashboard | `/api/dashboard` | stats, public live KPIs |
+| Marketplace | `/api/marketplace` | cities, vendors, vehicles, customers, bookings, KYC, support, analytics |
+| Tasks | `/api/tasks` | CRUD, status (drag-drop), comments, files, stats |
+| Employees | `/api/employees` | directory, invitations, attendance + check-in/out, leave, performance, departments |
+| Opportunities | `/api/opportunities` | CRUD, assign, status, stats |
+| Connect | `/api/connect` | channels, members, messages, read state |
+| Calendar | `/api/calendar` | events CRUD, month / week / day / agenda, invitees |
+| Notifications | `/api/notifications` | list, unread count, mark read |
+| Activity | `/api/activity` | audit log |
+| Settings | `/api/settings` | company profile, roles |
+| Company Vault | `/api/vault` | folders, documents, versions, downloads, stats |
+| Finance | `/api/finance` | settings, invoices, payouts, statements, exports |
+| CRM | `/api/crm` | customers, customer 360, notes, tags, follow-ups, segments |
+| Marketing | `/api/marketing` | campaigns, attribution, overview |
+| Analytics | `/api/analytics` | marketplace, operations, CSV exports |
+| WavyGo AI | `/api/ai` | status, conversations, streamed messages |
 
 ---
 
-## 📝 License
+## Testing
 
-This project is licensed under the [MIT License](LICENSE).
+```bash
+cd backend
+.venv/Scripts/python -m pytest tests/ -k local -q      # Windows path; use .venv/bin/python on macOS/Linux
+```
 
+- `tests/*_local_test.py` are self-contained: each module starts its own server on a free port against a throwaway MongoDB database (see [`tests/local_harness.py`](backend/tests/local_harness.py)) and deletes it afterwards. Only a local MongoDB is needed.
+- `tests/backend_test.py`, `backend_part2_test.py`, `rbac_test.py` are older end-to-end suites that call a deployed instance (`REACT_APP_BACKEND_URL`). Don't point them at production data.
+
+---
+
+## Deployment
+
+- Backend: `Procfile` runs `uvicorn server:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips="*"`. Trusting forwarded headers from any address is right only when the app is reachable solely through the hosting platform's proxy (Render, Railway, Heroku and similar); otherwise set `--forwarded-allow-ips` to the proxy's address.
+- WavyGo AI streams responses (Server-Sent Events); a reverse proxy in front of the backend must not buffer `text/event-stream`.
+- Frontend: static build; `frontend/vercel.json` rewrites all routes to `index.html`.
+
+## License
+
+No license has been chosen yet. Until one is added, all rights are reserved by WAVYGO MOBILITY SERVICES PRIVATE LIMITED.

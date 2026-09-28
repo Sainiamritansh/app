@@ -33,12 +33,16 @@ api.interceptors.request.use((cfg) => {
   return cfg;
 });
 
+// Endpoints that authenticate by credentials or refresh token, so a 401 from them must not trigger a refresh.
+// Everything else (including /auth/me) retries once with a fresh access token.
+const NO_REFRESH = /\/auth\/(login|refresh|logout|forgot-password|reset-password)/;
+
 let refreshing = null;
 api.interceptors.response.use(
   (r) => r,
   async (err) => {
     const original = err.config;
-    if (err.response?.status === 401 && !original._retry && tokens.refresh && !original.url?.includes("/auth/")) {
+    if (err.response?.status === 401 && original && !original._retry && tokens.refresh && !NO_REFRESH.test(original.url || "")) {
       original._retry = true;
       try {
         refreshing = refreshing || axios.post(`${API_BASE}/auth/refresh`, { refresh_token: tokens.refresh });

@@ -74,8 +74,30 @@ export const ACTIONS = {
   "connect.post_announcement":   new Set(["Founder", "Admin"]),
   "connect.send_dm":             new Set(["Founder", "Admin", "Manager", "Employee", "Intern"]),
 
+  "calendar.create":             new Set(["Founder", "Admin", "Manager", "Employee"]),
+  "calendar.view_all":           new Set(["Founder", "Admin"]),
+  "calendar.edit_any":           new Set(["Founder", "Admin"]),
+  "calendar.delete_any":         new Set(["Founder", "Admin"]),
+
   "activity.view_all":           new Set(["Founder", "Admin"]),
   "activity.view_team":          new Set(["Manager"]),
+
+  "vault.view":                  new Set(["Founder"]),
+  "vault.manage":                new Set(["Founder"]),
+
+  "finance.view":                new Set(["Founder"]),
+  "finance.manage":              new Set(["Founder"]),
+
+  "crm.view":                    new Set(["Founder", "Admin", "Manager"]),
+  "crm.edit":                    new Set(["Founder", "Admin", "Manager"]),
+
+  "marketing.view":              new Set(["Founder", "Admin", "Manager"]),
+  "marketing.manage":            new Set(["Founder", "Admin", "Manager"]),
+
+  "analytics.view":              new Set(["Founder", "Admin", "Manager"]),
+  "analytics.export":            new Set(["Founder", "Admin", "Manager"]),
+
+  "ai.use":                      new Set(["Founder", "Admin", "Manager", "Employee", "Intern"]),
 
   "settings.company_edit":       new Set(["Founder"]),
   "settings.roles_view":         new Set(["Founder", "Admin", "Manager", "Employee", "Intern"]),

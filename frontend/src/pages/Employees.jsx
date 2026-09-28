@@ -12,7 +12,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Users, Plus, UserPlus, Building2, CalendarDays, Award, KeyRound, Mail, Copy, Check, Trash2, Pencil, Power, UserMinus, CheckCircle2, Loader2, Eye, EyeOff, Sparkles, Send, ShieldCheck, ArrowLeft } from "lucide-react";
+import { Users, Plus, UserPlus, Building2, CalendarDays, Award, KeyRound, Mail, Copy, Check, Trash2, Pencil, Power, UserMinus, CheckCircle2, Loader2, Eye, EyeOff, Sparkles, Send, ShieldCheck, ArrowLeft, Clock, LogIn, LogOut } from "lucide-react";
+import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -28,12 +29,56 @@ function getInviteLink(token) {
   return `${origin}/accept-invite?token=${token}`;
 }
 
+const ROLE_OPTIONS = ["Admin", "Manager", "Employee", "Intern"];
+const ALL_EMPLOYEES = "__all__";
+const NO_DEPARTMENT = "__none__";
+
+// Local calendar date (YYYY-MM-DD); toISOString() would give the UTC date.
+function todayLocal() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function currentQuarter() {
+  const d = new Date();
+  return `Q${Math.floor(d.getMonth() / 3) + 1}-${d.getFullYear()}`;
+}
+
+function fmtTime(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+function fmtDuration(minutes) {
+  if (minutes === null || minutes === undefined || minutes < 0) return "—";
+  const h = Math.floor(minutes / 60);
+  const m = Math.floor(minutes % 60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function DepartmentSelect({ value, onChange, departments, disabled }) {
+  return (
+    <Select value={value || NO_DEPARTMENT} onValueChange={(v) => onChange(v === NO_DEPARTMENT ? "" : v)} disabled={disabled}>
+      <SelectTrigger><SelectValue placeholder="Select department" /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value={NO_DEPARTMENT}>No department</SelectItem>
+        {departments.filter(d => d.registered !== false).map(d => <SelectItem key={d.id || d.name} value={d.name}>{d.name}</SelectItem>)}
+        {value && !departments.some(d => d.name === value) && <SelectItem value={value}>{value}</SelectItem>}
+      </SelectContent>
+    </Select>
+  );
+}
+
 function Directory() {
+  const { user } = useAuth();
   const { can, role } = usePermission();
   const canInvite = can("employee.invite");
   const canEdit = can("employee.edit");
   const canReset = can("auth.reset_other_password");
   const canManageAccount = role === "Founder" || role === "Admin";
+  // Roles this user may grant, mirroring the user.invite.* permission matrix.
+  const assignableRoles = ROLE_OPTIONS.filter(r => can(`user.invite.${r.toLowerCase()}`));
   const [rows, setRows] = useState([]);
   const [departments, setDepartments] = useState([]);
   const [selectedDepartment, setSelectedDepartment] = useState(null);
@@ -54,42 +99,59 @@ function Directory() {
   const [copied, setCopied] = useState(false);
   const [actionLoadingKey, setActionLoadingKey] = useState(null);
 
+  const loadRows = (dept) => {
+    const params = dept && dept !== ALL_EMPLOYEES ? { department: dept } : {};
+    api.get("/employees", { params }).then(({ data }) => setRows(data)).catch((e) => toast.error(formatApiError(e)));
+  };
+
+  const loadMeta = () => {
+    api.get("/employees/departments/list").then(({ data }) => setDepartments(data)).catch((e) => toast.error(formatApiError(e)));
+    api.get("/employees/invitations").then(({ data }) => setInvitations(data)).catch((e) => toast.error(formatApiError(e)));
+  };
+
   const load = () => {
-    if (selectedDepartment) {
-      api.get("/employees", { params: { department: selectedDepartment } }).then(({ data }) => setRows(data)).catch(() => {});
-    }
-    api.get("/employees/departments/list").then(({ data }) => setDepartments(data)).catch(() => {});
-    api.get("/employees/invitations").then(({ data }) => setInvitations(data)).catch(() => {});
+    if (selectedDepartment) loadRows(selectedDepartment);
+    loadMeta();
   };
 
   const [searchParams, setSearchParams] = useSearchParams();
 
-  useEffect(() => {
-    api.get("/employees/departments/list").then(({ data }) => setDepartments(data)).catch(() => {});
-    api.get("/employees/invitations").then(({ data }) => setInvitations(data)).catch(() => {});
-  }, []);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { loadMeta(); }, []);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     setQ("");
     if (!selectedDepartment) {
       setRows([]);
       return;
     }
-    api.get("/employees", { params: { department: selectedDepartment } }).then(({ data }) => setRows(data)).catch(() => {});
+    loadRows(selectedDepartment);
   }, [selectedDepartment]);
+
+  // Managers only manage their own department, so only that card is offered to them.
+  const visibleDepartments = useMemo(
+    () => (role === "Manager"
+      ? departments.filter(d => d.name.trim().toLowerCase() === (user?.department || "").trim().toLowerCase())
+      : departments),
+    [departments, role, user]
+  );
 
   useEffect(() => {
     if (searchParams.get("create") === "invite" || searchParams.get("action") === "invite-teammate") {
-      setCreatedInvite(null);
-      setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" });
-      setOpen(true);
+      // Only roles that may invite get the dialog; for others the deep link is simply dropped.
+      if (canInvite) {
+        setCreatedInvite(null);
+        setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" });
+        setOpen(true);
+      }
       setSearchParams(params => {
         params.delete("create");
         params.delete("action");
         return params;
       }, { replace: true });
     }
-  }, [searchParams]);
+  }, [searchParams, setSearchParams, canInvite]);
 
   const filtered = useMemo(() => {
     if (!q) return rows;
@@ -113,7 +175,7 @@ function Directory() {
       const { data } = await api.post("/employees/invite", form);
       const url = getInviteLink(data.token);
       setCreatedInvite({ ...data, invite_url: url });
-      toast.success(data.message || `Invitation email sent to ${form.email}`);
+      toast.success(data.message || "Invitation created — share the link");
       load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -122,8 +184,13 @@ function Directory() {
     }
   }
 
-  function copyInviteUrl(url) {
-    navigator.clipboard.writeText(url);
+  async function copyInviteUrl(url) {
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      toast.error("Couldn't copy automatically — select the link and copy it manually");
+      return;
+    }
     setCopied(true);
     toast.success("Invitation link copied to clipboard!");
     setTimeout(() => setCopied(false), 2500);
@@ -135,7 +202,8 @@ function Directory() {
     setActionLoadingKey(key);
     try {
       const { data } = await api.post(`/employees/invitations/${targetId}/resend`);
-      toast.success(data.message || `Invitation email resent to ${inv.email}`);
+      toast.success(data.message || "Invitation renewed");
+      load();
     } catch (e) {
       toast.error(formatApiError(e));
     } finally {
@@ -182,8 +250,8 @@ function Directory() {
     if (e) e.preventDefault();
     if (!resetTargetUser) return;
     const trimmed = newPassword.trim();
-    if (!trimmed || trimmed.length < 6) {
-      toast.error("Password must be at least 6 characters long");
+    if (!trimmed || trimmed.length < 8) {
+      toast.error("Password must be at least 8 characters long");
       return;
     }
     if (trimmed !== confirmPassword.trim()) {
@@ -197,11 +265,12 @@ function Directory() {
       const { data } = await api.post(`/employees/${resetTargetUser.id}/reset-password`, {
         new_password: trimmed,
       });
-      toast.success(data.message || `Password updated! Email dispatched to ${resetTargetUser.email} via Brevo.`);
+      toast.success(data.message || "Password updated");
       setResetInfo({
         email: resetTargetUser.email,
         name: resetTargetUser.name,
         password: trimmed,
+        emailQueued: !!data.email_queued,
       });
       setResetTargetUser(null);
       setNewPassword("");
@@ -265,6 +334,13 @@ function Directory() {
     });
   }
 
+  // Mirrors the backend edit rules: role/department are org-managed fields.
+  const editingSelf = editingUser?.id === user?.id;
+  const canChangeRole = !!editingUser && !editingSelf && (role === "Founder" || role === "Admin")
+    && assignableRoles.includes(editingUser.role);
+  const canChangeDepartment = !!editingUser && (role === "Founder" || (role === "Admin" && !editingSelf));
+  const editRoles = canChangeRole ? assignableRoles : [editForm.role];
+
   async function saveEdit() {
     if (!editingUser) return;
     setActionLoadingKey("save-edit");
@@ -288,18 +364,20 @@ function Directory() {
             {canInvite && <Button onClick={() => { setCreatedInvite(null); setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" }); setOpen(true); }} data-testid="employee-invite-btn"><UserPlus className="h-4 w-4 mr-1.5" /> Invite teammate</Button>}
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 mb-6">
-            {departments.map(d => (
-              <Card key={d.id || d.name} className="border-border hover-lift cursor-pointer" onClick={() => setSelectedDepartment(d.name)}>
-                <CardHeader className="pb-2">
-                  <div className="flex items-center gap-2">
-                    <div className="h-9 w-9 rounded-md bg-primary/10 text-primary flex items-center justify-center"><Building2 className="h-4.5 w-4.5" /></div>
-                    <div>
-                      <CardTitle className="font-display text-[15px]">{d.name}</CardTitle>
-                      <div className="text-[11.5px] text-muted-foreground">{d.headcount} teammate{d.headcount === 1 ? "" : "s"}{d.head_name ? ` · ${d.head_name}` : ""}</div>
-                    </div>
+            <Card className="border-border hover-lift cursor-pointer" onClick={() => setSelectedDepartment(ALL_EMPLOYEES)} data-testid="dept-card-all">
+              <CardHeader className="pb-2">
+                <div className="flex items-center gap-2">
+                  <div className="h-9 w-9 rounded-md bg-primary/10 text-primary flex items-center justify-center"><Users className="h-4.5 w-4.5" /></div>
+                  <div>
+                    <CardTitle className="font-display text-[15px]">{role === "Manager" ? "My team" : "All employees"}</CardTitle>
+                    <div className="text-[11.5px] text-muted-foreground">Everyone{role === "Manager" ? " in your department" : ", including teammates without a department"}</div>
                   </div>
-                </CardHeader>
-                <CardContent className="pt-0 text-[13px] text-muted-foreground">{d.description || "—"}</CardContent>
+                </div>
+              </CardHeader>
+            </Card>
+            {visibleDepartments.map(d => (
+              <Card key={d.id || `unregistered-${d.name}`} className="border-border hover-lift cursor-pointer" onClick={() => setSelectedDepartment(d.name)}>
+                <DepartmentCardBody d={d} />
               </Card>
             ))}
           </div>
@@ -309,6 +387,7 @@ function Directory() {
           <button type="button" onClick={() => setSelectedDepartment(null)} className="mb-3 inline-flex items-center gap-1.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors">
             <ArrowLeft className="h-4 w-4" /> Back to Departments
           </button>
+          <div className="mb-2 font-display text-[15px] font-semibold">{selectedDepartment === ALL_EMPLOYEES ? (role === "Manager" ? "My team" : "All employees") : selectedDepartment}</div>
           <div className="flex flex-col sm:flex-row gap-2 items-start sm:items-center justify-between">
             <Input placeholder="Search by name, email, role…" value={q} onChange={(e) => setQ(e.target.value)} className="max-w-md" data-testid="employee-search" />
             {canInvite && <Button onClick={() => { setCreatedInvite(null); setForm({ email: "", name: "", role: "Employee", designation: "", department: "", phone: "" }); setOpen(true); }} data-testid="employee-invite-btn"><UserPlus className="h-4 w-4 mr-1.5" /> Invite teammate</Button>}
@@ -332,16 +411,19 @@ function Directory() {
                 const isDeleting = actionLoadingKey === `del-inv-${targetId}`;
 
                 return (
-                  <div key={targetId} className="py-2.5 flex items-center justify-between gap-4 text-xs">
-                    <div>
+                  <div key={targetId} className="py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 sm:gap-4 text-xs">
+                    <div className="min-w-0 break-words">
                       <span className="font-medium text-foreground">{inv.name}</span>
                       <span className="text-muted-foreground ml-2">({inv.email})</span>
                       <Badge variant="outline" className="ml-2 text-[10px] uppercase">{inv.role}</Badge>
+                      {inv.expired && <Badge variant="outline" className="ml-1 text-[10px] uppercase text-destructive border-destructive/40">Expired</Badge>}
                     </div>
-                    <div className="flex items-center gap-2">
-                      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => copyInviteUrl(link)}>
-                        <Copy className="h-3 w-3 mr-1" /> Copy Link
-                      </Button>
+                    {canInvite && <div className="flex flex-wrap items-center gap-2">
+                      {inv.token && !inv.expired && (
+                        <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => copyInviteUrl(link)}>
+                          <Copy className="h-3 w-3 mr-1" /> Copy Link
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="outline"
@@ -350,7 +432,7 @@ function Directory() {
                         disabled={isResending || !!actionLoadingKey}
                       >
                         {isResending ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : null}
-                        Resend Email
+                        {inv.expired ? "Renew" : "Resend"}
                       </Button>
                       <Button
                         size="sm"
@@ -362,7 +444,7 @@ function Directory() {
                         {isDeleting ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Trash2 className="h-3 w-3 mr-1" />}
                         Delete
                       </Button>
-                    </div>
+                    </div>}
                   </div>
                 );
               })}
@@ -390,6 +472,12 @@ function Directory() {
                 const isStatusLoading = actionLoadingKey === `status-${targetId}`;
                 const isDeleteLoading = actionLoadingKey === `del-emp-${targetId}`;
                 const isResetLoading = actionLoadingKey === `reset-${u.id}`;
+                const isSelf = u.id === user?.id;
+                const canEditRow = canEdit && u.role !== "Founder" && (
+                  isSelf
+                  || (role === "Manager" ? ["Employee", "Intern"].includes(u.role) : !(role === "Admin" && u.role === "Admin"))
+                );
+                const canManageRow = canManageAccount && u.role !== "Founder" && !isSelf && !(role === "Admin" && u.role === "Admin");
 
                 return (
                   <TableRow key={u.id}>
@@ -411,18 +499,18 @@ function Directory() {
                     {(canEdit || canReset || canManageAccount) && (
                       <TableCell className="text-right">
                         <div className="flex items-center justify-end gap-1.5">
-                          {canEdit && u.role !== "Founder" && (
+                          {canEditRow && (
                             <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => startEdit(u)} disabled={!!actionLoadingKey} data-testid={`edit-employee-btn-${u.id}`}>
                               <Pencil className="h-3.5 w-3.5 mr-1" /> Edit
                             </Button>
                           )}
-                          {canReset && u.role !== "Founder" && (
+                          {canReset && u.role !== "Founder" && !(role === "Admin" && u.role === "Admin" && !isSelf) && (
                             <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => resetPassword(u)} disabled={isResetLoading || !!actionLoadingKey} data-testid={`reset-password-btn-${u.id}`}>
                               {isResetLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : <KeyRound className="h-3.5 w-3.5 mr-1" />}
                               Reset password
                             </Button>
                           )}
-                          {canManageAccount && u.role !== "Founder" && (
+                          {canManageRow && (
                             <>
                               <Button
                                 size="sm"
@@ -476,11 +564,13 @@ function Directory() {
       <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) setCreatedInvite(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle className="font-display">{createdInvite ? "Invitation Sent & Link Generated" : "Invite teammate"}</DialogTitle>
+            <DialogTitle className="font-display">{createdInvite ? "Invitation Created" : "Invite teammate"}</DialogTitle>
             <DialogDescription>
               {createdInvite
-                ? "An email was dispatched via Brevo. You can also copy and share the direct invitation link below."
-                : "An invitation email will be sent to the employee. They will be added to the directory once they accept."}
+                ? (createdInvite.email_queued
+                  ? "The invitation email has been queued. You can also copy and share the direct invitation link below."
+                  : "Invitation created — share the link below. Email is not configured, so no email was sent.")
+                : "They will be added to the directory once they accept the invitation. The link is valid for 7 days."}
             </DialogDescription>
           </DialogHeader>
 
@@ -488,8 +578,8 @@ function Directory() {
             <div className="space-y-3 my-2">
               <div className="rounded-lg border border-blue-500/30 bg-blue-500/10 p-3.5 space-y-2">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-blue-400 uppercase tracking-wider">Invitation Link</span>
-                  <Badge variant="outline" className="text-[10px] bg-blue-500/20 text-blue-300 border-blue-500/30">Active</Badge>
+                  <span className="text-xs font-semibold text-blue-700 dark:text-blue-400 uppercase tracking-wider">Invitation Link</span>
+                  <Badge variant="outline" className="text-[10px] bg-blue-500/20 text-blue-700 dark:text-blue-300 border-blue-500/30">Active</Badge>
                 </div>
                 <div className="text-xs text-muted-foreground">
                   Share this link directly with <strong className="text-foreground">{createdInvite.name}</strong> to let them set their password & accept:
@@ -512,14 +602,14 @@ function Directory() {
                   <Label>Role</Label>
                   <Select value={form.role} onValueChange={(v) => setForm(s => ({ ...s, role: v }))}>
                     <SelectTrigger><SelectValue /></SelectTrigger>
-                    <SelectContent>{["Admin","Manager","Employee","Intern"].map(r => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
+                    <SelectContent>{assignableRoles.map(r => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
                 <div><Label>Phone</Label><Input value={form.phone} onChange={(e) => setForm(s => ({ ...s, phone: e.target.value }))} /></div>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div><Label>Designation</Label><Input value={form.designation} onChange={(e) => setForm(s => ({ ...s, designation: e.target.value }))} /></div>
-                <div><Label>Department</Label><Input value={form.department} onChange={(e) => setForm(s => ({ ...s, department: e.target.value }))} /></div>
+                <div><Label>Department</Label><DepartmentSelect value={form.department} onChange={(v) => setForm(s => ({ ...s, department: v }))} departments={departments} /></div>
               </div>
             </div>
           )}
@@ -533,10 +623,10 @@ function Directory() {
                 <Button onClick={invite} disabled={actionLoadingKey === "invite"} data-testid="invite-submit-btn">
                   {actionLoadingKey === "invite" ? (
                     <>
-                      <Loader2 className="h-4 w-4 animate-spin mr-2" /> Sending invitation...
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" /> Creating invitation...
                     </>
                   ) : (
-                    "Send invitation email"
+                    "Create invitation"
                   )}
                 </Button>
               </>
@@ -566,10 +656,10 @@ function Directory() {
           <div className="rounded-lg bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900/60 p-3 text-xs text-blue-900 dark:text-blue-200 flex items-start gap-2.5">
             <Mail className="h-4 w-4 text-blue-600 dark:text-blue-400 mt-0.5 shrink-0" />
             <div className="space-y-0.5 leading-relaxed">
-              <span className="font-semibold">Brevo Email Notification:</span>
+              <span className="font-semibold">Email Notification:</span>
               <p className="text-muted-foreground text-[11px] leading-normal">
-                When submitted, an email will be automatically sent via Brevo to{" "}
-                <span className="font-mono font-medium text-foreground">{resetTargetUser?.email}</span> with their updated login credentials attached.
+                If email is configured, the updated login credentials are emailed to{" "}
+                <span className="font-mono font-medium text-foreground">{resetTargetUser?.email}</span>. Otherwise share them securely yourself.
               </p>
             </div>
           </div>
@@ -589,7 +679,7 @@ function Directory() {
               <div className="relative">
                 <Input
                   type={showPassword ? "text" : "password"}
-                  placeholder="Enter new password (min 6 characters)"
+                  placeholder="Enter new password (min 8 characters)"
                   value={newPassword}
                   onChange={(e) => setNewPassword(e.target.value)}
                   className="pr-10 text-sm font-mono tracking-wide"
@@ -632,18 +722,18 @@ function Directory() {
               </Button>
               <Button
                 type="submit"
-                disabled={actionLoadingKey === `reset-${resetTargetUser?.id}` || !newPassword || newPassword.length < 6 || newPassword !== confirmPassword}
+                disabled={actionLoadingKey === `reset-${resetTargetUser?.id}` || !newPassword || newPassword.length < 8 || newPassword !== confirmPassword}
                 data-testid="reset-submit-btn"
               >
                 {actionLoadingKey === `reset-${resetTargetUser?.id}` ? (
                   <>
                     <Loader2 className="h-4 w-4 animate-spin mr-2" />
-                    Updating & Sending Brevo Email...
+                    Updating password...
                   </>
                 ) : (
                   <>
                     <Send className="h-3.5 w-3.5 mr-1.5" />
-                    Update & Send Email
+                    Update password
                   </>
                 )}
               </Button>
@@ -663,7 +753,9 @@ function Directory() {
               <div>
                 <DialogTitle className="text-lg font-display">Password Updated Successfully</DialogTitle>
                 <DialogDescription className="text-xs">
-                  Email dispatched to <span className="font-semibold text-foreground">{resetInfo?.email}</span> via Brevo
+                  {resetInfo?.emailQueued
+                    ? <>Email queued to <span className="font-semibold text-foreground">{resetInfo?.email}</span></>
+                    : "Email is not configured — share the new password securely"}
                 </DialogDescription>
               </div>
             </div>
@@ -673,7 +765,9 @@ function Directory() {
             <div className="flex items-center gap-2 text-xs bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-900/60 text-emerald-800 dark:text-emerald-300 p-2.5 rounded-lg">
               <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600 dark:text-emerald-400" />
               <span>
-                The employee's password has been updated and an email with the new credentials was sent to <strong>{resetInfo?.email}</strong>.
+                {resetInfo?.emailQueued
+                  ? <>The employee's password has been updated and an email with the new credentials is on its way to <strong>{resetInfo?.email}</strong>.</>
+                  : "The employee's password has been updated. No email was sent, so share it with them directly."}
               </span>
             </div>
 
@@ -682,8 +776,13 @@ function Directory() {
                 <span>Updated Password</span>
                 <button
                   type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(resetInfo?.password || "");
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(resetInfo?.password || "");
+                    } catch {
+                      toast.error("Couldn't copy automatically — select the password and copy it manually");
+                      return;
+                    }
                     setPasswordCopied(true);
                     toast.success("Password copied to clipboard");
                     setTimeout(() => setPasswordCopied(false), 2000);
@@ -719,16 +818,16 @@ function Directory() {
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <Label>Role</Label>
-                <Select value={editForm.role} onValueChange={(v) => setEditForm(s => ({ ...s, role: v }))}>
+                <Select value={editForm.role} onValueChange={(v) => setEditForm(s => ({ ...s, role: v }))} disabled={!canChangeRole}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>{["Admin","Manager","Employee","Intern"].map(r => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
+                  <SelectContent>{editRoles.map(r => <SelectItem key={r} value={r}>{r}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
               <div><Label>Phone</Label><Input value={editForm.phone} onChange={(e) => setEditForm(s => ({ ...s, phone: e.target.value }))} /></div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div><Label>Designation</Label><Input value={editForm.designation} onChange={(e) => setEditForm(s => ({ ...s, designation: e.target.value }))} /></div>
-              <div><Label>Department</Label><Input value={editForm.department} onChange={(e) => setEditForm(s => ({ ...s, department: e.target.value }))} /></div>
+              <div><Label>Department</Label><DepartmentSelect value={editForm.department} onChange={(v) => setEditForm(s => ({ ...s, department: v }))} departments={departments} disabled={!canChangeDepartment} /></div>
             </div>
           </div>
           <DialogFooter>
@@ -753,27 +852,73 @@ function Attendance() {
   const { user } = useAuth();
   const { can } = usePermission();
   const canDir = can("employee.view_directory");
+  const canMarkOthers = can("attendance.mark_others");
   const [rows, setRows] = useState([]);
   const [users, setUsers] = useState([]);
   const [open, setOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [form, setForm] = useState({ employee_id: "", date: new Date().toISOString().slice(0, 10), status: "present" });
+  const [punching, setPunching] = useState(false);
+  const [, setTick] = useState(0);
+  const [form, setForm] = useState({ employee_id: "", date: todayLocal(), status: "present" });
+  const [dateFilter, setDateFilter] = useState("");
 
-  useEffect(() => { if (!canDir && user) setForm(s => ({ ...s, employee_id: user.id })); }, [canDir, user]);
+  useEffect(() => { if (user) setForm(s => ({ ...s, employee_id: s.employee_id || user.id })); }, [user]);
 
-  async function load() {
-    const empReq = canDir ? api.get("/employees") : Promise.resolve({ data: [] });
-    const [{ data: att }, { data: emps }] = await Promise.all([api.get("/employees/attendance/records"), empReq]);
-    const list = canDir ? emps : (user ? [{ id: user.id, name: user.name }] : []);
-    const nameMap = Object.fromEntries(list.map(e => [e.id, e.name]));
-    if (user) nameMap[user.id] = user.name;
-    setRows(att.map(a => ({ ...a, employee_name: nameMap[a.employee_id] || (user ? user.name : "—") })));
-    setUsers(list);
+  // Re-render every minute so the running worked time stays current.
+  useEffect(() => {
+    const t = setInterval(() => setTick(n => n + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  async function load({ background = false } = {}) {
+    try {
+      const empReq = canDir ? api.get("/employees") : Promise.resolve({ data: [] });
+      const [{ data: att }, { data: emps }] = await Promise.all([api.get("/employees/attendance/records"), empReq]);
+      const list = canDir ? emps : (user ? [{ id: user.id, name: user.name }] : []);
+      const nameMap = Object.fromEntries(list.map(e => [e.id, e.name]));
+      if (user) nameMap[user.id] = user.name;
+      setRows(att.map(a => ({ ...a, employee_name: a.employee_name || nameMap[a.employee_id] || "Unknown employee" })));
+      setUsers(list);
+    } catch (e) {
+      if (!background) toast.error(formatApiError(e));
+    }
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, []);
+  useLiveRefresh(load, 60000);
+
+  const today = todayLocal();
+  const shownRows = dateFilter ? rows.filter(r => r.date === dateFilter) : rows;
+  const mine = rows.find(r => r.employee_id === user?.id && r.date === today);
+  const checkedIn = !!mine?.check_in;
+  const checkedOut = !!mine?.check_out;
+  const workedMinutes = checkedIn && !checkedOut
+    ? Math.max(0, Math.floor((Date.now() - new Date(mine.check_in).getTime()) / 60000))
+    : mine?.duration_minutes;
+  const todayText = !checkedIn
+    ? (mine?.status === "leave" ? "On leave today" : "Not checked in yet")
+    : checkedOut
+      ? `Checked in ${fmtTime(mine.check_in)} · out ${fmtTime(mine.check_out)} · worked ${fmtDuration(workedMinutes)}`
+      : `Checked in at ${fmtTime(mine.check_in)} · worked ${fmtDuration(workedMinutes)} so far`;
+
+  async function punch() {
+    setPunching(true);
+    try {
+      await api.post(checkedIn ? "/employees/attendance/check-out" : "/employees/attendance/check-in");
+      toast.success(checkedIn ? "Checked out" : "Checked in");
+      load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setPunching(false);
+    }
+  }
 
   async function submit() {
+    if (!form.employee_id) {
+      toast.error("Please select an employee");
+      return;
+    }
     setSubmitting(true);
     try {
       await api.post("/employees/attendance/records", form);
@@ -787,22 +932,46 @@ function Attendance() {
     }
   }
 
+  const markingSelf = form.employee_id === user?.id;
+  // Leave is recorded through an approved leave request, never self-marked.
+  const statusOptions = ["present", "absent", "leave", "half_day", "wfh"].filter(s => !(markingSelf && s === "leave"));
+
   return (
     <>
-      <div className="flex justify-end mb-4">
-        <Button onClick={() => { setForm(s => ({ ...s, date: new Date().toISOString().slice(0, 10) })); setOpen(true); }} data-testid="attendance-mark-btn"><Plus className="h-4 w-4 mr-1.5" /> Mark attendance</Button>
+      <Card className="border-border mb-4" data-testid="attendance-today-card">
+        <CardContent className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="h-9 w-9 rounded-md bg-primary/10 text-primary flex items-center justify-center"><Clock className="h-4.5 w-4.5" /></div>
+            <div>
+              <div className="text-[13.5px] font-medium">Today</div>
+              <div className="text-[12.5px] text-muted-foreground" data-testid="attendance-today-status">{todayText}</div>
+            </div>
+          </div>
+          <Button onClick={punch} disabled={punching || !user} data-testid="attendance-punch-btn">
+            {punching ? <Loader2 className="h-4 w-4 animate-spin mr-1.5" /> : checkedIn ? <LogOut className="h-4 w-4 mr-1.5" /> : <LogIn className="h-4 w-4 mr-1.5" />}
+            {checkedIn ? (checkedOut ? "Check out again" : "Check out") : "Check in"}
+          </Button>
+        </CardContent>
+      </Card>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+        <div className="flex items-center gap-2">
+          <Input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)} className="w-[170px]" aria-label="Filter by date" data-testid="attendance-date-filter" />
+          {dateFilter && <Button variant="ghost" size="sm" onClick={() => setDateFilter("")} data-testid="attendance-date-clear">All dates</Button>}
+        </div>
+        <Button onClick={() => { setForm(s => ({ ...s, date: todayLocal(), employee_id: s.employee_id || user?.id || "" })); setOpen(true); }} data-testid="attendance-mark-btn"><Plus className="h-4 w-4 mr-1.5" /> Mark attendance</Button>
       </div>
       <Card className="border-border">
-        {rows.length === 0 ? <EmptyState icon={CalendarDays} title="No attendance yet" description="Attendance records will appear here." /> : (
+        {shownRows.length === 0 ? <EmptyState icon={CalendarDays} title={dateFilter ? "No attendance on this date" : "No attendance yet"} description="Attendance records will appear here." /> : (
           <Table>
-            <TableHeader><TableRow><TableHead>Employee</TableHead><TableHead>Date</TableHead><TableHead>Status</TableHead><TableHead>Check-in</TableHead><TableHead>Check-out</TableHead></TableRow></TableHeader>
-            <TableBody>{rows.map(r => (
+            <TableHeader><TableRow><TableHead>Employee</TableHead><TableHead>Date</TableHead><TableHead>Status</TableHead><TableHead>Check-in</TableHead><TableHead>Check-out</TableHead><TableHead>Worked</TableHead></TableRow></TableHeader>
+            <TableBody>{shownRows.map(r => (
               <TableRow key={r.id}>
                 <TableCell className="font-medium">{r.employee_name}</TableCell>
                 <TableCell>{r.date}</TableCell>
                 <TableCell><StatusPill status={r.status} /></TableCell>
-                <TableCell className="text-[13px] text-muted-foreground">{r.check_in || "—"}</TableCell>
-                <TableCell className="text-[13px] text-muted-foreground">{r.check_out || "—"}</TableCell>
+                <TableCell className="text-[13px] text-muted-foreground">{fmtTime(r.check_in)}</TableCell>
+                <TableCell className="text-[13px] text-muted-foreground">{fmtTime(r.check_out)}</TableCell>
+                <TableCell className="text-[13px] text-muted-foreground">{fmtDuration(r.duration_minutes)}</TableCell>
               </TableRow>
             ))}</TableBody>
           </Table>
@@ -810,11 +979,15 @@ function Attendance() {
       </Card>
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle className="font-display">Mark attendance</DialogTitle><DialogDescription>Record for a specific date and employee.</DialogDescription></DialogHeader>
+          <DialogHeader><DialogTitle className="font-display">Mark attendance</DialogTitle><DialogDescription>Record today's status. Existing check-in and check-out times are kept.</DialogDescription></DialogHeader>
           <div className="space-y-3">
             <div>
               <Label>Employee</Label>
-              <Select value={form.employee_id} onValueChange={(v) => setForm(s => ({ ...s, employee_id: v }))} disabled={!canDir || submitting}>
+              <Select
+                value={form.employee_id}
+                onValueChange={(v) => setForm(s => ({ ...s, employee_id: v, status: v === user?.id && s.status === "leave" ? "present" : s.status }))}
+                disabled={!canMarkOthers || !canDir || submitting}
+              >
                 <SelectTrigger><SelectValue placeholder={canDir ? "Select employee" : (user?.name || "You")} /></SelectTrigger>
                 <SelectContent>{users.map(u => <SelectItem key={u.id} value={u.id}>{u.name}</SelectItem>)}</SelectContent>
               </Select>
@@ -825,7 +998,7 @@ function Attendance() {
                 <Label>Status</Label>
                 <Select value={form.status} onValueChange={(v) => setForm(s => ({ ...s, status: v }))} disabled={submitting}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>{["present","absent","leave","half_day","wfh"].map(s => <SelectItem key={s} value={s} className="capitalize">{s.replace("_"," ")}</SelectItem>)}</SelectContent>
+                  <SelectContent>{statusOptions.map(s => <SelectItem key={s} value={s} className="capitalize">{s.replace("_"," ")}</SelectItem>)}</SelectContent>
                 </Select>
               </div>
             </div>
@@ -853,24 +1026,38 @@ function Leave() {
   const [open, setOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [actionId, setActionId] = useState(null);
-  const [form, setForm] = useState({ employee_id: "", from_date: "", to_date: "", kind: "casual", reason: "", status: "pending" });
+  const [form, setForm] = useState({ employee_id: "", from_date: "", to_date: "", kind: "casual", reason: "" });
 
-  useEffect(() => { if (!canDir && user) setForm(s => ({ ...s, employee_id: user.id })); }, [canDir, user]);
+  useEffect(() => { if (user) setForm(s => ({ ...s, employee_id: s.employee_id || user.id })); }, [user]);
 
-  async function load() {
-    const empReq = canDir ? api.get("/employees") : Promise.resolve({ data: [] });
-    const [{ data: lv }, { data: emps }] = await Promise.all([api.get("/employees/leave/requests"), empReq]);
-    setRows(lv); setUsers(canDir ? emps : (user ? [{ id: user.id, name: user.name }] : []));
+  async function load({ background = false } = {}) {
+    try {
+      const empReq = canDir ? api.get("/employees") : Promise.resolve({ data: [] });
+      const [{ data: lv }, { data: emps }] = await Promise.all([api.get("/employees/leave/requests"), empReq]);
+      setRows(lv); setUsers(canDir ? emps : (user ? [{ id: user.id, name: user.name }] : []));
+    } catch (e) {
+      if (!background) toast.error(formatApiError(e));
+    }
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, []);
+  useLiveRefresh(load, 60000);
 
   async function submit() {
+    if (!form.from_date || !form.to_date || form.from_date > form.to_date) {
+      toast.error("Please pick a valid date range");
+      return;
+    }
+    if (!form.reason.trim()) {
+      toast.error("Please add a reason");
+      return;
+    }
     setSubmitting(true);
     try {
       await api.post("/employees/leave/requests", form);
       toast.success("Leave requested");
       setOpen(false);
+      setForm({ employee_id: user?.id || "", from_date: "", to_date: "", kind: "casual", reason: "" });
       load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -901,13 +1088,13 @@ function Leave() {
             <TableHeader><TableRow><TableHead>Employee</TableHead><TableHead>Type</TableHead><TableHead>From → To</TableHead><TableHead>Reason</TableHead><TableHead>Status</TableHead><TableHead className="text-right">Actions</TableHead></TableRow></TableHeader>
             <TableBody>{rows.map(r => (
               <TableRow key={r.id}>
-                <TableCell className="font-medium">{r.employee_name}</TableCell>
+                <TableCell className="font-medium">{r.employee_name || "Unknown employee"}</TableCell>
                 <TableCell className="capitalize">{r.kind}</TableCell>
                 <TableCell className="text-[13px]">{r.from_date} → {r.to_date}</TableCell>
                 <TableCell className="text-[13px] text-muted-foreground line-clamp-1">{r.reason}</TableCell>
                 <TableCell><StatusPill status={r.status} /></TableCell>
                 <TableCell className="text-right space-x-1">
-                  {canApprove && r.status === "pending" && <>
+                  {canApprove && r.status === "pending" && r.employee_id !== user?.id && <>
                     <Button
                       size="sm"
                       variant="outline"
@@ -979,22 +1166,37 @@ function Performance() {
   const [users, setUsers] = useState([]);
   const [open, setOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [form, setForm] = useState({ employee_id: "", period: "Q1-2026", score: 4.0, highlights: "", growth_areas: "" });
+  const [form, setForm] = useState({ employee_id: "", period: currentQuarter(), score: 4.0, highlights: "", growth_areas: "" });
 
-  async function load() {
-    const empReq = canDir ? api.get("/employees") : Promise.resolve({ data: [] });
-    const [{ data: pr }, { data: emps }] = await Promise.all([api.get("/employees/performance/reviews"), empReq]);
-    setRows(pr); setUsers(canDir ? emps : (user ? [{ id: user.id, name: user.name }] : []));
+  async function load({ background = false } = {}) {
+    try {
+      const empReq = canDir ? api.get("/employees") : Promise.resolve({ data: [] });
+      const [{ data: pr }, { data: emps }] = await Promise.all([api.get("/employees/performance/reviews"), empReq]);
+      // Nobody reviews themselves.
+      setRows(pr); setUsers(canDir ? emps.filter(e => e.id !== user?.id) : []);
+    } catch (e) {
+      if (!background) toast.error(formatApiError(e));
+    }
   }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { load(); }, []);
+  useLiveRefresh(load, 60000);
 
   async function submit() {
+    if (!form.employee_id) {
+      toast.error("Please select an employee");
+      return;
+    }
+    if (!(form.score >= 1 && form.score <= 5)) {
+      toast.error("Score must be between 1 and 5");
+      return;
+    }
     setSubmitting(true);
     try {
       await api.post("/employees/performance/reviews", form);
       toast.success("Review saved");
       setOpen(false);
+      setForm({ employee_id: "", period: currentQuarter(), score: 4.0, highlights: "", growth_areas: "" });
       load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -1014,12 +1216,12 @@ function Performance() {
                 <Avatar className="h-10 w-10"><AvatarImage src={r.employee_photo || undefined} /><AvatarFallback className="bg-wavygo-100 text-wavygo-800 text-[11px] font-semibold">{initials(r.employee_name)}</AvatarFallback></Avatar>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <div className="font-medium text-[14px]">{r.employee_name}</div>
+                    <div className="font-medium text-[14px]">{r.employee_name || "Unknown employee"}</div>
                     <Badge variant="secondary" className="text-[10px]">{r.period}</Badge>
                     <span className="ml-auto inline-flex items-center gap-1 text-warning font-semibold">★ {r.score}</span>
                   </div>
                   {r.employee_designation && <div className="text-[11.5px] text-muted-foreground">{r.employee_designation}</div>}
-                  <div className="mt-2 text-[13px]"><span className="text-muted-foreground text-[11px] uppercase tracking-wide">Highlights · </span>{r.highlights}</div>
+                  {r.highlights && <div className="mt-2 text-[13px]"><span className="text-muted-foreground text-[11px] uppercase tracking-wide">Highlights · </span>{r.highlights}</div>}
                   {r.growth_areas && <div className="text-[13px] mt-1"><span className="text-muted-foreground text-[11px] uppercase tracking-wide">Growth · </span>{r.growth_areas}</div>}
                 </div>
               </div>
@@ -1039,7 +1241,7 @@ function Performance() {
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div><Label>Period</Label><Input value={form.period} onChange={(e) => setForm(s => ({ ...s, period: e.target.value }))} disabled={submitting} /></div>
-              <div><Label>Score (1-5)</Label><Input type="number" step="0.1" value={form.score} onChange={(e) => setForm(s => ({ ...s, score: parseFloat(e.target.value) }))} disabled={submitting} /></div>
+              <div><Label>Score (1-5)</Label><Input type="number" step="0.1" min="1" max="5" value={form.score} onChange={(e) => setForm(s => ({ ...s, score: parseFloat(e.target.value) }))} disabled={submitting} /></div>
             </div>
             <div><Label>Highlights</Label><Textarea rows={2} value={form.highlights} onChange={(e) => setForm(s => ({ ...s, highlights: e.target.value }))} disabled={submitting} /></div>
             <div><Label>Growth areas</Label><Textarea rows={2} value={form.growth_areas} onChange={(e) => setForm(s => ({ ...s, growth_areas: e.target.value }))} disabled={submitting} /></div>
@@ -1057,23 +1259,87 @@ function Performance() {
   );
 }
 
+const NO_HEAD = "__none__";
+
+function DepartmentCardBody({ d }) {
+  return (
+    <>
+      <CardHeader className="pb-2">
+        <div className="flex items-center gap-2">
+          <div className="h-9 w-9 rounded-md bg-primary/10 text-primary flex items-center justify-center shrink-0"><Building2 className="h-4.5 w-4.5" /></div>
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <CardTitle className="font-display text-[15px]">{d.name}</CardTitle>
+              {d.registered === false && <Badge variant="outline" className="text-[10.5px] border-warning/40 text-warning">Not set up</Badge>}
+            </div>
+            <div className="text-[11.5px] text-muted-foreground">
+              {d.headcount} teammate{d.headcount === 1 ? "" : "s"} · {d.head_name ? `Head: ${d.head_name}` : "No head assigned"}
+            </div>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="pt-0 text-[13px] text-muted-foreground">
+        {d.description || (d.registered === false
+          ? "Some teammates have this department, but it hasn't been created yet."
+          : "No description yet.")}
+      </CardContent>
+    </>
+  );
+}
+
 function Departments() {
   const { can } = usePermission();
   const canCreate = can("department.create");
   const [rows, setRows] = useState([]);
+  const [people, setPeople] = useState([]);
   const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
   const [submitting, setSubmitting] = useState(false);
-  const [form, setForm] = useState({ name: "", description: "" });
-  async function load() { const { data } = await api.get("/employees/departments/list"); setRows(data); }
+  const [form, setForm] = useState({ name: "", description: "", head_id: NO_HEAD });
+  async function load({ background = false } = {}) {
+    try {
+      const { data } = await api.get("/employees/departments/list");
+      setRows(data);
+    } catch (e) {
+      if (!background) toast.error(formatApiError(e));
+    }
+  }
   useEffect(() => { load(); }, []);
+  useLiveRefresh(load, 60000);
+  useEffect(() => {
+    if (!canCreate) return;
+    api.get("/users/directory").then(({ data }) => setPeople(data || [])).catch(() => setPeople([]));
+  }, [canCreate]);
+
+  function startCreate(name = "") {
+    setEditing(null);
+    setForm({ name, description: "", head_id: NO_HEAD });
+    setOpen(true);
+  }
+
+  function startEdit(d) {
+    setEditing(d);
+    setForm({ name: d.name, description: d.description || "", head_id: d.head_id || NO_HEAD });
+    setOpen(true);
+  }
 
   async function submit() {
+    const name = form.name.trim();
+    if (!name) {
+      toast.error("Please enter a department name");
+      return;
+    }
+    const body = { name, description: form.description.trim(), head_id: form.head_id === NO_HEAD ? null : form.head_id };
     setSubmitting(true);
     try {
-      await api.post("/employees/departments/list", form);
-      toast.success("Department created");
+      if (editing) {
+        await api.patch(`/employees/departments/${editing.id}`, body);
+        toast.success("Department updated");
+      } else {
+        await api.post("/employees/departments/list", { ...body, head_id: body.head_id || undefined });
+        toast.success("Department created");
+      }
       setOpen(false);
-      setForm({ name: "", description: "" });
       load();
     } catch (e) {
       toast.error(formatApiError(e));
@@ -1082,37 +1348,65 @@ function Departments() {
     }
   }
 
+  const unregistered = rows.filter((d) => d.registered === false);
+
   return (
     <>
-      {canCreate && <div className="flex justify-end mb-4"><Button onClick={() => setOpen(true)} data-testid="department-create-btn"><Plus className="h-4 w-4 mr-1.5" /> New department</Button></div>}
+      {canCreate && <div className="flex justify-end mb-4"><Button onClick={() => startCreate()} data-testid="department-create-btn"><Plus className="h-4 w-4 mr-1.5" /> New department</Button></div>}
+      {canCreate && unregistered.length > 0 && (
+        <div className="mb-4 rounded-lg border border-warning/30 bg-warning/5 px-4 py-3 text-[13px] text-foreground">
+          {unregistered.length} department name{unregistered.length === 1 ? " is" : "s are"} used by teammates but not set up yet. Set them up to give them a head and a description, or edit those teammates to move them into an existing department.
+        </div>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
         {rows.map(d => (
-          <Card key={d.id} className="border-border hover-lift">
-            <CardHeader className="pb-2">
-              <div className="flex items-center gap-2">
-                <div className="h-9 w-9 rounded-md bg-primary/10 text-primary flex items-center justify-center"><Building2 className="h-4.5 w-4.5" /></div>
-                <div>
-                  <CardTitle className="font-display text-[15px]">{d.name}</CardTitle>
-                  <div className="text-[11.5px] text-muted-foreground">{d.headcount} teammate{d.headcount === 1 ? "" : "s"}{d.head_name ? ` · ${d.head_name}` : ""}</div>
-                </div>
+          <Card key={d.id || `unregistered-${d.name}`} className="border-border hover-lift flex flex-col">
+            <DepartmentCardBody d={d} />
+            {canCreate && (
+              <div className="mt-auto px-6 pb-4">
+                {d.registered === false ? (
+                  <Button size="sm" variant="outline" onClick={() => startCreate(d.name)} data-testid="department-setup-btn">
+                    <Plus className="h-3.5 w-3.5 mr-1" /> Set up department
+                  </Button>
+                ) : (
+                  <Button size="sm" variant="ghost" onClick={() => startEdit(d)} data-testid="department-edit-btn">
+                    <Pencil className="h-3.5 w-3.5 mr-1" /> Edit
+                  </Button>
+                )}
               </div>
-            </CardHeader>
-            <CardContent className="pt-0 text-[13px] text-muted-foreground">{d.description || "—"}</CardContent>
+            )}
           </Card>
         ))}
       </div>
-      <Dialog open={open} onOpenChange={setOpen}>
+      <Dialog open={open} onOpenChange={(o) => !submitting && setOpen(o)}>
         <DialogContent>
-          <DialogHeader><DialogTitle className="font-display">New department</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle className="font-display">{editing ? "Edit department" : "New department"}</DialogTitle>
+            <DialogDescription>
+              {editing ? "Renaming also moves everyone in this department to the new name." : "The department head is optional and can be set later."}
+            </DialogDescription>
+          </DialogHeader>
           <div className="space-y-3">
-            <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm(s => ({ ...s, name: e.target.value }))} disabled={submitting} /></div>
-            <div><Label>Description</Label><Textarea rows={2} value={form.description} onChange={(e) => setForm(s => ({ ...s, description: e.target.value }))} disabled={submitting} /></div>
+            <div><Label>Name</Label><Input value={form.name} onChange={(e) => setForm(s => ({ ...s, name: e.target.value }))} disabled={submitting} maxLength={80} /></div>
+            <div>
+              <Label>Head</Label>
+              <Select value={form.head_id} onValueChange={(v) => setForm(s => ({ ...s, head_id: v }))} disabled={submitting}>
+                <SelectTrigger className="mt-1"><SelectValue placeholder="No head" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NO_HEAD}>No head</SelectItem>
+                  {people.map((p) => (
+                    <SelectItem key={p.id} value={p.id}>{p.name}{p.department ? ` · ${p.department}` : ""}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div><Label>Description</Label><Textarea rows={2} value={form.description} onChange={(e) => setForm(s => ({ ...s, description: e.target.value }))} disabled={submitting} maxLength={1000} /></div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setOpen(false)} disabled={submitting}>Cancel</Button>
             <Button onClick={submit} disabled={submitting}>
               {submitting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              {submitting ? "Creating..." : "Create"}
+              {submitting ? "Saving..." : editing ? "Save" : "Create"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1128,7 +1422,9 @@ export default function Employees() {
   const showPerformance = role !== "Intern";
   const personal = role === "Employee" || role === "Intern";
   const [stats, setStats] = useState(null);
-  useEffect(() => { api.get("/employees/stats/overview").then(({ data }) => setStats(data)); }, []);
+  useEffect(() => {
+    api.get("/employees/stats/overview").then(({ data }) => setStats(data)).catch((e) => toast.error(formatApiError(e)));
+  }, []);
   return (
     <div data-testid="employees-page">
       <PageHeader
@@ -1138,16 +1434,26 @@ export default function Employees() {
           ? "Your attendance, leave and performance in one place."
           : "Directory, attendance, leave, performance and departments — the human core of WavyGo."}
       />
-      {stats && (
+      {stats && stats.scope === "self" && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
-          <StatCard label="Total teammates" value={stats.total} icon={Users} />
+          <StatCard label="Days present this month" value={stats.present_this_month} icon={CalendarDays} />
+          <StatCard label="Checked in today" value={stats.checked_in_today ? "Yes" : "Not yet"} icon={Clock} tone="success" />
+          <StatCard label="Pending leave" value={stats.pending_leave} icon={CalendarDays} tone="warning" />
+          <StatCard label="Approved leave" value={stats.approved_leave} icon={CheckCircle2} tone="info" />
+        </div>
+      )}
+      {stats && stats.scope !== "self" && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+          <StatCard label={stats.scope === "department" ? "Team members" : "Total teammates"} value={stats.total} icon={Users} />
           <StatCard label="Online now" value={stats.online} icon={Users} tone="success" />
-          <StatCard label="Departments" value={stats.departments} icon={Building2} tone="info" />
+          {stats.scope === "department"
+            ? <StatCard label="Department" value={stats.department || "—"} icon={Building2} tone="info" />
+            : <StatCard label="Departments" value={stats.departments} icon={Building2} tone="info" />}
           <StatCard label="Pending leave" value={stats.pending_leave} icon={CalendarDays} tone="warning" />
         </div>
       )}
       <Tabs defaultValue={canDir ? "directory" : "attendance"}>
-        <TabsList>
+        <TabsList className="flex flex-wrap h-auto gap-1 justify-start">
           {canDir && <TabsTrigger value="directory" data-testid="emp-tab-directory">Directory</TabsTrigger>}
           <TabsTrigger value="attendance" data-testid="emp-tab-attendance">Attendance</TabsTrigger>
           <TabsTrigger value="leave" data-testid="emp-tab-leave">Leave</TabsTrigger>
