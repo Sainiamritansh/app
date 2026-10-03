@@ -6,6 +6,9 @@ from auth_utils import get_current_user, require_roles
 from models import UserPublic
 from models_part2 import ChannelIn, MessageIn
 from hub_utils import serialize, serialize_many, oid, utc_iso, log_activity, notify
+from fastapi import File, UploadFile
+import core.cloudinary_config  # loads Cloudinary settings
+from services.image_service import upload_file, delete_file
 
 router = APIRouter(prefix="/connect", tags=["connect"])
 
@@ -171,6 +174,33 @@ async def open_dm(peer_id: str, current: UserPublic = Depends(get_current_user))
     await _channel_meta(db, doc, current.id)
     return serialize(doc)
 
+@router.post("/upload")
+async def upload_chat_file(
+    file: UploadFile = File(...),
+    current: UserPublic = Depends(get_current_user),
+):
+    """Upload a chat file (image, pdf, doc...) to Cloudinary and remember who uploaded it."""
+    db = get_db()
+    uploaded = await upload_file(file)
+    await db.uploads.insert_one({**uploaded, "owner_id": current.id, "created_at": utc_iso()})
+    return uploaded
+
+@router.delete("/messages/{message_id}")
+async def delete_message(message_id: str, current: UserPublic = Depends(get_current_user)):
+    db = get_db()
+    msg = await db.messages.find_one({"_id": oid(message_id)})
+    if not msg:
+        raise HTTPException(404, "Message not found")
+    if msg["sender_id"] != current.id and current.role not in ("Founder", "Admin"):
+        raise HTTPException(403, "You can only delete your own messages")
+
+    for a in msg.get("attachments", []):
+        if isinstance(a, dict) and a.get("public_id"):
+            await delete_file(a["public_id"], a.get("resource_type", "image"))
+            await db.uploads.delete_one({"public_id": a["public_id"]})
+
+    await db.messages.delete_one({"_id": msg["_id"]})
+    return {"ok": True}
 
 @router.get("/channels/{channel_id}/messages")
 async def list_messages(channel_id: str, limit: int = Query(100, ge=1, le=500),
@@ -196,6 +226,24 @@ async def send_message(channel_id: str, payload: MessageIn, current: UserPublic 
         raise HTTPException(403, "Only Founder or Admin can post in announcement channels")
     if ch["kind"] in ("dm", "group") and current.id not in ch.get("members", []):
         raise HTTPException(403, "Not a member")
+
+    # Turn each URL into full file details, but only for files this user uploaded
+    attachments = []
+    for url in payload.attachments:
+        up = await db.uploads.find_one({"url": url, "owner_id": current.id})
+        if up:
+            attachments.append({
+                "url": up["url"],
+                "public_id": up["public_id"],
+                "resource_type": up["resource_type"],
+                "name": up["name"],
+                "size": up["size"],
+                "content_type": up.get("content_type", ""),
+                "is_image": up["is_image"],
+            })
+        else:
+            attachments.append(url)  # plain link, no Cloudinary cleanup later
+
     doc = {
         "channel_id": channel_id,
         "channel_name": ch["name"],
@@ -204,16 +252,18 @@ async def send_message(channel_id: str, payload: MessageIn, current: UserPublic 
         "sender_role": current.role,
         "sender_photo": current.photo,
         "body": payload.body,
-        "attachments": payload.attachments,
+        "attachments": attachments,
         "created_at": utc_iso(),
     }
     res = await db.messages.insert_one(doc)
     doc["_id"] = res.inserted_id
-    await db.channels.update_one({"_id": oid(channel_id)}, {"$set": {"last_message_at": doc["created_at"], "last_body": payload.body[:120]}})
+    await db.channels.update_one(
+        {"_id": oid(channel_id)},
+        {"$set": {"last_message_at": doc["created_at"], "last_body": payload.body[:120] or "📎 Attachment"}},
+    )
     if ch["kind"] == "announcement":
         await notify(db, None, f"Announcement · {ch['name']}", payload.body[:180], kind="info", link="/wavygo-connect")
     return serialize(doc)
-
 
 @router.post("/channels/{channel_id}/join")
 async def join_channel(channel_id: str, current: UserPublic = Depends(get_current_user)):

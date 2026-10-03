@@ -10,7 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck } from "lucide-react";
+import { MessagesSquare, Hash, Users2, Megaphone, Plus, Send, Search, Lock, Building2, ShieldCheck, Paperclip, X, FileText, Trash2 } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
@@ -35,6 +35,24 @@ function isHighDesignation(u) {
 
 function initials(name) { return (name || "?").split(" ").map(s => s[0]).filter(Boolean).slice(0, 2).join("").toUpperCase(); }
 
+const ALLOWED_EXT = ["jpg", "jpeg", "png", "gif", "webp", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "csv", "zip"];
+const MAX_FILE_MB = 10;
+
+// Old messages store attachments as plain URL strings; new ones are objects.
+function normalizeAttachment(a) {
+  if (typeof a !== "string") return a;
+  const isImg = /\.(jpe?g|png|gif|webp)(\?.*)?$/i.test(a);
+  let name = "Attachment";
+  try { name = decodeURIComponent(a.split("/").pop().split("?")[0]) || name; } catch { /* keep default */ }
+  return { url: a, name, is_image: isImg };
+}
+
+function formatSize(bytes) {
+  if (!bytes) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export default function WavygoConnect() {
   const { user } = useAuth();
   const { can } = usePermission();
@@ -52,6 +70,29 @@ export default function WavygoConnect() {
   const [form, setForm] = useState({ name: "", kind: "channel", description: "" });
   const [q, setQ] = useState("");
   const scrollRef = useRef(null);
+
+  // ---- File upload state ----
+  const fileRef = useRef(null);
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState("");
+  const [sending, setSending] = useState(false);
+
+  function handleFile(e) {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const ext = f.name.includes(".") ? f.name.split(".").pop().toLowerCase() : "";
+    if (!ALLOWED_EXT.includes(ext)) { toast.error(`.${ext || "this"} files are not allowed`); return; }
+    if (f.size > MAX_FILE_MB * 1024 * 1024) { toast.error(`File must be under ${MAX_FILE_MB}MB`); return; }
+    setFile(f);
+    setPreview(f.type.startsWith("image/") ? URL.createObjectURL(f) : "");
+  }
+
+  function clearFile() {
+    setFile(null);
+    setPreview("");
+    if (fileRef.current) fileRef.current.value = "";
+  }
+  // ---- end file upload state ----
 
   async function loadChannels(selectId = null) {
     const { data } = await api.get("/connect/channels");
@@ -116,12 +157,32 @@ export default function WavygoConnect() {
     } catch (e) { toast.error(formatApiError(e)); }
   }
 
+  // Uploads the file first (if any), then sends the message with the URL in attachments
   async function send() {
-    if (!text.trim() || !activeId) return;
+    if ((!text.trim() && !file) || !activeId || sending) return;
+    setSending(true);
     try {
-      await api.post(`/connect/channels/${activeId}/messages`, { body: text.trim() });
+      let attachments = [];
+      if (file) {
+        const fd = new FormData();
+        fd.append("file", file); // must match the backend parameter name "file"
+        const { data: up } = await api.post("/connect/upload", fd);
+        attachments = [up.url];
+      }
+      await api.post(`/connect/channels/${activeId}/messages`, { body: text.trim(), attachments });
       setText("");
+      clearFile();
       loadMessages(activeId);
+      loadChannels();
+    } catch (e) { toast.error(formatApiError(e)); }
+    finally { setSending(false); }
+  }
+
+  async function deleteMessage(id) {
+    if (!window.confirm("Delete this message? This cannot be undone.")) return;
+    try {
+      await api.delete(`/connect/messages/${id}`);
+      setMessages(prev => prev.filter(m => m.id !== id));
       loadChannels();
     } catch (e) { toast.error(formatApiError(e)); }
   }
@@ -324,6 +385,7 @@ export default function WavygoConnect() {
                 {messages.length === 0 && <div className="text-center text-sm text-muted-foreground py-16">No messages yet. Say hello 👋</div>}
                 {messages.map(m => {
                   const mine = m.sender_id === user?.id;
+                  const canDelete = mine || user?.role === "Founder" || user?.role === "Admin";
                   return (
                     <div key={m.id} className={cn("flex gap-2.5", mine && "flex-row-reverse")}>
                       <Avatar className="h-7 w-7 shrink-0"><AvatarImage src={m.sender_photo || undefined} /><AvatarFallback className="text-[9px] bg-wavygo-100 text-wavygo-800">{initials(m.sender_name)}</AvatarFallback></Avatar>
@@ -331,10 +393,34 @@ export default function WavygoConnect() {
                         <div className={cn("flex items-baseline gap-2 mb-0.5", mine && "flex-row-reverse")}>
                           <span className="text-[12px] font-medium">{m.sender_name}</span>
                           <span className="text-[10.5px] text-muted-foreground">{(() => { try { return formatDistanceToNow(new Date(m.created_at), { addSuffix: true }); } catch { return ""; } })()}</span>
+                          {canDelete && (
+                            <button type="button" onClick={() => deleteMessage(m.id)} title="Delete message"
+                                    className="text-muted-foreground hover:text-destructive transition-colors">
+                              <Trash2 className="h-3 w-3" />
+                            </button>
+                          )}
                         </div>
-                        <div className={cn("inline-block rounded-lg px-3 py-2 text-[13.5px] leading-relaxed", mine ? "bg-primary text-primary-foreground" : "bg-muted text-foreground")}>
-                          {m.body}
-                        </div>
+                        {m.body && (
+                          <div className={cn("inline-block rounded-lg px-3 py-2 text-[13.5px] leading-relaxed", mine ? "bg-primary text-primary-foreground" : "bg-muted text-foreground")}>
+                            {m.body}
+                          </div>
+                        )}
+                        {(m.attachments || []).map(normalizeAttachment).map((a, i) => (
+                          <div key={i} className="mt-1">
+                            {a.is_image ? (
+                              <a href={a.url} target="_blank" rel="noreferrer" className="block">
+                                <img src={a.url} alt={a.name || "attachment"} className="max-w-[260px] max-h-[260px] rounded-lg border border-border inline-block" />
+                              </a>
+                            ) : (
+                              <a href={a.url} target="_blank" rel="noreferrer"
+                                 className="inline-flex items-center gap-2 max-w-full rounded-lg border border-border bg-background px-3 py-2 text-[12.5px] text-foreground hover:bg-muted">
+                                <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
+                                <span className="truncate max-w-[200px]">{a.name}</span>
+                                {a.size ? <span className="text-[10.5px] text-muted-foreground shrink-0">{formatSize(a.size)}</span> : null}
+                              </a>
+                            )}
+                          </div>
+                        ))}
                       </div>
                     </div>
                   );
@@ -342,11 +428,33 @@ export default function WavygoConnect() {
               </div>
 
               {(active.kind !== "announcement" || canPostAnnouncement) && (
-                <div className="border-t border-border px-4 py-3 flex items-center gap-2">
-                  <Input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), send())}
-                         placeholder={`Message ${active.kind === "dm" ? active.display_name || active.name : "#" + active.name}`}
-                         className="h-10" data-testid="connect-message-input" />
-                  <Button onClick={send} disabled={!text.trim()} data-testid="connect-send-btn"><Send className="h-4 w-4" /></Button>
+                <div className="border-t border-border px-4 py-3">
+                  {file && (
+                    <div className="relative inline-block mb-2">
+                      {preview ? (
+                        <img src={preview} alt="preview" className="h-20 rounded-md border border-border" />
+                      ) : (
+                        <div className="flex items-center gap-2 rounded-md border border-border px-3 py-2 pr-8 text-[12.5px]">
+                          <FileText className="h-4 w-4 text-muted-foreground" />
+                          <span className="truncate max-w-[220px]">{file.name}</span>
+                        </div>
+                      )}
+                      <button onClick={clearFile} type="button"
+                              className="absolute -top-2 -right-2 h-5 w-5 rounded-full bg-foreground text-background flex items-center justify-center">
+                        <X className="h-3 w-3" />
+                      </button>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <input type="file" accept=".jpg,.jpeg,.png,.gif,.webp,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip" hidden ref={fileRef} onChange={handleFile} />
+                    <Button type="button" variant="outline" onClick={() => fileRef.current?.click()} disabled={sending}>
+                      <Paperclip className="h-4 w-4" />
+                    </Button>
+                    <Input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), send())}
+                           placeholder={`Message ${active.kind === "dm" ? active.display_name || active.name : "#" + active.name}`}
+                           className="h-10" data-testid="connect-message-input" />
+                    <Button onClick={send} disabled={(!text.trim() && !file) || sending} data-testid="connect-send-btn"><Send className="h-4 w-4" /></Button>
+                  </div>
                 </div>
               )}
             </>
