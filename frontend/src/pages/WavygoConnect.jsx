@@ -22,7 +22,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { usePermission } from "@/hooks/usePermission";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { formatDistanceToNow } from "date-fns";
+import { formatChatTime, formatChatTimeFull, formatDateSeparator } from "@/lib/chatTime";
 
 const KIND_ICON = { channel: Hash, dm: MessagesSquare, group: Users2, announcement: Megaphone };
 const KIND_LABEL = { channel: "Channel", group: "Group", announcement: "Announcement channel" };
@@ -126,6 +126,7 @@ export default function WavygoConnect() {
   const withinWindow = (m) => !m.editable_until || new Date(m.editable_until).getTime() > now;
   const minutesLeft = (m) => (m.editable_until ? Math.max(1, Math.ceil((new Date(m.editable_until).getTime() - now) / 60000)) : null);
   const [text, setText] = useState("");
+  const [file, setFile] = useState(null);       // future: file attachment for chat messages
   const [createOpen, setCreateOpen] = useState(false);
   const [dmOpen, setDmOpen] = useState(false);
   const [dmSearch, setDmSearch] = useState("");
@@ -685,83 +686,97 @@ export default function WavygoConnect() {
 
               <div ref={scrollRef} className="flex-1 overflow-y-auto scrollbar-thin px-5 py-4 space-y-4 min-h-[300px] max-h-[520px]">
                 {messages.length === 0 && <div className="text-center text-sm text-muted-foreground py-16">No messages yet. Say hello 👋</div>}
-                {messages.map(m => {
+                {messages.map((m, idx) => {
                   const mine = m.sender_id === user?.id;
                   const open = withinWindow(m);
                   const canEditMsg = mine && !m.deleted && open;
                   const canDeleteMsg = !m.deleted && (isOrgAdmin || (mine && open));
                   const left = mine && open ? minutesLeft(m) : null;
                   const editing = editingId === m.id;
+                  // Day separator: show when the date changes between consecutive messages
+                  const prevMsg = idx > 0 ? messages[idx - 1] : null;
+                  const curDay = m.created_at ? new Date(m.created_at).toDateString() : "";
+                  const prevDay = prevMsg?.created_at ? new Date(prevMsg.created_at).toDateString() : "";
+                  const showSep = curDay && curDay !== prevDay;
                   return (
-                    <div key={m.id} className={cn("group flex gap-2.5", mine && "flex-row-reverse")} data-testid="connect-message">
-                      <Avatar className="h-7 w-7 shrink-0"><AvatarImage src={m.sender_photo || undefined} /><AvatarFallback className="text-[9px] bg-wavygo-100 text-wavygo-800">{initials(m.sender_name)}</AvatarFallback></Avatar>
-                      <div className={cn("max-w-[70%] min-w-0", mine && "text-right", editing && "w-full")}>
-                        <div className={cn("flex items-baseline gap-2 mb-0.5", mine && "flex-row-reverse")}>
-                          <span className="text-[12px] font-medium">{m.sender_name}</span>
-                          <span className="text-[10.5px] text-muted-foreground">{(() => { try { return formatDistanceToNow(new Date(m.created_at), { addSuffix: true }); } catch { return ""; } })()}</span>
-                          {m.edited_at && !m.deleted && <span className="text-[10.5px] text-muted-foreground italic" title={`Edited ${new Date(m.edited_at).toLocaleString()}`}>(edited)</span>}
+                    <div key={m.id}>
+                      {showSep && (
+                        <div className="flex items-center gap-3 my-3">
+                          <div className="flex-1 h-px bg-border" />
+                          <span className="text-[10.5px] font-medium text-muted-foreground uppercase tracking-wide select-none">{formatDateSeparator(m.created_at)}</span>
+                          <div className="flex-1 h-px bg-border" />
                         </div>
-                        <div className={cn("flex items-center gap-1", mine && "flex-row-reverse")}>
-                          {editing ? (
-                            <div className="w-full text-left space-y-1.5">
-                              <Textarea
-                                autoFocus
-                                rows={2}
-                                maxLength={4000}
-                                value={editText}
-                                onChange={(e) => setEditText(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveEdit(m); }
-                                  if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
-                                }}
-                                className="text-[13.5px] min-h-[60px]"
-                                data-testid="connect-edit-input"
-                              />
-                              <div className="flex items-center justify-end gap-1.5">
-                                <span className="text-[10.5px] text-muted-foreground mr-auto">Enter to save · Esc to cancel</span>
-                                <Button size="sm" variant="ghost" className="h-7 gap-1" onClick={cancelEdit}><X className="h-3.5 w-3.5" />Cancel</Button>
-                                <Button size="sm" className="h-7 gap-1" onClick={() => saveEdit(m)} disabled={!editText.trim() || savingEdit} data-testid="connect-edit-save">
-                                  <Check className="h-3.5 w-3.5" />Save
-                                </Button>
+                      )}
+                      <div className={cn("group flex gap-2.5", mine && "flex-row-reverse")} data-testid="connect-message">
+                        <Avatar className="h-7 w-7 shrink-0"><AvatarImage src={m.sender_photo || undefined} /><AvatarFallback className="text-[9px] bg-wavygo-100 text-wavygo-800">{initials(m.sender_name)}</AvatarFallback></Avatar>
+                        <div className={cn("max-w-[70%] min-w-0", mine && "text-right", editing && "w-full")}>
+                          <div className={cn("flex items-baseline gap-2 mb-0.5", mine && "flex-row-reverse")}>
+                            <span className="text-[12px] font-medium">{m.sender_name}</span>
+                            <span className="text-[10.5px] text-muted-foreground cursor-default" title={formatChatTimeFull(m.created_at)}>{formatChatTime(m.created_at)}</span>
+                            {m.edited_at && !m.deleted && <span className="text-[10.5px] text-muted-foreground italic" title={`Edited ${formatChatTimeFull(m.edited_at)}`}>(edited)</span>}
+                          </div>
+                          <div className={cn("flex items-center gap-1", mine && "flex-row-reverse")}>
+                            {editing ? (
+                              <div className="w-full text-left space-y-1.5">
+                                <Textarea
+                                  autoFocus
+                                  rows={2}
+                                  maxLength={4000}
+                                  value={editText}
+                                  onChange={(e) => setEditText(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); saveEdit(m); }
+                                    if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+                                  }}
+                                  className="text-[13.5px] min-h-[60px]"
+                                  data-testid="connect-edit-input"
+                                />
+                                <div className="flex items-center justify-end gap-1.5">
+                                  <span className="text-[10.5px] text-muted-foreground mr-auto">Enter to save · Esc to cancel</span>
+                                  <Button size="sm" variant="ghost" className="h-7 gap-1" onClick={cancelEdit}><X className="h-3.5 w-3.5" />Cancel</Button>
+                                  <Button size="sm" className="h-7 gap-1" onClick={() => saveEdit(m)} disabled={!editText.trim() || savingEdit} data-testid="connect-edit-save">
+                                    <Check className="h-3.5 w-3.5" />Save
+                                  </Button>
+                                </div>
                               </div>
-                            </div>
-                          ) : m.deleted ? (
-                            <div className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-[13px] italic text-muted-foreground border border-dashed border-border">
-                              <Ban className="h-3.5 w-3.5" /> This message was deleted
-                            </div>
-                          ) : (
-                            <div className={cn("inline-block rounded-lg px-3 py-2 text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-left", mine ? "bg-primary text-primary-foreground" : "bg-muted text-foreground")}>
-                              {m.body}
-                            </div>
-                          )}
-                          {!editing && !m.deleted && (
-                            <DropdownMenu>
-                              <DropdownMenuTrigger asChild>
-                                <button type="button" aria-label="Message options" data-testid="connect-message-menu"
-                                        className="shrink-0 h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 hover:bg-muted transition-opacity">
-                                  <MoreHorizontal className="h-4 w-4" />
-                                </button>
-                              </DropdownMenuTrigger>
-                              <DropdownMenuContent align={mine ? "end" : "start"} className="w-40">
-                                <DropdownMenuItem onSelect={() => copyMessage(m)}><Copy className="h-4 w-4 mr-2" />Copy text</DropdownMenuItem>
-                                {canEditMsg && <DropdownMenuItem onSelect={() => startEdit(m)} data-testid="connect-message-edit"><Pencil className="h-4 w-4 mr-2" />Edit</DropdownMenuItem>}
-                                {mine && !open && !isOrgAdmin && (
-                                  <div className="px-2 py-1.5 text-[11px] text-muted-foreground">Edit and delete are only possible for 15 minutes after sending.</div>
-                                )}
-                                {left !== null && (
-                                  <div className="px-2 py-1 text-[11px] text-muted-foreground">Editable for {left} more min</div>
-                                )}
-                                {canDeleteMsg && (
-                                  <>
-                                    <DropdownMenuSeparator />
-                                    <DropdownMenuItem onSelect={() => setDeleting(m)} className="text-destructive focus:text-destructive" data-testid="connect-message-delete">
-                                      <Trash2 className="h-4 w-4 mr-2" />{mine ? "Delete" : "Delete (moderate)"}
-                                    </DropdownMenuItem>
-                                  </>
-                                )}
-                              </DropdownMenuContent>
-                            </DropdownMenu>
-                          )}
+                            ) : m.deleted ? (
+                              <div className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-[13px] italic text-muted-foreground border border-dashed border-border">
+                                <Ban className="h-3.5 w-3.5" /> This message was deleted
+                              </div>
+                            ) : (
+                              <div className={cn("inline-block rounded-lg px-3 py-2 text-[13.5px] leading-relaxed whitespace-pre-wrap break-words text-left", mine ? "bg-primary text-primary-foreground" : "bg-muted text-foreground")}>
+                                {m.body}
+                              </div>
+                            )}
+                            {!editing && !m.deleted && (
+                              <DropdownMenu>
+                                <DropdownMenuTrigger asChild>
+                                  <button type="button" aria-label="Message options" data-testid="connect-message-menu"
+                                          className="shrink-0 h-7 w-7 rounded-md flex items-center justify-center text-muted-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 hover:bg-muted transition-opacity">
+                                    <MoreHorizontal className="h-4 w-4" />
+                                  </button>
+                                </DropdownMenuTrigger>
+                                <DropdownMenuContent align={mine ? "end" : "start"} className="w-40">
+                                  <DropdownMenuItem onSelect={() => copyMessage(m)}><Copy className="h-4 w-4 mr-2" />Copy text</DropdownMenuItem>
+                                  {canEditMsg && <DropdownMenuItem onSelect={() => startEdit(m)} data-testid="connect-message-edit"><Pencil className="h-4 w-4 mr-2" />Edit</DropdownMenuItem>}
+                                  {mine && !open && !isOrgAdmin && (
+                                    <div className="px-2 py-1.5 text-[11px] text-muted-foreground">Edit and delete are only possible for 15 minutes after sending.</div>
+                                  )}
+                                  {left !== null && (
+                                    <div className="px-2 py-1 text-[11px] text-muted-foreground">Editable for {left} more min</div>
+                                  )}
+                                  {canDeleteMsg && (
+                                    <>
+                                      <DropdownMenuSeparator />
+                                      <DropdownMenuItem onSelect={() => setDeleting(m)} className="text-destructive focus:text-destructive" data-testid="connect-message-delete">
+                                        <Trash2 className="h-4 w-4 mr-2" />{mine ? "Delete" : "Delete (moderate)"}
+                                      </DropdownMenuItem>
+                                    </>
+                                  )}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                            )}
+                          </div>
                         </div>
                       </div>
                     </div>
