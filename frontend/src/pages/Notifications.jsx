@@ -10,7 +10,9 @@ import {
   CheckCircle2,
   Bell,
 } from "lucide-react";
-import { api } from "@/lib/api";
+import { useLiveRefresh } from "@/hooks/useLiveRefresh";
+import { api, formatApiError } from "@/lib/api";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import { formatDistanceToNow } from "date-fns";
 import { useNavigate } from "react-router-dom";
@@ -34,29 +36,36 @@ const KIND_META = {
   },
 };
 
+// Lets the TopNav bell refresh its unread badge
+function notifyChanged() {
+  window.dispatchEvent(new Event("wavygo:notifications-changed"));
+}
+
 export default function NotificationsPage() {
   const [items, setItems] = useState([]);
   const navigate = useNavigate();
 
-  async function load() {
+  async function load({ background = false } = {}) {
     try {
       const { data } = await api.get("/notifications");
       setItems(data);
     } catch (error) {
-      console.error("Failed to load notifications:", error);
+      if (!background) toast.error(`Could not load notifications: ${formatApiError(error)}`);
     }
   }
 
   useEffect(() => {
     load();
   }, []);
+  useLiveRefresh(load, 30000);
 
   async function markAll() {
     try {
       await api.post("/notifications/read-all");
+      notifyChanged();
       await load();
     } catch (error) {
-      console.error("Failed to mark all notifications as read:", error);
+      toast.error(`Could not mark notifications as read: ${formatApiError(error)}`);
     }
   }
 
@@ -66,9 +75,10 @@ export default function NotificationsPage() {
       if (!notification.read) {
         try {
           await api.post(`/notifications/${notification.id}/read`);
+          notifyChanged();
         } catch (error) {
           // Don't stop navigation if the read endpoint is unavailable
-          console.warn("Could not mark notification as read:", error);
+          toast.error(`Could not mark notification as read: ${formatApiError(error)}`);
         }
       }
 
@@ -83,7 +93,7 @@ export default function NotificationsPage() {
       // Refresh the notification list if there is no link
       await load();
     } catch (error) {
-      console.error("Failed to open notification:", error);
+      toast.error(`Could not open notification: ${formatApiError(error)}`);
     }
   }
 
@@ -104,6 +114,7 @@ export default function NotificationsPage() {
         <Button
           variant="outline"
           onClick={markAll}
+          disabled={!items.some((n) => !n.read)}
           data-testid="mark-all-read-btn"
         >
           <CheckCheck className="h-4 w-4 mr-1.5" />
