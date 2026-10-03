@@ -607,6 +607,8 @@ async def send_message(channel_id: str, payload: MessageCreate, current: UserPub
     ch = await _visible_channel(db, channel_id, current)
     if ch["kind"] == "announcement" and current.role not in ("Founder", "Admin"):
         raise HTTPException(403, "Only Founder or Admin can post in announcement channels")
+    attachments = []
+
     doc = {
         "channel_id": channel_id,
         "channel_name": ch["name"],
@@ -618,6 +620,7 @@ async def send_message(channel_id: str, payload: MessageCreate, current: UserPub
         "attachments": attachments,
         "created_at": utc_iso(),
     }
+    
     res = await db.messages.insert_one(doc)
     doc["_id"] = res.inserted_id
     await db.channels.update_one(
