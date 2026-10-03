@@ -435,7 +435,14 @@ export default function WavygoConnect() {
     if (!text.trim() || !activeId || sendingRef.current) return;
     sendingRef.current = true;
     try {
-      await api.post(`/connect/channels/${activeId}/messages`, { body: text.trim() });
+      let attachments = [];
+      if (file) {
+        const fd = new FormData();
+        fd.append("file", file); // must match the backend parameter name "file"
+        const { data: up } = await api.post("/connect/upload", fd);
+        attachments = [up.url];
+      }
+      await api.post(`/connect/channels/${activeId}/messages`, { body: text.trim(), attachments });
       setText("");
       loadMessages(activeId, { scroll: true });
       loadChannels(null, true);
