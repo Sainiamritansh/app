@@ -12,7 +12,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Badge } from "@/components/ui/badge";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Users, Plus, UserPlus, Building2, CalendarDays, Award, KeyRound, Mail, Copy, Check, Trash2, Pencil, Power, UserMinus, CheckCircle2, Loader2, Eye, EyeOff, Sparkles, Send, ShieldCheck, ArrowLeft, Clock, LogIn, LogOut } from "lucide-react";
+import { Users, Plus, UserPlus, Building2, CalendarDays, Award, KeyRound, Mail, Copy, Check, Trash2, Pencil, Power, UserMinus, CheckCircle2, Loader2, Eye, EyeOff, Sparkles, Send, ShieldCheck, ArrowLeft, Clock, LogIn, LogOut, ClipboardList } from "lucide-react";
 import { useLiveRefresh } from "@/hooks/useLiveRefresh";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/contexts/AuthContext";
@@ -70,6 +70,244 @@ function DepartmentSelect({ value, onChange, departments, disabled }) {
   );
 }
 
+// ============================================================
+// EMPLOYEE DETAILS (submitted by the employee + provided by the company)
+// ============================================================
+
+// [key, label, type]  — type: text (default) | date | number | checkbox | textarea
+const SUBMITTED_FIELDS = [
+  ["phone", "Phone"],
+  ["personal_email", "Personal email"],
+  ["date_of_birth", "Date of birth", "date"],
+  ["address", "Address", "textarea"],
+  ["emergency_contact_name", "Emergency contact name"],
+  ["emergency_contact_relation", "Emergency contact relation"],
+  ["emergency_contact_phone", "Emergency contact phone"],
+  ["college", "College"],
+  ["degree", "Degree"],
+  ["resume_url", "Resume link"],
+  ["id_proof_url", "ID proof link"],
+  ["bank_account_last4", "Bank account (last 4 digits)"],
+];
+
+const COMPANY_FIELDS = [
+  ["employee_code", "Employee ID"],
+  ["reporting_manager", "Reporting manager"],
+  ["joining_date", "Joining date", "date"],
+  ["employment_type", "Employment type"],
+  ["stipend_or_salary", "Stipend / salary", "number"],
+  ["offer_letter_url", "Offer letter link"],
+  ["nda_signed", "NDA signed", "checkbox"],
+  ["assigned_assets", "Assigned assets", "textarea"],
+];
+
+const normalizeValue = (v) => (v === "" || v === undefined ? null : v);
+
+function DetailsSection({ title, subtitle, fields, values, editable, onSave }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState(values);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => { setForm(values); }, [values]);
+
+  function display(key, type) {
+    const v = values[key];
+    if (type === "checkbox") return v ? "Yes" : "No";
+    if (v === null || v === undefined || v === "") return "—";
+    if (key.endsWith("_url")) {
+      return <a href={v} target="_blank" rel="noreferrer" className="text-primary underline underline-offset-2">Open link</a>;
+    }
+    return String(v);
+  }
+
+  async function save() {
+    // Send only what changed, so untouched fields are never overwritten.
+    const changes = {};
+    fields.forEach(([key]) => {
+      if (normalizeValue(form[key]) !== normalizeValue(values[key])) changes[key] = form[key];
+    });
+    if (Object.keys(changes).length === 0) {
+      setEditing(false);
+      return;
+    }
+    setSaving(true);
+    try {
+      await onSave(changes);
+      toast.success(`${title} saved`);
+      setEditing(false);
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function cancel() {
+    setForm(values);
+    setEditing(false);
+  }
+
+  return (
+    <Card className="border-border">
+      <CardHeader className="pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <CardTitle className="font-display text-[14px]">{title}</CardTitle>
+            <div className="text-[11.5px] text-muted-foreground mt-0.5">{subtitle}</div>
+          </div>
+          {editable && !editing && (
+            <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setEditing(true)}>
+              <Pencil className="h-3.5 w-3.5 mr-1" /> Edit
+            </Button>
+          )}
+        </div>
+      </CardHeader>
+      <CardContent className="pt-0">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3">
+          {fields.map(([key, label, type]) => (
+            <div key={key} className={type === "textarea" ? "sm:col-span-2" : ""}>
+              <Label className="text-[11px] uppercase tracking-wide text-muted-foreground">{label}</Label>
+              {editing ? (
+                type === "checkbox" ? (
+                  <div className="mt-1.5">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 accent-primary"
+                      checked={!!form[key]}
+                      onChange={(e) => setForm(s => ({ ...s, [key]: e.target.checked }))}
+                      disabled={saving}
+                    />
+                  </div>
+                ) : type === "textarea" ? (
+                  <Textarea
+                    rows={2}
+                    className="mt-1"
+                    value={form[key] ?? ""}
+                    onChange={(e) => setForm(s => ({ ...s, [key]: e.target.value }))}
+                    disabled={saving}
+                  />
+                ) : (
+                  <Input
+                    className="mt-1"
+                    type={type === "date" ? "date" : type === "number" ? "number" : "text"}
+                    min={type === "number" ? 0 : undefined}
+                    value={form[key] ?? ""}
+                    onChange={(e) => setForm(s => ({
+                      ...s,
+                      [key]: type === "number" ? (e.target.value === "" ? null : Number(e.target.value)) : e.target.value,
+                    }))}
+                    disabled={saving}
+                  />
+                )
+              ) : (
+                <div className="mt-1 text-[13.5px] break-words whitespace-pre-wrap">{display(key, type)}</div>
+              )}
+            </div>
+          ))}
+        </div>
+        {editing && (
+          <div className="flex justify-end gap-2 mt-4">
+            <Button variant="outline" size="sm" onClick={cancel} disabled={saving}>Cancel</Button>
+            <Button size="sm" onClick={save} disabled={saving}>
+              {saving ? <><Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" /> Saving...</> : "Save"}
+            </Button>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function EmployeeDetailsDialog({ employee, onClose }) {
+  const [profile, setProfile] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const employeeId = employee?.id;
+
+  useEffect(() => {
+    if (!employeeId) {
+      setProfile(null);
+      setError("");
+      return undefined;
+    }
+    let alive = true;
+    setLoading(true);
+    setProfile(null);
+    setError("");
+    api.get(`/employees/${employeeId}/profile`)
+      .then(({ data }) => { if (alive) setProfile(data); })
+      .catch((e) => { if (alive) setError(formatApiError(e)); })
+      .finally(() => { if (alive) setLoading(false); });
+    return () => { alive = false; };
+  }, [employeeId]);
+
+  async function saveSubmitted(changes) {
+    const { data } = await api.put(`/employees/${employeeId}/profile/submitted`, changes);
+    setProfile(data);
+  }
+
+  async function saveCompany(changes) {
+    const { data } = await api.patch(`/employees/${employeeId}/profile/company`, changes);
+    setProfile(data);
+  }
+
+  return (
+    <Dialog open={!!employee} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="sm:max-w-2xl max-h-[88vh] overflow-y-auto" data-testid="employee-details-dialog">
+        <DialogHeader>
+          <div className="flex items-center gap-3">
+            <Avatar className="h-11 w-11">
+              <AvatarImage src={employee?.photo || undefined} />
+              <AvatarFallback className="bg-wavygo-100 text-wavygo-800 text-[11px] font-semibold">{initials(employee?.name)}</AvatarFallback>
+            </Avatar>
+            <div className="min-w-0">
+              <DialogTitle className="font-display">{employee?.name}</DialogTitle>
+              <DialogDescription className="text-xs">
+                {employee?.email}
+                {employee?.role ? ` · ${employee.role}` : ""}
+                {employee?.designation ? ` · ${employee.designation}` : ""}
+                {employee?.department ? ` · ${employee.department}` : ""}
+              </DialogDescription>
+            </div>
+          </div>
+        </DialogHeader>
+
+        {loading && (
+          <div className="flex items-center justify-center py-10 text-sm text-muted-foreground">
+            <Loader2 className="h-4 w-4 animate-spin mr-2" /> Loading details...
+          </div>
+        )}
+        {!loading && error && <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div>}
+
+        {profile && (
+          <div className="space-y-4">
+            <DetailsSection
+              title="Submitted by employee"
+              subtitle="Details the employee has filled in about themselves."
+              fields={SUBMITTED_FIELDS}
+              values={profile.submitted}
+              editable={profile.can_edit_submitted}
+              onSave={saveSubmitted}
+            />
+            <DetailsSection
+              title="Provided by company"
+              subtitle="Details the company has recorded for this employee."
+              fields={COMPANY_FIELDS}
+              values={profile.company}
+              editable={profile.can_edit_company}
+              onSave={saveCompany}
+            />
+          </div>
+        )}
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>Close</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 function Directory({ onChange }) {
   const { user } = useAuth();
   const { can, role } = usePermission();
@@ -94,6 +332,7 @@ function Directory({ onChange }) {
   const [passwordCopied, setPasswordCopied] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
   const [editForm, setEditForm] = useState({ name: "", role: "Employee", designation: "", department: "", phone: "" });
+  const [detailsUser, setDetailsUser] = useState(null);
 
   const [createdInvite, setCreatedInvite] = useState(null);
   const [copied, setCopied] = useState(false);
@@ -464,6 +703,7 @@ function Directory({ onChange }) {
                 <TableHead>Designation</TableHead>
                 <TableHead>Contact</TableHead>
                 <TableHead>Status</TableHead>
+                <TableHead>Details</TableHead>
                 {(canEdit || canReset || canManageAccount) && <TableHead className="text-right">Actions</TableHead>}
               </TableRow>
             </TableHeader>
@@ -496,6 +736,11 @@ function Directory({ onChange }) {
                         <StatusPill status={u.status === "deactivated" || u.is_active === false ? "deactivated" : "active"} />
                         {u.online && <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" title="Online now" />}
                       </div>
+                    </TableCell>
+                    <TableCell>
+                      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => setDetailsUser(u)} data-testid={`view-details-btn-${u.id}`}>
+                        <ClipboardList className="h-3.5 w-3.5 mr-1" /> View
+                      </Button>
                     </TableCell>
                     {(canEdit || canReset || canManageAccount) && (
                       <TableCell className="text-right">
@@ -561,6 +806,8 @@ function Directory({ onChange }) {
           </Table>
         )}
       </Card>}
+
+      <EmployeeDetailsDialog employee={detailsUser} onClose={() => setDetailsUser(null)} />
 
       <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) setCreatedInvite(null); }}>
         <DialogContent>
